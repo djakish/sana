@@ -4,6 +4,7 @@
 
 pub mod error;
 pub mod manifest;
+pub mod namespace;
 pub mod object_store;
 pub mod schema;
 pub mod value;

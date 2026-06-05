@@ -11,9 +11,10 @@ the next unchecked task under "Current milestone" / "Next up".
 
 ## Status snapshot
 
-- **Current stage:** Stage 0 (Skeleton) — **complete**.
-- **Next stage:** Stage 1 (Durable Documents).
-- **Tests:** `cargo test` green (21 tests); `cargo clippy --all-targets` clean.
+- **Current stage:** Stage 1 (Durable Documents) — **complete**.
+- **Next stage:** Stage 2 (SST/LSM).
+- **Done:** Stage 0 (Skeleton), Stage 1 (Durable Documents).
+- **Tests:** `cargo test` green (30 tests); `cargo clippy --all-targets` clean.
 - **Last updated:** 2026-06-05.
 
 ---
@@ -23,9 +24,9 @@ the next unchecked task under "Current milestone" / "Next up".
 - [x] **Stage 0 — Skeleton decisions.** Internal value/schema types, `ObjectStore`
       trait + filesystem backend, manifest + WAL formats, golden serialization
       tests.
-- [ ] **Stage 1 — Durable documents.** Namespace lifecycle: create, append WAL,
-      CAS-advance manifest, replay WAL → documents, strong primary-key lookup.
-      Small CLI/local API.
+- [x] **Stage 1 — Durable documents.** Namespace lifecycle: create, append WAL,
+      CAS-advance commit cursor, replay WAL → documents, strong primary-key
+      lookup. Small CLI.
 - [ ] **Stage 2 — SST/LSM.** SST writer/reader/range iterator, build doc SSTs
       from WAL, compaction + tombstones, query from manifest + WAL overlay.
 - [ ] **Stage 3 — Attributes & exact search.** Schema inference/checking,
@@ -46,31 +47,72 @@ the next unchecked task under "Current milestone" / "Next up".
 
 ---
 
-## Current milestone: Stage 1 — Durable Documents
+## Stage 1 — Durable Documents (done)
 
-Goal: end-to-end on the filesystem object store — create a namespace, append a
-WAL batch, CAS-advance the manifest, replay into documents, and look up by key.
+End-to-end on the filesystem object store: create a namespace, append WAL
+batches, CAS-advance a lightweight commit cursor, replay into documents, and
+look up by key. Shipped in `src/namespace.rs` + `src/main.rs` (CLI) with
+integration tests in `tests/namespace.rs`. On-disk layout matches the
+architecture doc:
 
-Planned tasks (subject to refinement when started):
+```
+namespaces/{ns}/manifest/current        # ManifestPointer -> generation
+namespaces/{ns}/manifest/g/{gen}.json   # immutable manifest body
+namespaces/{ns}/wal_commit/current      # CAS commit cursor (WalCursor as JSON)
+namespaces/{ns}/wal/{epoch}/{seq}.wal   # durable batches
+```
 
-- [ ] `namespace.rs`: `Namespace` handle over an `Arc<dyn ObjectStore>` with the
-      object-key layout from the architecture doc (helpers for manifest pointer,
-      manifest body, and `wal/{epoch}/{seq}.wal` keys).
-- [ ] Create namespace: write generation-0 manifest + `manifest/current`
-      pointer via `put_if_absent`.
-- [ ] Append WAL batch: allocate next `WalCursor`, write `wal/{epoch}/{seq}.wal`,
-      CAS-advance the manifest's `wal_commit_cursor`. (Group-commit *shape* even
-      though batches are committed one at a time at first.)
-- [ ] Replay: read manifest, stream WAL from `indexed_cursor`..`wal_commit`,
-      fold ops (upsert/patch/delete) into an in-memory document map.
-- [ ] Strong lookup by primary key via replay overlay.
-- [ ] Wire a tiny CLI in `main.rs` (create / upsert / get / list) over a local
-      store dir, plus integration tests.
+Stage 1 decisions / notes:
 
-Open question to settle in Stage 1: WAL epoch/seq allocation & group-commit loop
-structure (single-writer per namespace vs. per-process). Lean single-writer
-per namespace, committing batches sequentially, with the loop structured so
-multiple in-flight writes can later coalesce into one WAL object.
+- **D12 — Lightweight commit cursor separate from the manifest.** The write
+  path CAS-advances `wal_commit/current` per commit; the manifest only changes
+  when indexing publishes files. Realizes Principle 2 (write durability vs.
+  indexing freshness). Manifest's own `wal_commit_cursor`/`indexed_cursor` are
+  snapshots set at index-publish time (Stage 2+).
+- **D13 — Single-writer-per-namespace append.** In-process append lock + cursor
+  CAS. WAL object written with `put` (overwrite) before the cursor advances, so
+  a crashed prior attempt at that seq is a harmless orphan we overwrite. Same
+  single-process caveat as D4; cross-process append needs `put_if_absent` +
+  explicit orphan reconciliation (future).
+- **D14 — Patch = create-or-update; null clears a field.** Patch onto a missing
+  id creates a partial doc; a `Value::Null` attribute removes the field.
+
+Known limitations to fix in later stages:
+
+- `replay`/`lookup` are O(WAL) — full scan per call. Stage 2 SSTs fix this.
+- No idempotency-key dedup yet (field is plumbed through the WAL batch).
+- No schema inference/validation yet (Stage 3); attributes are free-form.
+- Single WAL epoch only; epoch rotation is unused.
+
+---
+
+## Current milestone: Stage 2 — SST / LSM
+
+Goal: stop replaying the whole WAL. Build immutable sorted document files
+(SSTs), fold committed WAL into them via an indexer step, and serve reads from
+manifest-named SSTs plus a bounded recent-WAL overlay. Add compaction and
+tombstone cleanup.
+
+Planned tasks (refine when started):
+
+- [ ] `sst.rs`: SST writer/reader with data blocks (prefix-compressed keys),
+      a block index (min/max key + offsets), and a footer (magic, version,
+      checksums, index offset). Batched range iterator (no per-item yield).
+- [ ] Key encoding for the `doc/{id}` family that sorts lexicographically by
+      `Id` (define a canonical byte ordering for U64/Uuid/String).
+- [ ] Indexer step: read WAL `indexed_cursor`..`wal_commit`, merge into a new
+      doc SST, write it, then CAS-advance the manifest (new generation naming
+      the SST + updated `indexed_cursor`).
+- [ ] Read path: load manifest → read SSTs named by it → merge with WAL overlay
+      after `indexed_cursor`. Lookup becomes SST point-read + small overlay.
+- [ ] Compaction: merge SSTs within the doc family, drop overwritten values and
+      tombstones past a retention horizon, update approx stats. Never mutate in
+      place.
+- [ ] Golden SST format test + indexer/compaction integration tests.
+
+Open question for Stage 2: levels/manifest representation of SST sets (start
+with a single level / full list of files; introduce levels when compaction
+needs them).
 
 ---
 
@@ -120,7 +162,7 @@ Decisions I (the implementer) made; the user delegated architectural calls.
 ```
 src/
   lib.rs                 module exports
-  main.rs                Stage-0 banner stub (CLI lands in Stage 1)
+  main.rs                Stage-1 CLI (create/upsert/get/delete/list/demo)
   error.rs               shared Error / Result
   value.rs               Id, Value, VectorValue, Document
   schema.rs              ScalarType, ColumnType, Schema, ...
@@ -129,10 +171,12 @@ src/
     fs.rs                FsObjectStore (filesystem backend)
   manifest.rs            NamespaceManifest, ManifestPointer (+ codecs)
   wal.rs                 WalCursor, WalOp, WalBatch (+ binary codec)
+  namespace.rs           Namespace: create/append/replay/lookup
 tests/
   common/mod.rs          assert_golden snapshot helper
   fs_object_store.rs     object store behavior (CAS, ranges, list, ...)
   manifest_codec.rs      manifest/pointer round-trip + golden JSON
   wal_codec.rs           WAL round-trip, corruption detection, golden bytes
+  namespace.rs           namespace lifecycle + durability across reopen
   fixtures/              committed golden snapshots
 ```
