@@ -11,11 +11,11 @@ the next unchecked task under "Current milestone" / "Next up".
 
 ## Status snapshot
 
-- **Current stage:** Stage 7 (Full-text search) — **in progress**.
-- **Next up:** Vectorized/batched MAXSCORE inner loops.
+- **Current stage:** Stage 8 (RaBitQ & kernels) — **not started**.
+- **Next up:** RaBitQ per-cluster quantized codes and portable batch kernels.
 - **Done:** Stage 0 (Skeleton), Stage 1 (Durable Documents), Stage 2 (SST/LSM),
   Stage 3 (Attributes & Exact Search), Stage 4 (ANN v0), Stage 5 (Native
-  Filtering), Stage 6 (SPFresh local rebuild).
+  Filtering), Stage 6 (SPFresh local rebuild), Stage 7 (Full-text search).
 - **Tests:** `cargo test` green (105 tests); `cargo clippy --all-targets` clean.
 - **Note:** post-Stage-2 and Stage-3–5 code-review fixes applied; remaining
   findings tracked under "Stage 2 — code review follow-ups" and "Stages 3–5 —
@@ -24,8 +24,9 @@ the next unchecked task under "Current milestone" / "Next up".
   and orphaned-object GC (`indexer::gc`, `sana gc [--apply]`); Stage 3 attribute
   write-amplification via delta + tiered `attr_ssts` (`tier_attr_ssts`); vector
   read path fetches append deltas concurrently; Stage 7 now has tokenizer,
-  block-shaped full-snapshot text postings, BM25 query support, rank-safe block
-  MAXSCORE top-k, and consistent-snapshot multi-query for hybrid retrieval.
+  block-shaped full-snapshot text postings, BM25 query support, rank-safe
+  batched block MAXSCORE top-k, and consistent-snapshot multi-query for hybrid
+  retrieval.
 - **Last updated:** 2026-06-06.
 
 ---
@@ -49,7 +50,7 @@ the next unchecked task under "Current milestone" / "Next up".
       bitmaps, filter-aware ANN traversal, filtered recall.
 - [x] **Stage 6 — SPFresh local rebuild.** Mutable posting append, version map,
       split/merge/reassign background jobs.
-- [ ] **Stage 7 — Full-text search.** Tokenizer, BM25, block postings,
+- [x] **Stage 7 — Full-text search.** Tokenizer, BM25, block postings,
       vectorized MAXSCORE, hybrid multi-query.
 - [ ] **Stage 8 — RaBitQ & kernels.** Per-cluster codes, quantized query path,
       portable then SIMD kernels.
@@ -596,7 +597,7 @@ Planned tasks:
 - [x] Upgrade postings to fixed-size blocks with block-local max scores.
 - [x] Add rank-safe MAXSCORE over the block postings.
 - [x] Add hybrid multi-query planning for combined text/vector/attribute ranks.
-- [ ] Vectorize/batch the MAXSCORE inner loop.
+- [x] Vectorize/batch the MAXSCORE inner loop.
 
 Stage 7 decisions / notes:
 
@@ -624,6 +625,12 @@ Stage 7 decisions / notes:
   commit snapshot, matching the turbopuffer-style "batch text/vector reads,
   fuse/rerank client-side" model without mixing BM25, vector, and attribute
   score semantics inside the executor yet. Empty batches are rejected.
+- **D43 — MAXSCORE scoring is batched and thresholded incrementally.** The text
+  top-k path now precomputes BM25 term constants once per term, scores decoded
+  posting blocks in contiguous 64-posting batches, and maintains the heap
+  threshold with a small ordered top-k tracker instead of sorting all accumulated
+  document scores after every block. This keeps the block-skip rule rank-safe
+  while matching the FTS v2 guidance to favor sequential per-list work.
 
 ---
 

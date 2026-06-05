@@ -6,7 +6,8 @@
 //! the query path falls back to scoring the strong materialized document
 //! snapshot.
 
-use std::collections::BTreeMap;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -20,6 +21,7 @@ const KEY_KIND_TERM_BLOCK: u8 = 2;
 
 const DEFAULT_MAX_TOKEN_LEN: usize = 39;
 const POSTING_BLOCK_TARGET: usize = 256;
+const SCORE_BATCH_TARGET: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenizerConfig {
@@ -111,6 +113,8 @@ pub struct TextTermStats {
 pub struct TextSearchStats {
     pub blocks_read: u64,
     pub blocks_skipped: u64,
+    pub score_batches: u64,
+    pub postings_scored: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -136,6 +140,131 @@ struct TermPosting {
     id: Id,
     term_frequency: u32,
     doc_len: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Bm25TermScorer {
+    idf: f32,
+    avg_doc_len: f32,
+    k1: f32,
+    b: f32,
+}
+
+impl Bm25TermScorer {
+    fn new(avg_doc_len: f32, doc_count: u64, doc_freq: u64, params: Bm25Params) -> Option<Self> {
+        if avg_doc_len <= 0.0 || doc_count == 0 || doc_freq == 0 {
+            return None;
+        }
+        let n = doc_count as f32;
+        let df = doc_freq.min(doc_count) as f32;
+        Some(Self {
+            idf: (1.0 + (n - df + 0.5) / (df + 0.5)).ln(),
+            avg_doc_len,
+            k1: params.k1,
+            b: params.b,
+        })
+    }
+
+    fn score(self, term_frequency: u32, doc_len: u32) -> f32 {
+        if term_frequency == 0 || doc_len == 0 {
+            return 0.0;
+        }
+        let tf = term_frequency as f32;
+        let norm = 1.0 - self.b + self.b * (doc_len as f32 / self.avg_doc_len);
+        self.idf * (tf * (self.k1 + 1.0)) / (tf + self.k1 * norm)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ScoredId {
+    score: f32,
+    id: Id,
+}
+
+impl PartialEq for ScoredId {
+    fn eq(&self, other: &Self) -> bool {
+        self.score.to_bits() == other.score.to_bits() && self.id == other.id
+    }
+}
+
+impl Eq for ScoredId {}
+
+impl PartialOrd for ScoredId {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ScoredId {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.score
+            .total_cmp(&other.score)
+            .then_with(|| self.id.cmp(&other.id))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TopKTracker {
+    k: usize,
+    by_id: BTreeMap<Id, f32>,
+    by_score: BTreeSet<ScoredId>,
+}
+
+impl TopKTracker {
+    fn new(k: usize) -> Self {
+        Self {
+            k,
+            by_id: BTreeMap::new(),
+            by_score: BTreeSet::new(),
+        }
+    }
+
+    fn observe(&mut self, id: Id, score: f32) {
+        if self.k == 0 {
+            return;
+        }
+        if let Some(previous) = self.by_id.remove(&id) {
+            self.by_score.remove(&ScoredId {
+                score: previous,
+                id: id.clone(),
+            });
+            self.insert(id, score);
+            return;
+        }
+        if self.by_id.len() < self.k {
+            self.insert(id, score);
+            return;
+        }
+        let Some(threshold) = self.threshold() else {
+            return;
+        };
+        if score > threshold {
+            self.insert(id, score);
+            self.trim();
+        }
+    }
+
+    fn threshold(&self) -> Option<f32> {
+        if self.by_id.len() < self.k {
+            return None;
+        }
+        self.by_score.iter().next().map(|entry| entry.score)
+    }
+
+    fn insert(&mut self, id: Id, score: f32) {
+        self.by_id.insert(id.clone(), score);
+        self.by_score.insert(ScoredId { score, id });
+    }
+
+    fn trim(&mut self) {
+        while self.by_id.len() > self.k {
+            let Some(entry) = self.by_score.iter().next().cloned() else {
+                break;
+            };
+            self.by_score.remove(&entry);
+            self.by_id.remove(&entry.id);
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -229,12 +358,9 @@ pub fn bm25_term_score(
     }
 
     let params = params.validate().unwrap_or_default();
-    let n = doc_count as f32;
-    let df = doc_freq.min(doc_count) as f32;
-    let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
-    let tf = term_frequency as f32;
-    let norm = 1.0 - params.b + params.b * (doc_len as f32 / avg_doc_len);
-    idf * (tf * (params.k1 + 1.0)) / (tf + params.k1 * norm)
+    Bm25TermScorer::new(avg_doc_len, doc_count, doc_freq, params)
+        .map(|scorer| scorer.score(term_frequency, doc_len))
+        .unwrap_or(0.0)
 }
 
 pub fn build_text_sst(docs: &BTreeMap<Id, Document>) -> Result<Option<BuiltTextSst>> {
@@ -254,20 +380,21 @@ pub fn build_text_sst(docs: &BTreeMap<Id, Document>) -> Result<Option<BuiltTextS
         let field_stats = data.field_stats.get(column).copied().unwrap_or_default();
         let avg_doc_len = average_doc_len(field_stats);
         let doc_freq = postings.len() as u64;
+        let scorer = Bm25TermScorer::new(
+            avg_doc_len,
+            field_stats.doc_count,
+            doc_freq,
+            Bm25Params::default(),
+        );
         let mut posting_blocks = Vec::new();
         let mut block_max_scores = Vec::new();
         for (block_id, block_postings) in postings.chunks(POSTING_BLOCK_TARGET).enumerate() {
             let block_max_score = block_postings
                 .iter()
                 .map(|posting| {
-                    bm25_term_score(
-                        posting.term_frequency,
-                        posting.doc_len,
-                        avg_doc_len,
-                        field_stats.doc_count,
-                        doc_freq,
-                        Bm25Params::default(),
-                    )
+                    scorer
+                        .map(|scorer| scorer.score(posting.term_frequency, posting.doc_len))
+                        .unwrap_or(0.0)
                 })
                 .fold(0.0f32, f32::max);
             block_max_scores.push(block_max_score);
@@ -436,33 +563,32 @@ pub fn search_sst_top_k_with_stats(
     let total_global_bound = terms.iter().map(|term| term.global_max_score).sum::<f32>();
     let avg_doc_len = average_doc_len(field_stats);
     let mut scores: BTreeMap<Id, f32> = BTreeMap::new();
+    let mut top_k = TopKTracker::new(k);
     let mut stats = TextSearchStats::default();
-    let mut threshold = None;
 
     for term in terms {
         let other_terms_bound = (total_global_bound - term.global_max_score).max(0.0);
+        let Some(scorer) =
+            Bm25TermScorer::new(avg_doc_len, field_stats.doc_count, term.doc_freq, params)
+        else {
+            continue;
+        };
         for (block_id, block_max_score) in term.block_max_scores.iter().copied().enumerate() {
-            if threshold.is_some_and(|score| block_max_score + other_terms_bound < score) {
+            if top_k
+                .threshold()
+                .is_some_and(|score| block_max_score + other_terms_bound < score)
+            {
                 stats.blocks_skipped += 1;
                 continue;
             }
 
             let block = read_posting_block(reader, column, &term.term, block_id as u32)?;
             stats.blocks_read += 1;
-            for posting in block.postings {
-                let score = bm25_term_score(
-                    posting.term_frequency,
-                    posting.doc_len,
-                    avg_doc_len,
-                    field_stats.doc_count,
-                    term.doc_freq,
-                    params,
-                ) * term.qtf;
-                if score > 0.0 {
-                    *scores.entry(posting.id).or_default() += score;
-                }
+            for batch in block.postings.chunks(SCORE_BATCH_TARGET) {
+                stats.score_batches += 1;
+                stats.postings_scored +=
+                    score_posting_batch(batch, scorer, term.qtf, &mut scores, &mut top_k);
             }
-            threshold = top_k_threshold(&scores, k);
         }
     }
 
@@ -556,15 +682,13 @@ fn score_terms(
             continue;
         }
         let qtf = query_term_frequency_weight(query_term.frequency, params.k3);
+        let Some(scorer) =
+            Bm25TermScorer::new(avg_doc_len, field_stats.doc_count, doc_freq, params)
+        else {
+            continue;
+        };
         for posting in postings {
-            let score = bm25_term_score(
-                posting.term_frequency,
-                posting.doc_len,
-                avg_doc_len,
-                field_stats.doc_count,
-                doc_freq,
-                params,
-            ) * qtf;
+            let score = scorer.score(posting.term_frequency, posting.doc_len) * qtf;
             if score > 0.0 {
                 *scores.entry(posting.id).or_default() += score;
             }
@@ -609,13 +733,28 @@ fn read_posting_block(
     postcard::from_bytes(&bytes).map_err(|e| Error::Codec(e.to_string()))
 }
 
-fn top_k_threshold(scores: &BTreeMap<Id, f32>, k: usize) -> Option<f32> {
-    if k == 0 || scores.len() < k {
-        return None;
+fn score_posting_batch(
+    postings: &[TermPosting],
+    scorer: Bm25TermScorer,
+    query_weight: f32,
+    scores: &mut BTreeMap<Id, f32>,
+    top_k: &mut TopKTracker,
+) -> u64 {
+    let mut scored = 0u64;
+    for posting in postings {
+        let score = scorer.score(posting.term_frequency, posting.doc_len) * query_weight;
+        if score <= 0.0 {
+            continue;
+        }
+        let new_score = {
+            let entry = scores.entry(posting.id.clone()).or_default();
+            *entry += score;
+            *entry
+        };
+        top_k.observe(posting.id.clone(), new_score);
+        scored += 1;
     }
-    let mut values: Vec<f32> = scores.values().copied().collect();
-    values.sort_by(|a, b| b.total_cmp(a));
-    values.get(k - 1).copied()
+    scored
 }
 
 fn hits_from_scores(scores: BTreeMap<Id, f32>) -> Vec<TextHit> {

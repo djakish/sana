@@ -134,4 +134,6 @@ fn maxscore_skips_blocks_that_cannot_enter_top_k() {
     assert_eq!(ids, vec![Id::U64(0), Id::U64(1), Id::U64(2)]);
     assert_eq!(outcome.stats.blocks_read, 1);
     assert_eq!(outcome.stats.blocks_skipped, 1);
+    assert_eq!(outcome.stats.score_batches, 4);
+    assert_eq!(outcome.stats.postings_scored, 256);
 }
