@@ -488,6 +488,9 @@ Known limitations to improve later:
   compaction still rewrites a full base and clears the append chain. Append
   objects currently reuse the IVF codec and duplicate centroids, so a future
   posting-specific object format should reduce overhead and bound chain length.
+  (Read-path note: `execute_ann_vector` now fetches the whole delta chain
+  concurrently via a `JoinSet`, instead of one round trip per delta — same
+  results, fewer serial object GETs on the vector query hot path.)
 - Maintenance planning is now published in the manifest, and `maintain_vectors`
   can publish bounded-neighborhood reassignment and local split/merge rebuild
   deltas from those tasks.

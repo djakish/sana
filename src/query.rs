@@ -432,8 +432,11 @@ async fn execute_ann_vector(
         Some(metric),
         native_filter.as_ref(),
     )?;
-    for append_meta in &meta.append_indexes {
-        let append_index = VectorIndex::decode(&ns.store().get(&append_meta.key).await?.bytes)?;
+    // The append-delta object keys are known up front, so prefetch them
+    // concurrently (mirroring `read_overlay_ops`) rather than serializing a
+    // round trip per delta; decode + search stays sequential and in order.
+    for bytes in fetch_append_indexes(ns, meta).await? {
+        let append_index = VectorIndex::decode(&bytes)?;
         let append_filter = match filter {
             Some(filter) => match native_filter_mask(&append_index, filter)? {
                 Some(mask) => Some(mask),
@@ -527,6 +530,35 @@ async fn execute_ann_vector(
         rows,
         aggregates: Vec::new(),
     })
+}
+
+/// Fetch every append-delta index object for a vector column concurrently,
+/// returning their bytes in `append_indexes` order. The keys are all known from
+/// the manifest, so the GETs need not be serialized.
+async fn fetch_append_indexes(ns: &Namespace, meta: &VectorIndexMeta) -> Result<Vec<bytes::Bytes>> {
+    if meta.append_indexes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut set = tokio::task::JoinSet::new();
+    for (idx, append_meta) in meta.append_indexes.iter().enumerate() {
+        let store = ns.store().clone();
+        let key = append_meta.key.clone();
+        set.spawn(async move {
+            Ok::<(usize, bytes::Bytes), Error>((idx, store.get(&key).await?.bytes))
+        });
+    }
+
+    let mut slots: Vec<Option<bytes::Bytes>> =
+        (0..meta.append_indexes.len()).map(|_| None).collect();
+    while let Some(res) = set.join_next().await {
+        let (idx, bytes) =
+            res.map_err(|e| Error::Corrupt(format!("append index join error: {e}")))??;
+        slots[idx] = Some(bytes);
+    }
+    Ok(slots
+        .into_iter()
+        .map(|slot| slot.expect("every append slot is filled exactly once"))
+        .collect())
 }
 
 async fn load_vector_version_map(
