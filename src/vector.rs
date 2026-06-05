@@ -107,6 +107,14 @@ pub struct VectorReassignmentDelta {
     pub reassignments: Vec<VectorReassignment>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct VectorLocalRebuildDelta {
+    pub index: VectorIndex,
+    pub version_map: VectorVersionMap,
+    pub rebuilt_ids: Vec<Id>,
+    pub rebuilt_cluster_ids: Vec<u32>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VectorVersionMap {
     pub format_version: u32,
@@ -195,8 +203,19 @@ impl VectorIndex {
         column: impl Into<String>,
         metric: DistanceMetric,
         dim: usize,
+        entries: Vec<VectorEntry>,
+        docs: &BTreeMap<Id, Document>,
+    ) -> Result<Option<Self>> {
+        Self::build_with_cluster_count(column.into(), metric, dim, entries, docs, cluster_count)
+    }
+
+    fn build_with_cluster_count(
+        column: String,
+        metric: DistanceMetric,
+        dim: usize,
         mut entries: Vec<VectorEntry>,
         docs: &BTreeMap<Id, Document>,
+        choose_cluster_count: impl FnOnce(usize) -> usize,
     ) -> Result<Option<Self>> {
         if entries.is_empty() {
             return Ok(None);
@@ -206,7 +225,7 @@ impl VectorIndex {
             validate_query_vector(&entry.vector, dim, "indexed vector")?;
         }
 
-        let cluster_count = cluster_count(entries.len());
+        let cluster_count = choose_cluster_count(entries.len()).clamp(1, entries.len());
         let mut centroids = initial_centroids(&entries, cluster_count);
         let mut assignments = vec![0usize; entries.len()];
 
@@ -238,7 +257,7 @@ impl VectorIndex {
 
         Ok(Some(Self {
             format_version: VECTOR_FORMAT_VERSION,
-            column: column.into(),
+            column,
             dim,
             metric,
             centroids,
@@ -462,11 +481,10 @@ impl VectorIndex {
                 ..Default::default()
             })
             .collect::<Vec<_>>();
-        accumulate_maintenance_stats(self, false, version_map, &mut stats)?;
+        accumulate_maintenance_stats(self, self, false, version_map, &mut stats)?;
 
         for append in append_indexes {
-            validate_append_segment(self, append)?;
-            accumulate_maintenance_stats(append, true, version_map, &mut stats)?;
+            accumulate_maintenance_stats(self, append, true, version_map, &mut stats)?;
         }
 
         let mut tasks = Vec::new();
@@ -546,10 +564,16 @@ impl VectorIndex {
 
         let cluster_ids = self.task_cluster_neighborhood(task)?;
         let mut candidates = BTreeMap::new();
-        collect_live_reassignment_candidates(self, &cluster_ids, version_map, &mut candidates)?;
+        collect_live_reassignment_candidates(
+            self,
+            self,
+            &cluster_ids,
+            version_map,
+            &mut candidates,
+        )?;
         for append in append_indexes {
-            validate_append_segment(self, append)?;
             collect_live_reassignment_candidates(
+                self,
                 append,
                 &cluster_ids,
                 version_map,
@@ -606,6 +630,83 @@ impl VectorIndex {
         }))
     }
 
+    pub fn build_local_rebuild_delta(
+        &self,
+        append_indexes: &[VectorIndex],
+        version_map: &VectorVersionMap,
+        task: &VectorMaintenanceTask,
+        new_version: u64,
+        docs: &BTreeMap<Id, Document>,
+    ) -> Result<Option<VectorLocalRebuildDelta>> {
+        if version_map.column != self.column {
+            return Err(Error::Corrupt(format!(
+                "vector version map column '{}' does not match index column '{}'",
+                version_map.column, self.column
+            )));
+        }
+
+        let cluster_ids = self.task_cluster_neighborhood(task)?;
+        let mut candidates = BTreeMap::new();
+        collect_live_reassignment_candidates(
+            self,
+            self,
+            &cluster_ids,
+            version_map,
+            &mut candidates,
+        )?;
+        for append in append_indexes {
+            collect_live_reassignment_candidates(
+                self,
+                append,
+                &cluster_ids,
+                version_map,
+                &mut candidates,
+            )?;
+        }
+
+        let mut entries = Vec::new();
+        let mut rebuilt_ids = Vec::new();
+        let mut next_version_map = version_map.clone();
+        for (id, candidate) in candidates {
+            if new_version <= candidate.entry.version {
+                return Err(Error::Corrupt(
+                    "vector local rebuild version must be newer than the live copy".into(),
+                ));
+            }
+            next_version_map.versions.insert(id.clone(), new_version);
+            rebuilt_ids.push(id.clone());
+            entries.push(VectorEntry {
+                id,
+                vector: candidate.entry.vector,
+                local_id: 0,
+                version: new_version,
+            });
+        }
+
+        let target_cluster_count = match task.action {
+            VectorMaintenanceAction::Split => 2,
+            VectorMaintenanceAction::Merge => 1,
+        };
+        let Some(index) = VectorIndex::build_with_cluster_count(
+            self.column.clone(),
+            self.metric,
+            self.dim,
+            entries,
+            docs,
+            |_| target_cluster_count,
+        )?
+        else {
+            return Ok(None);
+        };
+        let rebuilt_cluster_ids = cluster_ids.into_iter().collect();
+        Ok(Some(VectorLocalRebuildDelta {
+            index,
+            version_map: next_version_map,
+            rebuilt_ids,
+            rebuilt_cluster_ids,
+        }))
+    }
+
     fn task_cluster_neighborhood(&self, task: &VectorMaintenanceTask) -> Result<BTreeSet<u32>> {
         let mut cluster_ids = BTreeSet::new();
         cluster_ids.insert(task.cluster_id);
@@ -642,6 +743,23 @@ impl VectorIndex {
         }
         best.map(|(cluster_id, _)| cluster_id)
             .ok_or_else(|| Error::Corrupt("empty vector reassignment neighborhood".into()))
+    }
+
+    fn nearest_cluster_for_vector(&self, vector: &[f32]) -> Result<u32> {
+        validate_query_vector(vector, self.dim, "maintenance vector")?;
+        let mut best: Option<(u32, f32)> = None;
+        for (cluster_id, centroid) in self.centroids.iter().enumerate() {
+            let candidate = (cluster_id as u32, score(vector, centroid, self.metric)?);
+            if best.is_none_or(|best| {
+                compare_scores(candidate.1, best.1)
+                    .then_with(|| candidate.0.cmp(&best.0))
+                    .is_lt()
+            }) {
+                best = Some(candidate);
+            }
+        }
+        best.map(|(cluster_id, _)| cluster_id)
+            .ok_or_else(|| Error::Corrupt("vector index has no centroids".into()))
     }
 
     fn nearest_cluster_ids(&self, cluster_id: usize, limit: usize) -> Result<Vec<u32>> {
@@ -755,32 +873,30 @@ struct VectorPostingMaintenanceStats {
     total_rows: u64,
 }
 
-fn validate_append_segment(base: &VectorIndex, append: &VectorIndex) -> Result<()> {
-    if append.column != base.column
-        || append.dim != base.dim
-        || append.metric != base.metric
-        || append.centroids != base.centroids
-    {
-        return Err(Error::Corrupt(format!(
-            "vector append segment for '{}' does not match base index",
-            base.column
-        )));
-    }
-    Ok(())
-}
-
 fn accumulate_maintenance_stats(
+    base: &VectorIndex,
     index: &VectorIndex,
     is_append: bool,
     version_map: Option<&VectorVersionMap>,
     stats: &mut [VectorPostingMaintenanceStats],
 ) -> Result<()> {
+    if index.column != base.column || index.dim != base.dim || index.metric != base.metric {
+        return Err(Error::Corrupt(format!(
+            "vector segment for '{}' does not match base index",
+            base.column
+        )));
+    }
+    let same_topology = index.centroids == base.centroids;
     for posting in &index.postings {
-        let cluster_id = posting.centroid_id as usize;
-        let Some(stat) = stats.get_mut(cluster_id) else {
-            return Err(Error::Corrupt("vector posting id out of bounds".into()));
-        };
         for entry in &posting.vectors {
+            let cluster_id = if same_topology {
+                posting.centroid_id
+            } else {
+                base.nearest_cluster_for_vector(&entry.vector)?
+            } as usize;
+            let Some(stat) = stats.get_mut(cluster_id) else {
+                return Err(Error::Corrupt("vector posting id out of bounds".into()));
+            };
             stat.total_rows += 1;
             if is_append {
                 stat.append_rows += 1;
@@ -796,22 +912,35 @@ fn accumulate_maintenance_stats(
 }
 
 fn collect_live_reassignment_candidates(
+    base: &VectorIndex,
     index: &VectorIndex,
     cluster_ids: &BTreeSet<u32>,
     version_map: &VectorVersionMap,
     out: &mut BTreeMap<Id, ReassignmentCandidate>,
 ) -> Result<()> {
+    if index.column != base.column || index.dim != base.dim || index.metric != base.metric {
+        return Err(Error::Corrupt(format!(
+            "vector segment for '{}' does not match base index",
+            base.column
+        )));
+    }
+    let same_topology = index.centroids == base.centroids;
     for posting in &index.postings {
-        if !cluster_ids.contains(&posting.centroid_id) {
-            continue;
-        }
         for entry in &posting.vectors {
             if !version_map.is_live(&entry.id, entry.version) {
                 continue;
             }
+            let cluster_id = if same_topology {
+                posting.centroid_id
+            } else {
+                base.nearest_cluster_for_vector(&entry.vector)?
+            };
+            if !cluster_ids.contains(&cluster_id) {
+                continue;
+            }
             out.entry(entry.id.clone())
                 .or_insert_with(|| ReassignmentCandidate {
-                    cluster_id: posting.centroid_id,
+                    cluster_id,
                     entry: entry.clone(),
                 });
         }

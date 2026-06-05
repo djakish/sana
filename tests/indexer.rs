@@ -4,8 +4,8 @@ use std::sync::Arc;
 use bytes::Bytes;
 use sana::indexer;
 use sana::manifest::{
-    ManifestPointer, VectorMaintenanceAction, VectorMaintenancePlan, VectorMaintenanceTask,
-    VectorMaintenanceThresholds,
+    ManifestPointer, VectorAppendKind, VectorMaintenanceAction, VectorMaintenancePlan,
+    VectorMaintenanceTask, VectorMaintenanceThresholds,
 };
 use sana::namespace::Namespace;
 use sana::object_store::{FsObjectStore, ObjectStore};
@@ -325,7 +325,7 @@ async fn append_flush_plans_overfull_vector_posting_split() {
 }
 
 #[tokio::test]
-async fn vector_maintenance_publishes_reassignment_delta() {
+async fn vector_maintenance_publishes_local_rebuild_delta() {
     let dir = tempfile::tempdir().unwrap();
     let object_store = store(&dir);
     let ns = Namespace::create(object_store.clone(), "docs")
@@ -374,6 +374,10 @@ async fn vector_maintenance_publishes_reassignment_delta() {
     let maintained = ns.load_manifest().await.unwrap();
     let maintained_meta = maintained.vector_indexes.get("embedding").unwrap();
     assert_eq!(maintained_meta.append_indexes.len(), 1);
+    assert_eq!(
+        maintained_meta.append_indexes[0].kind,
+        VectorAppendKind::LocalRebuild
+    );
     assert!(maintained.generation > manifest.generation);
     let version_map = VectorVersionMap::decode(
         &object_store
@@ -388,7 +392,7 @@ async fn vector_maintenance_publishes_reassignment_delta() {
         Some(maintained.generation)
     );
 
-    let reassign_append = VectorIndex::decode(
+    let local_rebuild = VectorIndex::decode(
         &object_store
             .get(&maintained_meta.append_indexes[0].key)
             .await
@@ -396,9 +400,14 @@ async fn vector_maintenance_publishes_reassignment_delta() {
             .bytes,
     )
     .unwrap();
-    assert_eq!(reassign_append.row_count(), 1);
-    assert_eq!(reassign_append.addresses[0].id, Id::U64(1));
-    assert_eq!(reassign_append.addresses[0].cluster_id, correct_cluster);
+    assert_eq!(local_rebuild.row_count(), 2);
+    assert_eq!(local_rebuild.centroids.len(), 1);
+    assert!(
+        local_rebuild
+            .addresses
+            .iter()
+            .any(|addr| addr.id == Id::U64(1) && addr.version == maintained.generation)
+    );
 
     let ann = ns
         .query(Query {

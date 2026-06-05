@@ -158,3 +158,74 @@ fn reassignment_delta_moves_live_vectors_within_bounded_neighborhood() {
     assert_eq!(delta.index.postings[1].vectors[0].version, 2);
     assert_eq!(delta.index.addresses[0].cluster_id, 1);
 }
+
+#[test]
+fn local_rebuild_delta_splits_overfull_posting_topology() {
+    let docs = [
+        doc_with_vector(1, [0.0, 0.0]),
+        doc_with_vector(2, [1.0, 0.0]),
+        doc_with_vector(3, [10.0, 0.0]),
+        doc_with_vector(4, [11.0, 0.0]),
+    ]
+    .into_iter()
+    .map(|doc| (doc.id.clone(), doc))
+    .collect::<BTreeMap<_, _>>();
+    let index = VectorIndex {
+        format_version: 1,
+        column: "embedding".into(),
+        dim: 2,
+        metric: DistanceMetric::L2,
+        centroids: vec![vec![5.5, 0.0]],
+        postings: vec![VectorPosting {
+            centroid_id: 0,
+            vectors: (1..=4)
+                .map(|id| VectorEntry {
+                    id: Id::U64(id),
+                    vector: match docs[&Id::U64(id)].vectors.get("embedding").unwrap() {
+                        VectorValue::F32(vector) => vector.clone(),
+                        VectorValue::F16(_) => unreachable!(),
+                    },
+                    local_id: (id - 1) as u32,
+                    version: 1,
+                })
+                .collect(),
+        }],
+        addresses: (1..=4)
+            .map(|id| VectorAddress {
+                id: Id::U64(id),
+                cluster_id: 0,
+                local_id: (id - 1) as u32,
+                version: 1,
+            })
+            .collect(),
+        filter_index: VectorFilterIndex::default(),
+    };
+    let version_map = VectorVersionMap::from_index(&index);
+    let task = VectorMaintenanceTask {
+        action: VectorMaintenanceAction::Split,
+        cluster_id: 0,
+        partner_cluster_id: None,
+        neighbor_cluster_ids: Vec::new(),
+        live_rows: 4,
+        stale_rows: 0,
+        append_rows: 0,
+        total_rows: 4,
+    };
+
+    let delta = index
+        .build_local_rebuild_delta(&[], &version_map, &task, 2, &docs)
+        .unwrap()
+        .expect("overfull posting should be locally rebuilt");
+
+    assert_eq!(
+        delta.rebuilt_ids,
+        vec![Id::U64(1), Id::U64(2), Id::U64(3), Id::U64(4)]
+    );
+    assert_eq!(delta.rebuilt_cluster_ids, vec![0]);
+    assert_eq!(delta.index.row_count(), 4);
+    assert_eq!(delta.index.centroids.len(), 2);
+    assert_ne!(delta.index.centroids, index.centroids);
+    for id in 1..=4 {
+        assert_eq!(delta.version_map.live_version(&Id::U64(id)), Some(2));
+    }
+}

@@ -56,6 +56,23 @@ pub struct VectorAppendMeta {
     pub size_bytes: u64,
     pub row_count: u64,
     pub generation: u64,
+    #[serde(default, skip_serializing_if = "VectorAppendKind::is_plain_append")]
+    pub kind: VectorAppendKind,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VectorAppendKind {
+    #[default]
+    Append,
+    Reassign,
+    LocalRebuild,
+}
+
+impl VectorAppendKind {
+    fn is_plain_append(&self) -> bool {
+        matches!(self, Self::Append)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

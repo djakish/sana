@@ -11,13 +11,12 @@ the next unchecked task under "Current milestone" / "Next up".
 
 ## Status snapshot
 
-- **Current stage:** Stage 6 (SPFresh local rebuild) — **in progress**.
-- **Next up:** Execute posting-local split/merge rebuilds, not only
-  reassignment deltas.
+- **Current stage:** Stage 7 (Full-text search) — **in progress**.
+- **Next up:** Tokenizer, BM25 stats, and simple text postings.
 - **Done:** Stage 0 (Skeleton), Stage 1 (Durable Documents), Stage 2 (SST/LSM),
   Stage 3 (Attributes & Exact Search), Stage 4 (ANN v0), Stage 5 (Native
-  Filtering).
-- **Tests:** `cargo test` green (85 tests); `cargo clippy --all-targets` clean.
+  Filtering), Stage 6 (SPFresh local rebuild).
+- **Tests:** `cargo test` green (86 tests); `cargo clippy --all-targets` clean.
 - **Note:** post-Stage-2 and Stage-3–5 code-review fixes applied; remaining
   findings tracked under "Stage 2 — code review follow-ups" and "Stages 3–5 —
   code review follow-ups".
@@ -42,7 +41,7 @@ the next unchecked task under "Current milestone" / "Next up".
       probe + scan + rerank, recall endpoint.
 - [x] **Stage 5 — Native filtering.** Cluster-level summaries, row-level
       bitmaps, filter-aware ANN traversal, filtered recall.
-- [ ] **Stage 6 — SPFresh local rebuild.** Mutable posting append, version map,
+- [x] **Stage 6 — SPFresh local rebuild.** Mutable posting append, version map,
       split/merge/reassign background jobs.
 - [ ] **Stage 7 — Full-text search.** Tokenizer, BM25, block postings,
       vectorized MAXSCORE, hybrid multi-query.
@@ -419,7 +418,7 @@ A high-recall review of the Stage 3–5 diff (`462f44b..HEAD`) ran after it land
 
 ---
 
-## Current milestone: Stage 6 — SPFresh Local Rebuild
+## Stage 6 — SPFresh Local Rebuild (done)
 
 Goal: move from full-snapshot vector rebuilds to SPFresh-style local updates:
 append new vectors into nearby postings, drop stale versions at query time, and
@@ -436,7 +435,7 @@ Planned tasks:
 - [x] Implement bounded-neighborhood reassignment after split/merge.
 - [x] Add tests for insert/delete churn preserving recall without global
       rebuild.
-- [ ] Execute posting-local split/merge rebuilds that change centroids/posting
+- [x] Execute posting-local split/merge rebuilds that change centroids/posting
       layout, then publish reassignment deltas from the new local topology.
 
 Known limitations to improve later:
@@ -446,9 +445,8 @@ Known limitations to improve later:
   objects currently reuse the IVF codec and duplicate centroids, so a future
   posting-specific object format should reduce overhead and bound chain length.
 - Maintenance planning is now published in the manifest, and `maintain_vectors`
-  can publish bounded-neighborhood reassignment deltas from those tasks.
-  Actual split/merge execution that changes centroids/posting layout is still
-  future work.
+  can publish bounded-neighborhood reassignment and local split/merge rebuild
+  deltas from those tasks.
 - Version numbers are currently index generation numbers. Future append objects
   should use monotonic per-column vector versions or WAL positions so local
   rebuilds can CAS the map without rebuilding unrelated postings.
@@ -485,10 +483,32 @@ Stage 6 decisions / notes so far:
   garbage collection to later compaction.
 - **D37 — Vector maintenance is an explicit indexer pass.** `maintain_vectors`
   runs only when WAL is fully indexed, reads manifest-published maintenance
-  tasks, writes at most one reassignment append object per vector column, updates
-  that column's version map, recomputes the maintenance plan, and CAS-publishes
-  a new manifest generation. This keeps foreground flush simple and preserves
-  the write/indexing freshness boundary.
+  tasks, writes at most one vector maintenance append object per vector column,
+  updates that column's version map, recomputes the maintenance plan, and
+  CAS-publishes a new manifest generation. This keeps foreground flush simple
+  and preserves the write/indexing freshness boundary.
+- **D38 — Split/merge execution is local rebuild append objects.** A split or
+  merge task gathers live vectors from the planned bounded neighborhood, writes
+  a new local IVF segment with action-specific topology (two centroids for
+  split, one for merge), and advances the version map for rebuilt ids. Query
+  treats that local rebuild segment like any other vector segment, while stale
+  copies in the old base/append objects are filtered by version.
+
+---
+
+## Current milestone: Stage 7 — Full-Text Search
+
+Goal: add a first full-text search path: tokenize configured text attributes,
+publish simple immutable term postings with BM25 statistics, and let queries
+rank/filter by text before upgrading to fixed posting blocks and MAXSCORE.
+
+Planned tasks:
+
+- [ ] Add text schema support and tokenizer configuration.
+- [ ] Build immutable full-text postings during flush/compaction.
+- [ ] Implement BM25 scoring over text postings.
+- [ ] Add text query API/CLI support and hybrid-ready score plumbing.
+- [ ] Add tests for tokenization, ranking, filtering, and SST persistence.
 
 ---
 

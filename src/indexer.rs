@@ -21,7 +21,8 @@ use crate::attr;
 use crate::doc::{DocRecord, encode_id};
 use crate::error::Result;
 use crate::manifest::{
-    NamespaceManifest, SstMeta, VectorAppendMeta, VectorIndexMeta, VectorMaintenancePlan,
+    NamespaceManifest, SstMeta, VectorAppendKind, VectorAppendMeta, VectorIndexMeta,
+    VectorMaintenancePlan, VectorMaintenanceTask,
 };
 use crate::namespace::{Namespace, apply_op, now_ms, op_id};
 use crate::schema::{ColumnType, DistanceMetric};
@@ -271,6 +272,7 @@ async fn publish_vector_append(
             size_bytes,
             row_count: append.row_count() as u64,
             generation,
+            kind: VectorAppendKind::Append,
         });
         append_segments.push(append);
     }
@@ -534,8 +536,7 @@ pub async fn compact(ns: &Namespace) -> Result<bool> {
 }
 
 /// Execute one bounded vector maintenance pass from the manifest's planned
-/// split/merge tasks. Returns `true` if it published at least one reassignment
-/// delta.
+/// split/merge tasks. Returns `true` if it published at least one vector delta.
 pub async fn maintain_vectors(ns: &Namespace) -> Result<bool> {
     let snapshot = ns.load_manifest_snapshot().await?;
     let mut manifest = snapshot.manifest;
@@ -557,45 +558,90 @@ pub async fn maintain_vectors(ns: &Namespace) -> Result<bool> {
         let base = VectorIndex::decode(&ns.store().get(&meta.key).await?.bytes)?;
         let mut append_segments = load_vector_append_segments(ns, meta).await?;
         let version_map = load_vector_version_map(ns, meta, &base).await?;
-        let Some((task_idx, delta)) = first_reassignment_delta(
+        let published = match first_local_rebuild_delta(
             &base,
             &append_segments,
             &version_map,
             plan,
             new_gen,
             &live_docs,
-        )?
-        else {
-            continue;
+        )? {
+            Some((task_idx, task, delta)) => {
+                let bytes = delta.index.encode()?;
+                let key = format!(
+                    "namespaces/{}/index/g/{}/vector/{}/local-rebuild-{}-{}.ivf.bin",
+                    ns.name(),
+                    new_gen,
+                    object_path_component(column),
+                    new_gen,
+                    task_idx
+                );
+                ns.store().put(&key, Bytes::from(bytes.clone())).await?;
+
+                let mut append_indexes = meta.append_indexes.clone();
+                append_indexes.push(VectorAppendMeta {
+                    key,
+                    size_bytes: bytes.len() as u64,
+                    row_count: delta.index.row_count() as u64,
+                    generation: new_gen,
+                    kind: VectorAppendKind::LocalRebuild,
+                });
+                append_segments.push(delta.index);
+                let mut maintenance_plan = maintenance_plan_if_not_empty(base.plan_maintenance(
+                    &append_segments,
+                    Some(&delta.version_map),
+                    base.maintenance_thresholds(),
+                )?);
+                suppress_rebuilt_cluster_tasks(&mut maintenance_plan, &task);
+                Some((append_indexes, delta.version_map, maintenance_plan))
+            }
+            None => {
+                let Some((task_idx, delta)) = first_reassignment_delta(
+                    &base,
+                    &append_segments,
+                    &version_map,
+                    plan,
+                    new_gen,
+                    &live_docs,
+                )?
+                else {
+                    continue;
+                };
+
+                let bytes = delta.index.encode()?;
+                let key = format!(
+                    "namespaces/{}/index/g/{}/vector/{}/reassign-{}-{}.ivf.bin",
+                    ns.name(),
+                    new_gen,
+                    object_path_component(column),
+                    new_gen,
+                    task_idx
+                );
+                ns.store().put(&key, Bytes::from(bytes.clone())).await?;
+
+                let mut append_indexes = meta.append_indexes.clone();
+                append_indexes.push(VectorAppendMeta {
+                    key,
+                    size_bytes: bytes.len() as u64,
+                    row_count: delta.index.row_count() as u64,
+                    generation: new_gen,
+                    kind: VectorAppendKind::Reassign,
+                });
+                append_segments.push(delta.index);
+                let maintenance_plan = maintenance_plan_if_not_empty(base.plan_maintenance(
+                    &append_segments,
+                    Some(&delta.version_map),
+                    base.maintenance_thresholds(),
+                )?);
+                Some((append_indexes, delta.version_map, maintenance_plan))
+            }
         };
 
-        let bytes = delta.index.encode()?;
-        let key = format!(
-            "namespaces/{}/index/g/{}/vector/{}/reassign-{}-{}.ivf.bin",
-            ns.name(),
-            new_gen,
-            object_path_component(column),
-            new_gen,
-            task_idx
-        );
-        ns.store().put(&key, Bytes::from(bytes.clone())).await?;
-
-        let mut append_indexes = meta.append_indexes.clone();
-        append_indexes.push(VectorAppendMeta {
-            key,
-            size_bytes: bytes.len() as u64,
-            row_count: delta.index.row_count() as u64,
-            generation: new_gen,
-        });
-        append_segments.push(delta.index);
-
-        let maintenance_plan = maintenance_plan_if_not_empty(base.plan_maintenance(
-            &append_segments,
-            Some(&delta.version_map),
-            base.maintenance_thresholds(),
-        )?);
+        let Some((append_indexes, version_map, maintenance_plan)) = published else {
+            continue;
+        };
         let (version_map_key, version_map_size_bytes) =
-            publish_vector_version_map(ns, new_gen, column, &delta.version_map).await?;
+            publish_vector_version_map(ns, new_gen, column, &version_map).await?;
 
         vector_indexes.insert(
             column.clone(),
@@ -606,7 +652,7 @@ pub async fn maintain_vectors(ns: &Namespace) -> Result<bool> {
                 version_map_size_bytes,
                 append_indexes,
                 maintenance_plan,
-                row_count: delta.version_map.versions.len() as u64,
+                row_count: version_map.versions.len() as u64,
                 centroid_count: meta.centroid_count,
                 dim: meta.dim,
                 metric: meta.metric,
@@ -642,6 +688,30 @@ pub async fn maintain_vectors(ns: &Namespace) -> Result<bool> {
     Ok(true)
 }
 
+fn first_local_rebuild_delta(
+    base: &VectorIndex,
+    append_segments: &[VectorIndex],
+    version_map: &VectorVersionMap,
+    plan: &VectorMaintenancePlan,
+    new_version: u64,
+    docs: &BTreeMap<Id, Document>,
+) -> Result<
+    Option<(
+        usize,
+        VectorMaintenanceTask,
+        crate::vector::VectorLocalRebuildDelta,
+    )>,
+> {
+    for (task_idx, task) in plan.tasks.iter().enumerate() {
+        if let Some(delta) =
+            base.build_local_rebuild_delta(append_segments, version_map, task, new_version, docs)?
+        {
+            return Ok(Some((task_idx, task.clone(), delta)));
+        }
+    }
+    Ok(None)
+}
+
 fn first_reassignment_delta(
     base: &VectorIndex,
     append_segments: &[VectorIndex],
@@ -658,4 +728,28 @@ fn first_reassignment_delta(
         }
     }
     Ok(None)
+}
+
+fn suppress_rebuilt_cluster_tasks(
+    maintenance_plan: &mut Option<VectorMaintenancePlan>,
+    completed_task: &VectorMaintenanceTask,
+) {
+    let Some(plan) = maintenance_plan else {
+        return;
+    };
+    let mut completed = BTreeSet::new();
+    completed.insert(completed_task.cluster_id);
+    if let Some(partner) = completed_task.partner_cluster_id {
+        completed.insert(partner);
+    }
+    completed.extend(completed_task.neighbor_cluster_ids.iter().copied());
+    plan.tasks.retain(|task| {
+        !completed.contains(&task.cluster_id)
+            && task
+                .partner_cluster_id
+                .is_none_or(|partner| !completed.contains(&partner))
+    });
+    if plan.tasks.is_empty() {
+        *maintenance_plan = None;
+    }
 }
