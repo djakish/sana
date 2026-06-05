@@ -166,6 +166,42 @@ async fn compaction_collapses_ssts_and_drops_tombstones() {
 }
 
 #[tokio::test]
+async fn flush_and_compact_update_stats() {
+    let dir = tempfile::tempdir().unwrap();
+    let ns = Namespace::create(store(&dir), "docs").await.unwrap();
+    ns.upsert(doc_with(1, "alpha", 10)).await.unwrap();
+    ns.upsert(doc_with(2, "beta", 20)).await.unwrap();
+    indexer::flush(&ns).await.unwrap();
+
+    let m = ns.load_manifest().await.unwrap();
+    assert_eq!(m.approx_row_count, 2);
+    assert!(m.approx_logical_bytes > 0);
+    assert_eq!(
+        m.approx_logical_bytes,
+        m.doc_ssts.iter().map(|s| s.size_bytes).sum::<u64>()
+    );
+
+    // Overwrite one, delete one, flush: live rows drop to 1 (counted across the
+    // SST base + the new delta, not just the touched ids).
+    ns.upsert(doc_with(1, "alpha2", 11)).await.unwrap();
+    ns.delete(Id::U64(2)).await.unwrap();
+    indexer::flush(&ns).await.unwrap();
+    let m = ns.load_manifest().await.unwrap();
+    assert_eq!(m.approx_row_count, 1);
+    assert_eq!(
+        m.approx_logical_bytes,
+        m.doc_ssts.iter().map(|s| s.size_bytes).sum::<u64>()
+    );
+
+    // Compaction keeps the count and resets bytes to the single compacted file.
+    assert!(indexer::compact(&ns).await.unwrap());
+    let m = ns.load_manifest().await.unwrap();
+    assert_eq!(m.approx_row_count, 1);
+    assert_eq!(m.doc_ssts.len(), 1);
+    assert_eq!(m.approx_logical_bytes, m.doc_ssts[0].size_bytes);
+}
+
+#[tokio::test]
 async fn compaction_noop_with_single_sst() {
     let dir = tempfile::tempdir().unwrap();
     let ns = Namespace::create(store(&dir), "docs").await.unwrap();

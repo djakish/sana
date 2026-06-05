@@ -14,7 +14,9 @@ the next unchecked task under "Current milestone" / "Next up".
 - **Current stage:** Stage 2 (SST/LSM) — **complete**.
 - **Next stage:** Stage 3 (Attributes & Exact Search).
 - **Done:** Stage 0 (Skeleton), Stage 1 (Durable Documents), Stage 2 (SST/LSM).
-- **Tests:** `cargo test` green (51 tests); `cargo clippy --all-targets` clean.
+- **Tests:** `cargo test` green (52 tests); `cargo clippy --all-targets` clean.
+- **Note:** post-Stage-2 code-review fixes applied (efficiency + stats +
+  dedup); remaining findings tracked under "Stage 2 — code review follow-ups".
 - **Last updated:** 2026-06-05.
 
 ---
@@ -132,6 +134,61 @@ Known limitations to fix later:
 - No automatic flush trigger (backpressure on unindexed WAL bytes) — flush is
   manual via API/CLI. Wire a trigger when the indexing queue lands (Stage 9).
 - `replay` still loads all SSTs fully; fine until namespaces get large.
+
+---
+
+## Stage 2 — code review follow-ups
+
+A high-effort recall review of the Stage 2 diff ran after it landed. Outcomes:
+
+**Fixed (committed as the review-fixes change):**
+
+- **Efficiency — flush re-loaded every SST per touched id.** `flush` now loads
+  the merged SST records once (`Namespace::sst_records`) and seeds bases from
+  that map, instead of O(touched × ssts) object GETs.
+- **Efficiency — overlay WAL read was sequential.** `read_overlay_ops` now
+  issues the (known-up-front) WAL GETs concurrently via a `JoinSet` and
+  re-orders results by sequence.
+- **Stats — manifest counters went stale.** `flush` now sets
+  `approx_row_count` (exact, base + delta) and `approx_logical_bytes` (sum of
+  SST sizes); `compact` also sets `approx_logical_bytes`. Covered by
+  `tests/indexer.rs::flush_and_compact_update_stats`.
+- **Altitude — merge logic was duplicated.** The "merge all doc SSTs, newest
+  wins" loop now lives once in `Namespace::sst_records`, shared by `replay`,
+  `compact`, and `flush`. `lookup` intentionally keeps the point-get path
+  (`sst_point_get`): early-stop + min/max pruning for a single id.
+
+**Outstanding (address before/within Stage 3 — none fire under the current
+single-process, epoch-0, trusted-storage assumptions, but they are real):**
+
+- [ ] **Concurrency: non-atomic manifest publish.** `commit_manifest` `put`s
+      the new body before the pointer CAS, so two indexers at the same `new_gen`
+      let the CAS loser overwrite the winner's body. Fix when concurrent
+      indexers become possible (write body under a content-unique/generation
+      key only after — or make publish a single CAS). Latent today (manual,
+      single-process flush).
+- [ ] **Epoch-blind reads.** `read_overlay_ops` builds WAL keys with `to.epoch`
+      and `flush`'s `from_seq >= commit.seq` compares only `seq`; both break if
+      the WAL epoch ever rotates. Make the overlay range epoch-aware when epoch
+      rotation is implemented.
+- [ ] **Empty-batch / empty-SST churn.** `append` accepts an empty operations
+      batch (advances the commit cursor); `flush` then writes a zero-row SST
+      with `min_id/max_id = None` that can never be pruned. Reject empty
+      batches and/or skip emitting an empty SST.
+- [ ] **Point lookups load whole SSTs.** Implement the ranged read (footer →
+      index → one block) the SST format already supports (D16).
+- [ ] **Dead manifest field.** `wal_commit_cursor` is serialized but never
+      written; either maintain it or remove it.
+- [ ] **SST footer not checksummed.** Unlike blocks/index, footer fields aren't
+      CRC'd, so accidental corruption can overflow/panic instead of erroring;
+      add a footer checksum and use checked arithmetic on parsed offsets.
+- [ ] **`u32` size/offset fields** (restart offsets, index key length) silently
+      truncate for >4 GiB blocks/keys — widen or bound.
+- [ ] **Test gaps.** No test round-trips a manifest with a populated `doc_ssts`
+      (SstMeta serde uncovered), and none asserts `min_id/max_id` or exercises
+      the prune path.
+- [ ] **`load_manifest` vs `indexer::read_manifest`** duplicate the
+      pointer→generation→body load; share one helper.
 
 ---
 

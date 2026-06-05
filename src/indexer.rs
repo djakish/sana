@@ -84,12 +84,14 @@ pub async fn flush(ns: &Namespace) -> Result<bool> {
     let ops = ns.read_overlay_ops(manifest.indexed_cursor, commit).await?;
     let touched: BTreeSet<Id> = ops.iter().map(|op| op_id(op).clone()).collect();
 
-    // Seed each touched id with its current resolved document from existing
-    // SSTs so a Patch in the delta merges onto the full base, not a fragment.
+    // Load existing SST records once (not one point-get per touched id), then
+    // seed each touched id with its resolved base so a Patch in the delta merges
+    // onto the full document rather than a fragment.
+    let base = ns.sst_records(&manifest).await?;
     let mut docs: BTreeMap<Id, Document> = BTreeMap::new();
     for id in &touched {
-        if let Some(DocRecord::Present(base)) = ns.sst_point_get(&manifest, id).await? {
-            docs.insert(id.clone(), base);
+        if let Some(DocRecord::Present(doc)) = base.get(id) {
+            docs.insert(id.clone(), doc.clone());
         }
     }
     for op in ops {
@@ -120,6 +122,16 @@ pub async fn flush(ns: &Namespace) -> Result<bool> {
         .put(&sst_key, Bytes::from(built.bytes.clone()))
         .await?;
 
+    // Exact live-row count after this flush: the new records override the base.
+    let mut merged = base;
+    for (id, rec) in &records {
+        merged.insert(id.clone(), rec.clone());
+    }
+    let row_count = merged
+        .into_values()
+        .filter(|rec| matches!(rec, DocRecord::Present(_)))
+        .count() as u64;
+
     manifest.generation = new_gen;
     manifest.updated_at_ms = now_ms();
     manifest.indexed_cursor = Some(commit);
@@ -133,6 +145,8 @@ pub async fn flush(ns: &Namespace) -> Result<bool> {
             max_id: built.max_id,
         },
     );
+    manifest.approx_row_count = row_count;
+    manifest.approx_logical_bytes = manifest.doc_ssts.iter().map(|m| m.size_bytes).sum();
 
     commit_manifest(ns, ptr_version, new_gen, &manifest).await?;
     Ok(true)
@@ -146,16 +160,10 @@ pub async fn compact(ns: &Namespace) -> Result<bool> {
         return Ok(false);
     }
 
-    let mut seen: BTreeMap<Id, DocRecord> = BTreeMap::new();
-    for meta in &manifest.doc_ssts {
-        let reader = ns.load_sst(&meta.key).await?;
-        for (key, value) in reader.entries()? {
-            seen.entry(crate::doc::decode_id(&key)?)
-                .or_insert(DocRecord::decode(&value)?);
-        }
-    }
     // Full compaction: nothing older remains, so tombstones can be dropped.
-    let live: BTreeMap<Id, DocRecord> = seen
+    let live: BTreeMap<Id, DocRecord> = ns
+        .sst_records(&manifest)
+        .await?
         .into_iter()
         .filter(|(_, rec)| matches!(rec, DocRecord::Present(_)))
         .collect();
@@ -174,6 +182,7 @@ pub async fn compact(ns: &Namespace) -> Result<bool> {
     manifest.generation = new_gen;
     manifest.updated_at_ms = now_ms();
     manifest.approx_row_count = built.row_count;
+    manifest.approx_logical_bytes = built.bytes.len() as u64;
     manifest.doc_ssts = vec![SstMeta {
         key: sst_key,
         size_bytes: built.bytes.len() as u64,

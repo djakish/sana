@@ -22,7 +22,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 
-use crate::doc::{DocRecord, encode_id};
+use crate::doc::{DocRecord, decode_id, encode_id};
 use crate::error::{Error, Result};
 use crate::manifest::{ManifestPointer, NamespaceManifest};
 use crate::object_store::ObjectStore;
@@ -148,21 +148,60 @@ impl Namespace {
 
     /// Collect WAL operations after `from` (exclusive) up to and including `to`,
     /// in commit order. This is the recent-write overlay merged on top of SSTs.
+    ///
+    /// The WAL keys are all known up front, so the GETs are issued concurrently
+    /// and the results re-ordered by sequence (the overlay is expected to be
+    /// small — bounded by how far indexing lags writes).
     pub(crate) async fn read_overlay_ops(
         &self,
         from: Option<WalCursor>,
         to: WalCursor,
     ) -> Result<Vec<WalOp>> {
         let start = from.map(|c| c.seq + 1).unwrap_or(1);
+        if start > to.seq {
+            return Ok(Vec::new());
+        }
+
+        let mut set = tokio::task::JoinSet::new();
+        for (idx, seq) in (start..=to.seq).enumerate() {
+            let store = self.store.clone();
+            let key = wal_key(&self.name, WalCursor::new(to.epoch, seq));
+            set.spawn(async move {
+                let got = store.get(&key).await?;
+                Ok::<(usize, Vec<WalOp>), Error>((idx, WalBatch::decode(&got.bytes)?.operations))
+            });
+        }
+
+        let mut slots: Vec<Option<Vec<WalOp>>> = (start..=to.seq).map(|_| None).collect();
+        while let Some(res) = set.join_next().await {
+            let (idx, batch_ops) =
+                res.map_err(|e| Error::Corrupt(format!("overlay join error: {e}")))??;
+            slots[idx] = Some(batch_ops);
+        }
+
         let mut ops = Vec::new();
-        for seq in start..=to.seq {
-            let got = self
-                .store
-                .get(&wal_key(&self.name, WalCursor::new(to.epoch, seq)))
-                .await?;
-            ops.extend(WalBatch::decode(&got.bytes)?.operations);
+        for slot in slots {
+            ops.extend(slot.expect("every overlay slot is filled exactly once"));
         }
         Ok(ops)
+    }
+
+    /// Merge all document SSTs into the newest-wins record map (one record per
+    /// id, present or tombstone). Loads each SST object exactly once. Shared by
+    /// full reads, flush base resolution, and compaction.
+    pub(crate) async fn sst_records(
+        &self,
+        manifest: &NamespaceManifest,
+    ) -> Result<BTreeMap<Id, DocRecord>> {
+        let mut seen: BTreeMap<Id, DocRecord> = BTreeMap::new();
+        for meta in &manifest.doc_ssts {
+            let reader = self.load_sst(&meta.key).await?;
+            for (key, value) in reader.entries()? {
+                seen.entry(decode_id(&key)?)
+                    .or_insert(DocRecord::decode(&value)?);
+            }
+        }
+        Ok(seen)
     }
 
     /// Resolve the newest SST record for an id (point lookup, newest-first),
@@ -258,15 +297,9 @@ impl Namespace {
         let manifest = self.load_manifest().await?;
         let commit = self.commit_cursor().await?;
 
-        let mut seen: BTreeMap<Id, DocRecord> = BTreeMap::new();
-        for meta in &manifest.doc_ssts {
-            let reader = self.load_sst(&meta.key).await?;
-            for (key, value) in reader.entries()? {
-                seen.entry(crate::doc::decode_id(&key)?)
-                    .or_insert(DocRecord::decode(&value)?);
-            }
-        }
-        let mut docs: BTreeMap<Id, Document> = seen
+        let mut docs: BTreeMap<Id, Document> = self
+            .sst_records(&manifest)
+            .await?
             .into_iter()
             .filter_map(|(id, rec)| match rec {
                 DocRecord::Present(d) => Some((id, d)),
@@ -281,6 +314,9 @@ impl Namespace {
     }
 
     /// Strong primary-key lookup: SST base for the id with the overlay applied.
+    /// Unlike `replay`, this uses the point-get path (`sst_point_get`): it stops
+    /// at the first SST containing the id and prunes by `[min_id, max_id]`,
+    /// rather than merging every SST.
     pub async fn lookup(&self, id: &Id) -> Result<Option<Document>> {
         let manifest = self.load_manifest().await?;
         let commit = self.commit_cursor().await?;
