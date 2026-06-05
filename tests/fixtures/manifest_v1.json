@@ -1,0 +1,42 @@
+{
+  "format_version": 1,
+  "namespace": "docs",
+  "generation": 3,
+  "schema": {
+    "columns": {
+      "embedding": {
+        "column_type": {
+          "Vector": {
+            "dim": 768,
+            "encoding": "F32",
+            "metric": "Cosine"
+          }
+        },
+        "filterable": false,
+        "indexed": true
+      },
+      "title": {
+        "column_type": {
+          "Scalar": "String"
+        },
+        "filterable": true,
+        "indexed": true
+      }
+    },
+    "version": 1
+  },
+  "wal_commit_cursor": {
+    "epoch": 0,
+    "seq": 12
+  },
+  "indexed_cursor": {
+    "epoch": 0,
+    "seq": 9
+  },
+  "vector_index_generations": {},
+  "branch_parent": null,
+  "approx_logical_bytes": 4000000,
+  "approx_row_count": 1000,
+  "created_at_ms": 1700000000000,
+  "updated_at_ms": 1700000500000
+}
