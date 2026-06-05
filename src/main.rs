@@ -26,6 +26,7 @@ async fn main() -> CliResult {
         Some("recall") => recall(&args).await,
         Some("flush") => flush(&args).await,
         Some("compact") => compact(&args).await,
+        Some("gc") => gc(&args).await,
         Some("maintain-vectors") => maintain_vectors(&args).await,
         Some("demo") => demo(&args).await,
         _ => {
@@ -50,6 +51,7 @@ fn usage() {
     eprintln!("  sana recall  <dir> <ns> [json-recall-request]");
     eprintln!("  sana flush   <dir> <ns>   # fold WAL into a document SST");
     eprintln!("  sana compact <dir> <ns>   # merge SSTs, drop tombstones");
+    eprintln!("  sana gc      <dir> <ns> [--apply]   # report (or delete) orphaned objects");
     eprintln!("  sana maintain-vectors <dir> <ns>   # run one vector maintenance pass");
     eprintln!("  sana demo    <dir>");
 }
@@ -201,6 +203,32 @@ async fn compact(args: &[String]) -> CliResult {
             "nothing to compact"
         }
     );
+    Ok(())
+}
+
+async fn gc(args: &[String]) -> CliResult {
+    let (dir, ns) = (arg(args, 2)?, arg(args, 3)?);
+    let apply = args.iter().any(|a| a == "--apply");
+    let namespace = Namespace::open(store(dir), ns).await?;
+    let report = sana::indexer::gc(&namespace, apply).await?;
+    let verb = if report.applied {
+        "deleted"
+    } else {
+        "reclaimable"
+    };
+    println!(
+        "{} {} orphaned object(s), {} bytes {verb} ({} live)",
+        report.orphan_keys.len(),
+        if report.applied { "" } else { "(dry run)" },
+        report.orphan_bytes,
+        report.live_count,
+    );
+    if !report.applied && !report.orphan_keys.is_empty() {
+        for key in &report.orphan_keys {
+            println!("  {key}");
+        }
+        println!("re-run with --apply to delete");
+    }
     Ok(())
 }
 

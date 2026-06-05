@@ -24,11 +24,15 @@ use crate::manifest::{
     NamespaceManifest, SstMeta, VectorAppendKind, VectorAppendMeta, VectorIndexMeta,
     VectorMaintenancePlan, VectorMaintenanceTask,
 };
-use crate::namespace::{Namespace, apply_op, now_ms, op_id};
+use crate::namespace::{
+    Namespace, apply_op, manifest_body_key_for_pointer, manifest_pointer_key, now_ms, op_id,
+    wal_commit_key, wal_key,
+};
 use crate::schema::{ColumnType, DistanceMetric};
 use crate::sst::SstWriter;
 use crate::value::{Document, Id};
 use crate::vector::{VectorEntry, VectorIndex, VectorVersionMap, vector_to_f32};
+use crate::wal::WalCursor;
 
 fn vector_family_bytes(meta: &VectorIndexMeta) -> u64 {
     meta.size_bytes
@@ -685,6 +689,87 @@ pub async fn compact(ns: &Namespace) -> Result<bool> {
     ns.publish_manifest(snapshot.pointer_version, &manifest)
         .await?;
     Ok(true)
+}
+
+/// What a [`gc`] pass found (and, if `applied`, deleted).
+#[derive(Clone, Debug, Default)]
+pub struct GcReport {
+    pub orphan_keys: Vec<String>,
+    pub orphan_bytes: u64,
+    pub live_count: usize,
+    pub applied: bool,
+}
+
+/// Reclaim objects under a namespace prefix that the current manifest no longer
+/// references: superseded SST runs (from tiering/compaction), stale vector
+/// objects, old manifest bodies, and WAL batches already folded into the index.
+///
+/// With `apply = false` this only reports; with `apply = true` it deletes the
+/// orphans. The live set is computed from the *current* manifest pointer, so an
+/// object is kept iff the read path can still reach it: the pointer and its
+/// manifest body, the commit cursor, every doc/attr/vector run (plus version
+/// maps and append deltas) named by the manifest, and the unindexed WAL overlay
+/// `(indexed_cursor, commit]`. Everything else under the prefix is orphaned.
+///
+/// Assumes single-writer quiescence, like the filesystem store's CAS (D4): a
+/// concurrent reader still holding an older manifest could reference an object
+/// being deleted. Run it when the namespace is idle.
+pub async fn gc(ns: &Namespace, apply: bool) -> Result<GcReport> {
+    let snapshot = ns.load_manifest_snapshot().await?;
+    let manifest = &snapshot.manifest;
+    let commit = ns.commit_cursor().await?;
+
+    let mut live: BTreeSet<String> = BTreeSet::new();
+    live.insert(manifest_pointer_key(ns.name()));
+    live.insert(wal_commit_key(ns.name()));
+    live.insert(manifest_body_key_for_pointer(ns.name(), &snapshot.pointer));
+    for meta in manifest.doc_ssts.iter().chain(&manifest.attr_ssts) {
+        live.insert(meta.key.clone());
+    }
+    for vmeta in manifest.vector_indexes.values() {
+        live.insert(vmeta.key.clone());
+        if let Some(key) = &vmeta.version_map_key {
+            live.insert(key.clone());
+        }
+        for append in &vmeta.append_indexes {
+            live.insert(append.key.clone());
+        }
+    }
+    // The unindexed WAL overlay the read path still merges: `(indexed_cursor,
+    // commit]`. WAL at or before `indexed_cursor` is already in the SSTs.
+    let from = manifest.indexed_cursor.map(|c| c.seq + 1).unwrap_or(1);
+    for seq in from..=commit.seq {
+        live.insert(wal_key(ns.name(), WalCursor::new(commit.epoch, seq)));
+    }
+
+    let objects = ns
+        .store()
+        .list(&format!("namespaces/{}/", ns.name()))
+        .await?;
+    let mut orphan_keys = Vec::new();
+    let mut orphan_bytes = 0u64;
+    let mut live_count = 0usize;
+    for object in &objects {
+        if live.contains(&object.key) {
+            live_count += 1;
+        } else {
+            orphan_bytes += object.size;
+            orphan_keys.push(object.key.clone());
+        }
+    }
+
+    if apply {
+        for key in &orphan_keys {
+            ns.store().delete(key).await?;
+        }
+    }
+
+    Ok(GcReport {
+        orphan_keys,
+        orphan_bytes,
+        live_count,
+        applied: apply,
+    })
 }
 
 /// Execute one bounded vector maintenance pass from the manifest's planned

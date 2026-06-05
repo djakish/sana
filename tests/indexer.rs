@@ -741,6 +741,58 @@ async fn attr_postings_are_delta_appended_and_tiered() {
 }
 
 #[tokio::test]
+async fn gc_reclaims_orphans_and_preserves_live_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let ns = Namespace::create(store(&dir), "docs").await.unwrap();
+
+    // Make orphans: two flushes (superseding manifest bodies + indexing WAL
+    // seqs 1..=3), then a compaction (superseding both flushes' doc/attr runs).
+    ns.upsert(doc_with(1, "a", 1)).await.unwrap();
+    ns.upsert(doc_with(2, "b", 2)).await.unwrap();
+    indexer::flush(&ns).await.unwrap();
+    ns.upsert(doc_with(3, "c", 3)).await.unwrap();
+    indexer::flush(&ns).await.unwrap();
+    indexer::compact(&ns).await.unwrap();
+    // A live, unindexed write: its WAL object is in the overlay and must survive.
+    ns.upsert(doc_with(4, "d", 4)).await.unwrap();
+
+    // Dry run reports orphans but deletes nothing.
+    let report = indexer::gc(&ns, false).await.unwrap();
+    assert!(!report.applied);
+    assert!(
+        !report.orphan_keys.is_empty(),
+        "tiering/compaction should leave orphaned runs and manifests"
+    );
+    assert!(report.orphan_bytes > 0);
+    assert_eq!(ns.replay().await.unwrap().len(), 4); // dry run is read-only
+
+    // Apply deletes exactly the reported orphans, and every live read still works.
+    let applied = indexer::gc(&ns, true).await.unwrap();
+    assert!(applied.applied);
+    assert_eq!(applied.orphan_keys, report.orphan_keys);
+    assert_eq!(ns.replay().await.unwrap().len(), 4);
+    // The compacted SST survived (indexed rows)…
+    assert_eq!(
+        ns.lookup(&Id::U64(1)).await.unwrap(),
+        Some(doc_with(1, "a", 1))
+    );
+    // …and so did the live unindexed WAL batch (overlay row).
+    assert_eq!(
+        ns.lookup(&Id::U64(4)).await.unwrap(),
+        Some(doc_with(4, "d", 4))
+    );
+
+    // Idempotent: a second pass finds nothing, proving the live set was complete
+    // (we deleted only true orphans, never a referenced object).
+    let again = indexer::gc(&ns, false).await.unwrap();
+    assert!(
+        again.orphan_keys.is_empty(),
+        "second GC should find no orphans, found: {:?}",
+        again.orphan_keys
+    );
+}
+
+#[tokio::test]
 async fn compaction_noop_with_single_sst() {
     let dir = tempfile::tempdir().unwrap();
     let ns = Namespace::create(store(&dir), "docs").await.unwrap();

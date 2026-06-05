@@ -16,14 +16,14 @@ the next unchecked task under "Current milestone" / "Next up".
 - **Done:** Stage 0 (Skeleton), Stage 1 (Durable Documents), Stage 2 (SST/LSM),
   Stage 3 (Attributes & Exact Search), Stage 4 (ANN v0), Stage 5 (Native
   Filtering), Stage 6 (SPFresh local rebuild).
-- **Tests:** `cargo test` green (92 tests); `cargo clippy --all-targets` clean.
+- **Tests:** `cargo test` green (93 tests); `cargo clippy --all-targets` clean.
 - **Note:** post-Stage-2 and Stage-3–5 code-review fixes applied; remaining
   findings tracked under "Stage 2 — code review follow-ups" and "Stages 3–5 —
   code review follow-ups". Recently fixed limitations: Stage 2 ranged
-  point-lookup (`sst::ranged_get`) and LSM levels for `doc_ssts`
-  (`tier_doc_ssts`); Stage 3 attribute write-amplification via delta + tiered
-  `attr_ssts` (`tier_attr_ssts`); vector read path fetches append deltas
-  concurrently.
+  point-lookup (`sst::ranged_get`), LSM levels for `doc_ssts` (`tier_doc_ssts`),
+  and orphaned-object GC (`indexer::gc`, `sana gc [--apply]`); Stage 3 attribute
+  write-amplification via delta + tiered `attr_ssts` (`tier_attr_ssts`); vector
+  read path fetches append deltas concurrently.
 - **Last updated:** 2026-06-06.
 
 ---
@@ -145,8 +145,15 @@ Known limitations to fix later:
   `compact` still merges everything and drops tombstones. Remaining refinement:
   leveling is by run *count*, not bytes, and old runs are orphaned until GC. The
   `level` field is omitted from JSON when 0, so old manifests/goldens are stable.
-- Orphaned SSTs from superseded generations are not GC'd (need an
-  unreferenced-object sweep gated on manifest watermarks).
+- ~~Orphaned SSTs from superseded generations are not GC'd~~ **Done.**
+  `indexer::gc(ns, apply)` lists everything under the namespace prefix and
+  removes anything the current manifest no longer references — superseded
+  doc/attr runs (now plentiful with tiering + attr deltas), stale vector objects,
+  old manifest bodies, and WAL batches already folded into the index — keeping
+  the pointer, current body, cursor, referenced runs, and the unindexed WAL
+  overlay `(indexed_cursor, commit]`. Dry-run by default (`sana gc`), deletes
+  with `--apply`. Assumes single-writer quiescence (D4). A proper concurrent
+  sweep would gate deletion on a reader watermark; left as future work.
 - No automatic flush trigger (backpressure on unindexed WAL bytes) — flush is
   manual via API/CLI. Wire a trigger when the indexing queue lands (Stage 9).
 - `replay` still loads all SSTs fully; fine until namespaces get large.
@@ -633,7 +640,7 @@ Decisions I (the implementer) made; the user delegated architectural calls.
 ```
 src/
   lib.rs                 module exports
-  main.rs                CLI (create/upsert/get/delete/list/query/recall/flush/compact/demo)
+  main.rs                CLI (create/upsert/get/delete/list/query/recall/flush/compact/gc/demo)
   error.rs               shared Error / Result
   value.rs               Id, Value, VectorValue, Document
   schema.rs              ScalarType, ColumnType, Schema, ...
