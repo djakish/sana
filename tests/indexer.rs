@@ -1,10 +1,15 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use sana::indexer;
-use sana::manifest::VectorMaintenanceAction;
+use sana::manifest::{
+    ManifestPointer, VectorMaintenanceAction, VectorMaintenancePlan, VectorMaintenanceTask,
+    VectorMaintenanceThresholds,
+};
 use sana::namespace::Namespace;
 use sana::object_store::{FsObjectStore, ObjectStore};
+use sana::query::{ApproxVectorQuery, Query};
 use sana::schema::DistanceMetric;
 use sana::value::{Document, Id, Value, VectorValue};
 use sana::vector::{VectorIndex, VectorVersionMap};
@@ -49,6 +54,62 @@ fn doc_with_vector(id: u64, title: &str, score: i64, vector: [f32; 2]) -> Docume
     doc.vectors
         .insert("embedding".into(), VectorValue::F32(vector.to_vec()));
     doc
+}
+
+async fn overwrite_current_manifest_body(
+    object_store: &Arc<dyn ObjectStore>,
+    ns: &str,
+    manifest: &sana::manifest::NamespaceManifest,
+) {
+    let pointer = ManifestPointer::decode(
+        &object_store
+            .get(&format!("namespaces/{ns}/manifest/current"))
+            .await
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
+    let body_key = pointer
+        .body_key
+        .unwrap_or_else(|| format!("namespaces/{ns}/manifest/g/{}.json", pointer.generation));
+    object_store
+        .put(&body_key, Bytes::from(manifest.encode().unwrap()))
+        .await
+        .unwrap();
+}
+
+fn move_index_entry_to_other_cluster(index: &mut VectorIndex, id: Id) -> (u32, u32) {
+    let mut moved = None;
+    for posting in &mut index.postings {
+        if let Some(pos) = posting.vectors.iter().position(|entry| entry.id == id) {
+            moved = Some((posting.centroid_id, posting.vectors.remove(pos)));
+            break;
+        }
+    }
+    let (from_cluster, mut entry) = moved.expect("entry exists in vector index");
+    let to_cluster = index
+        .postings
+        .iter()
+        .map(|posting| posting.centroid_id)
+        .find(|cluster_id| *cluster_id != from_cluster)
+        .expect("test index has at least two clusters");
+    entry.local_id = index.postings[to_cluster as usize].vectors.len() as u32;
+    index.postings[to_cluster as usize].vectors.push(entry);
+
+    index.addresses.clear();
+    for posting in &mut index.postings {
+        for (local_id, entry) in posting.vectors.iter_mut().enumerate() {
+            entry.local_id = local_id as u32;
+            index.addresses.push(sana::vector::VectorAddress {
+                id: entry.id.clone(),
+                cluster_id: posting.centroid_id,
+                local_id: entry.local_id,
+                version: entry.version,
+            });
+        }
+    }
+    index.addresses.sort_by(|a, b| a.id.cmp(&b.id));
+    (from_cluster, to_cluster)
 }
 
 #[tokio::test]
@@ -261,6 +322,102 @@ async fn append_flush_plans_overfull_vector_posting_split() {
     assert!(split.live_rows > plan.thresholds.max_posting_rows);
     assert_eq!(split.partner_cluster_id, None);
     assert!(!split.neighbor_cluster_ids.contains(&split.cluster_id));
+}
+
+#[tokio::test]
+async fn vector_maintenance_publishes_reassignment_delta() {
+    let dir = tempfile::tempdir().unwrap();
+    let object_store = store(&dir);
+    let ns = Namespace::create(object_store.clone(), "docs")
+        .await
+        .unwrap();
+    ns.upsert(doc_with_vector(1, "north", 10, [0.0, 10.0]))
+        .await
+        .unwrap();
+    ns.upsert(doc_with_vector(2, "east", 20, [10.0, 0.0]))
+        .await
+        .unwrap();
+    indexer::flush(&ns).await.unwrap();
+
+    let mut manifest = ns.load_manifest().await.unwrap();
+    let meta = manifest.vector_indexes.get("embedding").unwrap().clone();
+    let mut index = VectorIndex::decode(&object_store.get(&meta.key).await.unwrap().bytes).unwrap();
+    let (correct_cluster, wrong_cluster) =
+        move_index_entry_to_other_cluster(&mut index, Id::U64(1));
+    object_store
+        .put(&meta.key, Bytes::from(index.encode().unwrap()))
+        .await
+        .unwrap();
+
+    let meta = manifest.vector_indexes.get_mut("embedding").unwrap();
+    meta.maintenance_plan = Some(VectorMaintenancePlan {
+        thresholds: VectorMaintenanceThresholds {
+            min_posting_rows: 1,
+            max_posting_rows: 2,
+            reassign_neighborhood: 2,
+        },
+        tasks: vec![VectorMaintenanceTask {
+            action: VectorMaintenanceAction::Merge,
+            cluster_id: wrong_cluster,
+            partner_cluster_id: Some(correct_cluster),
+            neighbor_cluster_ids: vec![correct_cluster],
+            live_rows: 2,
+            stale_rows: 0,
+            append_rows: 0,
+            total_rows: 2,
+        }],
+    });
+    overwrite_current_manifest_body(&object_store, "docs", &manifest).await;
+
+    assert!(indexer::maintain_vectors(&ns).await.unwrap());
+
+    let maintained = ns.load_manifest().await.unwrap();
+    let maintained_meta = maintained.vector_indexes.get("embedding").unwrap();
+    assert_eq!(maintained_meta.append_indexes.len(), 1);
+    assert!(maintained.generation > manifest.generation);
+    let version_map = VectorVersionMap::decode(
+        &object_store
+            .get(maintained_meta.version_map_key.as_ref().unwrap())
+            .await
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
+    assert_eq!(
+        version_map.live_version(&Id::U64(1)),
+        Some(maintained.generation)
+    );
+
+    let reassign_append = VectorIndex::decode(
+        &object_store
+            .get(&maintained_meta.append_indexes[0].key)
+            .await
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
+    assert_eq!(reassign_append.row_count(), 1);
+    assert_eq!(reassign_append.addresses[0].id, Id::U64(1));
+    assert_eq!(reassign_append.addresses[0].cluster_id, correct_cluster);
+
+    let ann = ns
+        .query(Query {
+            filter: None,
+            order_by: None,
+            limit: None,
+            aggregates: Vec::new(),
+            exact_vector: None,
+            approx_vector: Some(ApproxVectorQuery {
+                column: "embedding".into(),
+                vector: vec![0.0, 10.0],
+                k: 1,
+                probes: Some(1),
+                metric: Some(DistanceMetric::Cosine),
+            }),
+        })
+        .await
+        .unwrap();
+    assert_eq!(ann.rows[0].id, Id::U64(1));
 }
 
 #[tokio::test]

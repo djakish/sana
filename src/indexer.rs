@@ -57,6 +57,49 @@ struct VectorColumnPublish<'a> {
     dim: usize,
 }
 
+async fn load_vector_append_segments(
+    ns: &Namespace,
+    meta: &VectorIndexMeta,
+) -> Result<Vec<VectorIndex>> {
+    let mut append_segments = Vec::with_capacity(meta.append_indexes.len());
+    for append_meta in &meta.append_indexes {
+        append_segments.push(VectorIndex::decode(
+            &ns.store().get(&append_meta.key).await?.bytes,
+        )?);
+    }
+    Ok(append_segments)
+}
+
+async fn load_vector_version_map(
+    ns: &Namespace,
+    meta: &VectorIndexMeta,
+    base: &VectorIndex,
+) -> Result<VectorVersionMap> {
+    match &meta.version_map_key {
+        Some(key) => VectorVersionMap::decode(&ns.store().get(key).await?.bytes),
+        None => Ok(VectorVersionMap::from_index(base)),
+    }
+}
+
+async fn publish_vector_version_map(
+    ns: &Namespace,
+    generation: u64,
+    column: &str,
+    version_map: &VectorVersionMap,
+) -> Result<(String, u64)> {
+    let version_map_key = format!(
+        "namespaces/{}/index/g/{}/vector/{}/versions.bin",
+        ns.name(),
+        generation,
+        object_path_component(column)
+    );
+    let version_map_bytes = version_map.encode()?;
+    ns.store()
+        .put(&version_map_key, Bytes::from(version_map_bytes.clone()))
+        .await?;
+    Ok((version_map_key, version_map_bytes.len() as u64))
+}
+
 async fn publish_attr_sst(
     ns: &Namespace,
     generation: u64,
@@ -137,7 +180,6 @@ async fn publish_full_vector_index(
     };
     let bytes = index.encode()?;
     let version_map = VectorVersionMap::from_index(&index);
-    let version_map_bytes = version_map.encode()?;
     let maintenance_plan = maintenance_plan_if_not_empty(index.plan_maintenance(
         &[],
         Some(&version_map),
@@ -150,21 +192,14 @@ async fn publish_full_vector_index(
         generation,
         component
     );
-    let version_map_key = format!(
-        "namespaces/{}/index/g/{}/vector/{}/versions.bin",
-        ns.name(),
-        generation,
-        component
-    );
     ns.store().put(&key, Bytes::from(bytes.clone())).await?;
-    ns.store()
-        .put(&version_map_key, Bytes::from(version_map_bytes.clone()))
-        .await?;
+    let (version_map_key, version_map_size_bytes) =
+        publish_vector_version_map(ns, generation, column.name, &version_map).await?;
     Ok(Some(VectorIndexMeta {
         key,
         size_bytes: bytes.len() as u64,
         version_map_key: Some(version_map_key),
-        version_map_size_bytes: version_map_bytes.len() as u64,
+        version_map_size_bytes,
         append_indexes: Vec::new(),
         maintenance_plan,
         row_count: index.row_count() as u64,
@@ -187,16 +222,8 @@ async fn publish_vector_append(
     }
 
     let base = VectorIndex::decode(&ns.store().get(&prev.key).await?.bytes)?;
-    let mut append_segments = Vec::with_capacity(prev.append_indexes.len() + 1);
-    for append_meta in &prev.append_indexes {
-        append_segments.push(VectorIndex::decode(
-            &ns.store().get(&append_meta.key).await?.bytes,
-        )?);
-    }
-    let mut version_map = match &prev.version_map_key {
-        Some(key) => VectorVersionMap::decode(&ns.store().get(key).await?.bytes)?,
-        None => VectorVersionMap::from_index(&base),
-    };
+    let mut append_segments = load_vector_append_segments(ns, prev).await?;
+    let mut version_map = load_vector_version_map(ns, prev, &base).await?;
 
     let mut touched_docs = Vec::new();
     for id in touched {
@@ -254,22 +281,14 @@ async fn publish_vector_append(
         base.maintenance_thresholds(),
     )?);
 
-    let version_map_key = format!(
-        "namespaces/{}/index/g/{}/vector/{}/versions.bin",
-        ns.name(),
-        generation,
-        component
-    );
-    let version_map_bytes = version_map.encode()?;
-    ns.store()
-        .put(&version_map_key, Bytes::from(version_map_bytes.clone()))
-        .await?;
+    let (version_map_key, version_map_size_bytes) =
+        publish_vector_version_map(ns, generation, column.name, &version_map).await?;
 
     Ok(Some(VectorIndexMeta {
         key: prev.key.clone(),
         size_bytes: prev.size_bytes,
         version_map_key: Some(version_map_key),
-        version_map_size_bytes: version_map_bytes.len() as u64,
+        version_map_size_bytes,
         append_indexes,
         maintenance_plan,
         row_count: version_map.versions.len() as u64,
@@ -512,4 +531,131 @@ pub async fn compact(ns: &Namespace) -> Result<bool> {
     ns.publish_manifest(snapshot.pointer_version, &manifest)
         .await?;
     Ok(true)
+}
+
+/// Execute one bounded vector maintenance pass from the manifest's planned
+/// split/merge tasks. Returns `true` if it published at least one reassignment
+/// delta.
+pub async fn maintain_vectors(ns: &Namespace) -> Result<bool> {
+    let snapshot = ns.load_manifest_snapshot().await?;
+    let mut manifest = snapshot.manifest;
+    let commit = ns.commit_cursor().await?;
+    if manifest.indexed_cursor != Some(commit) {
+        return Ok(false);
+    }
+
+    let new_gen = snapshot.pointer.generation + 1;
+    let live_docs = ns.replay().await?;
+    let mut vector_indexes = manifest.vector_indexes.clone();
+    let mut changed = false;
+
+    for (column, meta) in &manifest.vector_indexes {
+        let Some(plan) = &meta.maintenance_plan else {
+            continue;
+        };
+
+        let base = VectorIndex::decode(&ns.store().get(&meta.key).await?.bytes)?;
+        let mut append_segments = load_vector_append_segments(ns, meta).await?;
+        let version_map = load_vector_version_map(ns, meta, &base).await?;
+        let Some((task_idx, delta)) = first_reassignment_delta(
+            &base,
+            &append_segments,
+            &version_map,
+            plan,
+            new_gen,
+            &live_docs,
+        )?
+        else {
+            continue;
+        };
+
+        let bytes = delta.index.encode()?;
+        let key = format!(
+            "namespaces/{}/index/g/{}/vector/{}/reassign-{}-{}.ivf.bin",
+            ns.name(),
+            new_gen,
+            object_path_component(column),
+            new_gen,
+            task_idx
+        );
+        ns.store().put(&key, Bytes::from(bytes.clone())).await?;
+
+        let mut append_indexes = meta.append_indexes.clone();
+        append_indexes.push(VectorAppendMeta {
+            key,
+            size_bytes: bytes.len() as u64,
+            row_count: delta.index.row_count() as u64,
+            generation: new_gen,
+        });
+        append_segments.push(delta.index);
+
+        let maintenance_plan = maintenance_plan_if_not_empty(base.plan_maintenance(
+            &append_segments,
+            Some(&delta.version_map),
+            base.maintenance_thresholds(),
+        )?);
+        let (version_map_key, version_map_size_bytes) =
+            publish_vector_version_map(ns, new_gen, column, &delta.version_map).await?;
+
+        vector_indexes.insert(
+            column.clone(),
+            VectorIndexMeta {
+                key: meta.key.clone(),
+                size_bytes: meta.size_bytes,
+                version_map_key: Some(version_map_key),
+                version_map_size_bytes,
+                append_indexes,
+                maintenance_plan,
+                row_count: delta.version_map.versions.len() as u64,
+                centroid_count: meta.centroid_count,
+                dim: meta.dim,
+                metric: meta.metric,
+            },
+        );
+        manifest
+            .vector_index_generations
+            .insert(column.clone(), new_gen);
+        changed = true;
+    }
+
+    if !changed {
+        return Ok(false);
+    }
+
+    manifest.generation = new_gen;
+    manifest.updated_at_ms = now_ms();
+    manifest.vector_indexes = vector_indexes;
+    manifest.approx_logical_bytes = manifest
+        .doc_ssts
+        .iter()
+        .chain(&manifest.attr_ssts)
+        .map(|m| m.size_bytes)
+        .sum::<u64>()
+        + manifest
+            .vector_indexes
+            .values()
+            .map(vector_family_bytes)
+            .sum::<u64>();
+
+    ns.publish_manifest(snapshot.pointer_version, &manifest)
+        .await?;
+    Ok(true)
+}
+
+fn first_reassignment_delta(
+    base: &VectorIndex,
+    append_segments: &[VectorIndex],
+    version_map: &VectorVersionMap,
+    plan: &VectorMaintenancePlan,
+    new_version: u64,
+    docs: &BTreeMap<Id, Document>,
+) -> Result<Option<(usize, crate::vector::VectorReassignmentDelta)>> {
+    for (task_idx, task) in plan.tasks.iter().enumerate() {
+        if let Some(delta) =
+            base.build_reassignment_delta(append_segments, version_map, task, new_version, docs)?
+        {
+            return Ok(Some((task_idx, delta)));
+        }
+    }
+    Ok(None)
 }

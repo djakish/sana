@@ -26,6 +26,7 @@ async fn main() -> CliResult {
         Some("recall") => recall(&args).await,
         Some("flush") => flush(&args).await,
         Some("compact") => compact(&args).await,
+        Some("maintain-vectors") => maintain_vectors(&args).await,
         Some("demo") => demo(&args).await,
         _ => {
             usage();
@@ -49,6 +50,7 @@ fn usage() {
     eprintln!("  sana recall  <dir> <ns> [json-recall-request]");
     eprintln!("  sana flush   <dir> <ns>   # fold WAL into a document SST");
     eprintln!("  sana compact <dir> <ns>   # merge SSTs, drop tombstones");
+    eprintln!("  sana maintain-vectors <dir> <ns>   # run one vector maintenance pass");
     eprintln!("  sana demo    <dir>");
 }
 
@@ -197,6 +199,21 @@ async fn compact(args: &[String]) -> CliResult {
             "compacted SSTs"
         } else {
             "nothing to compact"
+        }
+    );
+    Ok(())
+}
+
+async fn maintain_vectors(args: &[String]) -> CliResult {
+    let (dir, ns) = (arg(args, 2)?, arg(args, 3)?);
+    let namespace = Namespace::open(store(dir), ns).await?;
+    let did = sana::indexer::maintain_vectors(&namespace).await?;
+    println!(
+        "{}",
+        if did {
+            "published vector maintenance deltas"
+        } else {
+            "nothing to maintain"
         }
     );
     Ok(())

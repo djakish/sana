@@ -440,6 +440,101 @@ async fn ann_vector_query_reads_flushed_append_postings() {
 }
 
 #[tokio::test]
+async fn ann_recall_survives_flushed_insert_update_delete_churn_without_rebuild() {
+    let dir = tempfile::tempdir().unwrap();
+    let ns = Namespace::create(store(&dir), "docs").await.unwrap();
+    for (id, x) in [(1, 0.10), (2, 1.0), (3, 5.0), (4, 10.0)] {
+        ns.upsert(doc(id, &format!("base-{id}"), id as i64, &["v"], [x, 0.0]))
+            .await
+            .unwrap();
+    }
+    indexer::flush(&ns).await.unwrap();
+    let base_key = ns.load_manifest().await.unwrap().vector_indexes["embedding"]
+        .key
+        .clone();
+
+    ns.upsert(doc(5, "insert-near", 50, &["v"], [0.05, 0.0]))
+        .await
+        .unwrap();
+    ns.upsert(doc(3, "update-near", 30, &["v"], [0.20, 0.0]))
+        .await
+        .unwrap();
+    indexer::flush(&ns).await.unwrap();
+
+    ns.delete(Id::U64(1)).await.unwrap();
+    ns.upsert(doc(6, "insert-nearer", 60, &["v"], [0.08, 0.0]))
+        .await
+        .unwrap();
+    indexer::flush(&ns).await.unwrap();
+
+    ns.upsert(doc(2, "update-far", 20, &["v"], [20.0, 0.0]))
+        .await
+        .unwrap();
+    ns.upsert(doc(7, "insert-nearest", 70, &["v"], [0.03, 0.0]))
+        .await
+        .unwrap();
+    indexer::flush(&ns).await.unwrap();
+
+    let manifest = ns.load_manifest().await.unwrap();
+    let meta = manifest.vector_indexes.get("embedding").unwrap();
+    assert_eq!(meta.key, base_key);
+    assert_eq!(meta.append_indexes.len(), 3);
+
+    let exact = ns
+        .query(Query {
+            filter: None,
+            order_by: None,
+            limit: None,
+            aggregates: Vec::new(),
+            exact_vector: Some(ExactVectorQuery {
+                column: "embedding".into(),
+                vector: vec![0.0, 0.0],
+                k: 4,
+                metric: Some(DistanceMetric::L2),
+            }),
+            approx_vector: None,
+        })
+        .await
+        .unwrap();
+    let ann = ns
+        .query(Query {
+            filter: None,
+            order_by: None,
+            limit: None,
+            aggregates: Vec::new(),
+            exact_vector: None,
+            approx_vector: Some(ApproxVectorQuery {
+                column: "embedding".into(),
+                vector: vec![0.0, 0.0],
+                k: 4,
+                probes: Some(16),
+                metric: Some(DistanceMetric::L2),
+            }),
+        })
+        .await
+        .unwrap();
+    let exact_ids: Vec<Id> = exact.rows.iter().map(|row| row.id.clone()).collect();
+    let ann_ids: Vec<Id> = ann.rows.iter().map(|row| row.id.clone()).collect();
+    assert_eq!(ann_ids, exact_ids);
+
+    let recall = ns
+        .recall(RecallRequest {
+            num: 8,
+            top_k: 4,
+            column: Some("embedding".into()),
+            probes: Some(16),
+            metric: Some(DistanceMetric::L2),
+            filter: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(recall.avg_recall, 1.0);
+    for sample in recall.samples {
+        assert_eq!(sample.exhaustive_ids, sample.ann_ids);
+    }
+}
+
+#[tokio::test]
 async fn ann_vector_query_rechecks_wal_overlay() {
     let dir = tempfile::tempdir().unwrap();
     let ns = Namespace::create(store(&dir), "docs").await.unwrap();
