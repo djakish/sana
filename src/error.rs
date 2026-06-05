@@ -20,6 +20,15 @@ pub enum Error {
     #[error("invalid object range {start}..{end} for object of size {size}")]
     InvalidRange { start: u64, end: u64, size: u64 },
 
+    #[error("invalid write: {0}")]
+    InvalidWrite(String),
+
+    #[error("invalid schema: {0}")]
+    InvalidSchema(String),
+
+    #[error("invalid query: {0}")]
+    InvalidQuery(String),
+
     #[error("corrupt data: {0}")]
     Corrupt(String),
 

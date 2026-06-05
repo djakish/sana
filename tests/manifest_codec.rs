@@ -1,7 +1,8 @@
 mod common;
 
-use sana::manifest::{ManifestPointer, NamespaceManifest};
+use sana::manifest::{ManifestPointer, NamespaceManifest, SstMeta, VectorIndexMeta};
 use sana::schema::{ColumnSpec, ColumnType, DistanceMetric, ScalarType, Schema, VectorEncoding};
+use sana::value::Id;
 use sana::wal::WalCursor;
 
 fn sample_manifest() -> NamespaceManifest {
@@ -59,8 +60,52 @@ fn manifest_rejects_unknown_format_version() {
 }
 
 #[test]
+fn manifest_round_trips_doc_sst_metadata() {
+    let mut m = sample_manifest();
+    m.doc_ssts.push(SstMeta {
+        key: "namespaces/docs/index/g/7/doc/flush-12.sst".into(),
+        size_bytes: 4096,
+        row_count: 2,
+        min_id: Some(Id::U64(1)),
+        max_id: Some(Id::U64(9)),
+    });
+    m.attr_ssts.push(SstMeta {
+        key: "namespaces/docs/index/g/7/attr/full-12.sst".into(),
+        size_bytes: 2048,
+        row_count: 8,
+        min_id: None,
+        max_id: None,
+    });
+    m.vector_index_generations.insert("embedding".into(), 7);
+    m.vector_indexes.insert(
+        "embedding".into(),
+        VectorIndexMeta {
+            key: "namespaces/docs/index/g/7/vector/656d62656464696e67/ivf.bin".into(),
+            size_bytes: 8192,
+            row_count: 2,
+            centroid_count: 2,
+            dim: 768,
+            metric: DistanceMetric::Cosine,
+        },
+    );
+
+    let decoded = NamespaceManifest::decode(&m.encode().unwrap()).unwrap();
+    assert_eq!(decoded.doc_ssts, m.doc_ssts);
+    assert_eq!(decoded.attr_ssts, m.attr_ssts);
+    assert_eq!(decoded.vector_index_generations, m.vector_index_generations);
+    assert_eq!(decoded.vector_indexes, m.vector_indexes);
+}
+
+#[test]
 fn pointer_round_trips() {
     let p = ManifestPointer::new(42);
+    let decoded = ManifestPointer::decode(&p.encode().unwrap()).unwrap();
+    assert_eq!(p, decoded);
+}
+
+#[test]
+fn pointer_round_trips_content_body_key() {
+    let p = ManifestPointer::for_body(42, "namespaces/docs/manifest/g/42-deadbeef.json");
     let decoded = ManifestPointer::decode(&p.encode().unwrap()).unwrap();
     assert_eq!(p, decoded);
 }

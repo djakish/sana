@@ -17,36 +17,106 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use bytes::Bytes;
 
+use crate::attr;
 use crate::doc::{DocRecord, encode_id};
 use crate::error::Result;
-use crate::manifest::{ManifestPointer, NamespaceManifest, SstMeta};
-use crate::namespace::{
-    Namespace, apply_op, manifest_body_key, manifest_pointer_key, now_ms, op_id,
-};
-use crate::object_store::ObjectVersion;
+use crate::manifest::{NamespaceManifest, SstMeta, VectorIndexMeta};
+use crate::namespace::{Namespace, apply_op, now_ms, op_id};
+use crate::schema::ColumnType;
 use crate::sst::SstWriter;
 use crate::value::{Document, Id};
-
-/// Pointer object version (to CAS against), the current pointer, and the body.
-type ManifestState = (ObjectVersion, ManifestPointer, NamespaceManifest);
-
-/// Read the manifest pointer and body together; callers need the pointer's
-/// object version to CAS against.
-async fn read_manifest(ns: &Namespace) -> Result<ManifestState> {
-    let ptr = ns.store().get(&manifest_pointer_key(ns.name())).await?;
-    let pointer = ManifestPointer::decode(&ptr.bytes)?;
-    let body = ns
-        .store()
-        .get(&manifest_body_key(ns.name(), pointer.generation))
-        .await?;
-    Ok((ptr.version, pointer, NamespaceManifest::decode(&body.bytes)?))
-}
+use crate::vector::{VectorEntry, VectorIndex, vector_to_f32};
 
 struct BuiltSst {
     bytes: Vec<u8>,
     row_count: u64,
     min_id: Option<Id>,
     max_id: Option<Id>,
+}
+
+async fn publish_attr_sst(
+    ns: &Namespace,
+    generation: u64,
+    suffix: &str,
+    docs: &BTreeMap<Id, Document>,
+) -> Result<Vec<SstMeta>> {
+    let Some(built) = attr::build_attr_sst(docs)? else {
+        return Ok(Vec::new());
+    };
+    let sst_key = format!(
+        "namespaces/{}/index/g/{}/attr/{}.sst",
+        ns.name(),
+        generation,
+        suffix
+    );
+    ns.store()
+        .put(&sst_key, Bytes::from(built.bytes.clone()))
+        .await?;
+    Ok(vec![SstMeta {
+        key: sst_key,
+        size_bytes: built.bytes.len() as u64,
+        row_count: built.entry_count,
+        min_id: None,
+        max_id: None,
+    }])
+}
+
+async fn publish_vector_indexes(
+    ns: &Namespace,
+    generation: u64,
+    manifest: &NamespaceManifest,
+    docs: &BTreeMap<Id, Document>,
+) -> Result<BTreeMap<String, VectorIndexMeta>> {
+    let mut out = BTreeMap::new();
+    for (column, spec) in &manifest.schema.columns {
+        let ColumnType::Vector { dim, metric, .. } = spec.column_type else {
+            continue;
+        };
+
+        let mut entries = Vec::new();
+        for (id, doc) in docs {
+            let Some(vector) = doc.vectors.get(column) else {
+                continue;
+            };
+            entries.push(VectorEntry {
+                id: id.clone(),
+                vector: vector_to_f32(vector),
+            });
+        }
+
+        let Some(index) = VectorIndex::build(column.clone(), metric, dim, entries)? else {
+            continue;
+        };
+        let bytes = index.encode()?;
+        let key = format!(
+            "namespaces/{}/index/g/{}/vector/{}/ivf.bin",
+            ns.name(),
+            generation,
+            object_path_component(column)
+        );
+        ns.store().put(&key, Bytes::from(bytes.clone())).await?;
+        out.insert(
+            column.clone(),
+            VectorIndexMeta {
+                key,
+                size_bytes: bytes.len() as u64,
+                row_count: index.row_count() as u64,
+                centroid_count: index.centroids.len() as u64,
+                dim,
+                metric,
+            },
+        );
+    }
+    Ok(out)
+}
+
+fn object_path_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() * 2);
+    for b in value.as_bytes() {
+        use std::fmt::Write;
+        write!(&mut out, "{b:02x}").expect("writing to String cannot fail");
+    }
+    out
 }
 
 fn build_sst(records: &BTreeMap<Id, DocRecord>) -> Result<BuiltSst> {
@@ -74,7 +144,8 @@ fn build_sst(records: &BTreeMap<Id, DocRecord>) -> Result<BuiltSst> {
 /// Flush the WAL delta since `indexed_cursor` into a new document SST. Returns
 /// `true` if work was done.
 pub async fn flush(ns: &Namespace) -> Result<bool> {
-    let (ptr_version, pointer, mut manifest) = read_manifest(ns).await?;
+    let snapshot = ns.load_manifest_snapshot().await?;
+    let mut manifest = snapshot.manifest;
     let commit = ns.commit_cursor().await?;
     let from_seq = manifest.indexed_cursor.map(|c| c.seq).unwrap_or(0);
     if from_seq >= commit.seq {
@@ -83,6 +154,15 @@ pub async fn flush(ns: &Namespace) -> Result<bool> {
 
     let ops = ns.read_overlay_ops(manifest.indexed_cursor, commit).await?;
     let touched: BTreeSet<Id> = ops.iter().map(|op| op_id(op).clone()).collect();
+    if touched.is_empty() {
+        manifest.generation = snapshot.pointer.generation + 1;
+        manifest.updated_at_ms = now_ms();
+        manifest.wal_commit_cursor = Some(commit);
+        manifest.indexed_cursor = Some(commit);
+        ns.publish_manifest(snapshot.pointer_version, &manifest)
+            .await?;
+        return Ok(true);
+    }
 
     // Load existing SST records once (not one point-get per touched id), then
     // seed each touched id with its resolved base so a Patch in the delta merges
@@ -111,7 +191,7 @@ pub async fn flush(ns: &Namespace) -> Result<bool> {
         .collect();
 
     let built = build_sst(&records)?;
-    let new_gen = pointer.generation + 1;
+    let new_gen = snapshot.pointer.generation + 1;
     let sst_key = format!(
         "namespaces/{}/index/g/{}/doc/flush-{}.sst",
         ns.name(),
@@ -127,13 +207,21 @@ pub async fn flush(ns: &Namespace) -> Result<bool> {
     for (id, rec) in &records {
         merged.insert(id.clone(), rec.clone());
     }
-    let row_count = merged
-        .into_values()
-        .filter(|rec| matches!(rec, DocRecord::Present(_)))
-        .count() as u64;
+    let live_docs: BTreeMap<Id, Document> = merged
+        .iter()
+        .filter_map(|(id, rec)| match rec {
+            DocRecord::Present(doc) => Some((id.clone(), doc.clone())),
+            DocRecord::Deleted => None,
+        })
+        .collect();
+    let row_count = live_docs.len() as u64;
+    let attr_ssts =
+        publish_attr_sst(ns, new_gen, &format!("full-{}", commit.seq), &live_docs).await?;
+    let vector_indexes = publish_vector_indexes(ns, new_gen, &manifest, &live_docs).await?;
 
     manifest.generation = new_gen;
     manifest.updated_at_ms = now_ms();
+    manifest.wal_commit_cursor = Some(commit);
     manifest.indexed_cursor = Some(commit);
     manifest.doc_ssts.insert(
         0,
@@ -145,17 +233,35 @@ pub async fn flush(ns: &Namespace) -> Result<bool> {
             max_id: built.max_id,
         },
     );
+    manifest.attr_ssts = attr_ssts;
+    manifest.vector_index_generations = vector_indexes
+        .keys()
+        .map(|column| (column.clone(), new_gen))
+        .collect();
+    manifest.vector_indexes = vector_indexes;
     manifest.approx_row_count = row_count;
-    manifest.approx_logical_bytes = manifest.doc_ssts.iter().map(|m| m.size_bytes).sum();
+    manifest.approx_logical_bytes = manifest
+        .doc_ssts
+        .iter()
+        .chain(&manifest.attr_ssts)
+        .map(|m| m.size_bytes)
+        .sum::<u64>()
+        + manifest
+            .vector_indexes
+            .values()
+            .map(|m| m.size_bytes)
+            .sum::<u64>();
 
-    commit_manifest(ns, ptr_version, new_gen, &manifest).await?;
+    ns.publish_manifest(snapshot.pointer_version, &manifest)
+        .await?;
     Ok(true)
 }
 
 /// Merge all document SSTs into a single file, dropping shadowed values and
 /// tombstones. Returns `true` if work was done.
 pub async fn compact(ns: &Namespace) -> Result<bool> {
-    let (ptr_version, pointer, mut manifest) = read_manifest(ns).await?;
+    let snapshot = ns.load_manifest_snapshot().await?;
+    let mut manifest = snapshot.manifest;
     if manifest.doc_ssts.len() <= 1 {
         return Ok(false);
     }
@@ -167,9 +273,16 @@ pub async fn compact(ns: &Namespace) -> Result<bool> {
         .into_iter()
         .filter(|(_, rec)| matches!(rec, DocRecord::Present(_)))
         .collect();
+    let live_docs: BTreeMap<Id, Document> = live
+        .iter()
+        .filter_map(|(id, rec)| match rec {
+            DocRecord::Present(doc) => Some((id.clone(), doc.clone())),
+            DocRecord::Deleted => None,
+        })
+        .collect();
 
     let built = build_sst(&live)?;
-    let new_gen = pointer.generation + 1;
+    let new_gen = snapshot.pointer.generation + 1;
     let sst_key = format!(
         "namespaces/{}/index/g/{}/doc/compacted.sst",
         ns.name(),
@@ -181,8 +294,22 @@ pub async fn compact(ns: &Namespace) -> Result<bool> {
 
     manifest.generation = new_gen;
     manifest.updated_at_ms = now_ms();
+    manifest.wal_commit_cursor = Some(ns.commit_cursor().await?);
     manifest.approx_row_count = built.row_count;
-    manifest.approx_logical_bytes = built.bytes.len() as u64;
+    manifest.attr_ssts = publish_attr_sst(ns, new_gen, "full", &live_docs).await?;
+    manifest.vector_indexes = publish_vector_indexes(ns, new_gen, &manifest, &live_docs).await?;
+    manifest.vector_index_generations = manifest
+        .vector_indexes
+        .keys()
+        .map(|column| (column.clone(), new_gen))
+        .collect();
+    manifest.approx_logical_bytes = built.bytes.len() as u64
+        + manifest.attr_ssts.iter().map(|m| m.size_bytes).sum::<u64>()
+        + manifest
+            .vector_indexes
+            .values()
+            .map(|m| m.size_bytes)
+            .sum::<u64>();
     manifest.doc_ssts = vec![SstMeta {
         key: sst_key,
         size_bytes: built.bytes.len() as u64,
@@ -191,28 +318,7 @@ pub async fn compact(ns: &Namespace) -> Result<bool> {
         max_id: built.max_id,
     }];
 
-    commit_manifest(ns, ptr_version, new_gen, &manifest).await?;
+    ns.publish_manifest(snapshot.pointer_version, &manifest)
+        .await?;
     Ok(true)
-}
-
-async fn commit_manifest(
-    ns: &Namespace,
-    expected: ObjectVersion,
-    new_gen: u64,
-    manifest: &NamespaceManifest,
-) -> Result<()> {
-    ns.store()
-        .put(
-            &manifest_body_key(ns.name(), new_gen),
-            Bytes::from(manifest.encode()?),
-        )
-        .await?;
-    ns.store()
-        .compare_and_set(
-            &manifest_pointer_key(ns.name()),
-            expected,
-            Bytes::from(ManifestPointer::new(new_gen).encode()?),
-        )
-        .await?;
-    Ok(())
 }

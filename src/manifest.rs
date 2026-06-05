@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::schema::Schema;
+use crate::schema::{DistanceMetric, Schema};
 use crate::value::Id;
 use crate::wal::WalCursor;
 
@@ -32,6 +32,16 @@ pub struct SstMeta {
     pub max_id: Option<Id>,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct VectorIndexMeta {
+    pub key: String,
+    pub size_bytes: u64,
+    pub row_count: u64,
+    pub centroid_count: u64,
+    pub dim: usize,
+    pub metric: DistanceMetric,
+}
+
 /// The immutable manifest body for one generation. Stored as pretty JSON so it
 /// is human-inspectable; deterministic because all maps are `BTreeMap`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -51,8 +61,16 @@ pub struct NamespaceManifest {
     /// file containing a key wins (a tombstone there hides older files).
     #[serde(default)]
     pub doc_ssts: Vec<SstMeta>,
+    /// Attribute-family SST files. Stage 3 writes one full-snapshot postings
+    /// SST per indexed manifest generation; the vector is kept for future LSM
+    /// levels and compatibility with the document family shape.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attr_ssts: Vec<SstMeta>,
     #[serde(default)]
     pub vector_index_generations: BTreeMap<String, u64>,
+    /// Full-snapshot immutable IVF indexes by vector column.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub vector_indexes: BTreeMap<String, VectorIndexMeta>,
     #[serde(default)]
     pub branch_parent: Option<BranchParent>,
     #[serde(default)]
@@ -74,7 +92,9 @@ impl NamespaceManifest {
             wal_commit_cursor: None,
             indexed_cursor: None,
             doc_ssts: Vec::new(),
+            attr_ssts: Vec::new(),
             vector_index_generations: BTreeMap::new(),
+            vector_indexes: BTreeMap::new(),
             branch_parent: None,
             approx_logical_bytes: 0,
             approx_row_count: 0,
@@ -102,14 +122,26 @@ impl NamespaceManifest {
 
 /// The tiny object at `manifest/current`: it names the live generation. Reading
 /// a namespace is: get this pointer, then get `manifest/g/{generation}.json`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestPointer {
     pub generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_key: Option<String>,
 }
 
 impl ManifestPointer {
     pub fn new(generation: u64) -> Self {
-        Self { generation }
+        Self {
+            generation,
+            body_key: None,
+        }
+    }
+
+    pub fn for_body(generation: u64, body_key: impl Into<String>) -> Self {
+        Self {
+            generation,
+            body_key: Some(body_key.into()),
+        }
     }
 
     pub fn encode(&self) -> Result<Vec<u8>> {

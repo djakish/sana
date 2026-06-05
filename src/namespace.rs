@@ -25,7 +25,8 @@ use bytes::Bytes;
 use crate::doc::{DocRecord, decode_id, encode_id};
 use crate::error::{Error, Result};
 use crate::manifest::{ManifestPointer, NamespaceManifest};
-use crate::object_store::ObjectStore;
+use crate::object_store::{ObjectStore, ObjectVersion, version_of};
+use crate::query::{Query, QueryResult};
 use crate::sst::SstReader;
 use crate::value::{Document, Id, Value};
 use crate::wal::{WalBatch, WalCursor, WalOp};
@@ -36,6 +37,21 @@ pub(crate) fn manifest_pointer_key(ns: &str) -> String {
 
 pub(crate) fn manifest_body_key(ns: &str, generation: u64) -> String {
     format!("namespaces/{ns}/manifest/g/{generation}.json")
+}
+
+pub(crate) fn manifest_content_body_key(
+    ns: &str,
+    generation: u64,
+    version: &ObjectVersion,
+) -> String {
+    format!("namespaces/{ns}/manifest/g/{generation}-{}.json", version.0)
+}
+
+pub(crate) fn manifest_body_key_for_pointer(ns: &str, pointer: &ManifestPointer) -> String {
+    pointer
+        .body_key
+        .clone()
+        .unwrap_or_else(|| manifest_body_key(ns, pointer.generation))
 }
 
 pub(crate) fn wal_commit_key(ns: &str) -> String {
@@ -73,9 +89,18 @@ pub struct Namespace {
     append_lock: tokio::sync::Mutex<()>,
 }
 
+/// Pointer object version (to CAS against), the current pointer, and the body.
+pub(crate) struct ManifestSnapshot {
+    pub pointer_version: ObjectVersion,
+    pub pointer: ManifestPointer,
+    pub manifest: NamespaceManifest,
+}
+
 impl std::fmt::Debug for Namespace {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Namespace").field("name", &self.name).finish()
+        f.debug_struct("Namespace")
+            .field("name", &self.name)
+            .finish()
     }
 }
 
@@ -99,10 +124,7 @@ impl Namespace {
             .await?;
         // The pointer is the existence sentinel; create it last and atomically.
         store
-            .put_if_absent(
-                &pointer_key,
-                Bytes::from(ManifestPointer::new(0).encode()?),
-            )
+            .put_if_absent(&pointer_key, Bytes::from(ManifestPointer::new(0).encode()?))
             .await
             .map_err(|_| Error::AlreadyExists(format!("namespace {name}")))?;
 
@@ -227,14 +249,56 @@ impl Namespace {
 
     /// Load the current manifest body via the pointer.
     pub async fn load_manifest(&self) -> Result<NamespaceManifest> {
-        let pointer = ManifestPointer::decode(
-            &self.store.get(&manifest_pointer_key(&self.name)).await?.bytes,
-        )?;
+        Ok(self.load_manifest_snapshot().await?.manifest)
+    }
+
+    pub(crate) async fn load_manifest_snapshot(&self) -> Result<ManifestSnapshot> {
+        let ptr = self.store.get(&manifest_pointer_key(&self.name)).await?;
+        let pointer = ManifestPointer::decode(&ptr.bytes)?;
         let body = self
             .store
-            .get(&manifest_body_key(&self.name, pointer.generation))
+            .get(&manifest_body_key_for_pointer(&self.name, &pointer))
             .await?;
-        NamespaceManifest::decode(&body.bytes)
+        Ok(ManifestSnapshot {
+            pointer_version: ptr.version,
+            pointer,
+            manifest: NamespaceManifest::decode(&body.bytes)?,
+        })
+    }
+
+    pub(crate) async fn publish_manifest(
+        &self,
+        expected: ObjectVersion,
+        manifest: &NamespaceManifest,
+    ) -> Result<()> {
+        let encoded = manifest.encode()?;
+        let body_version = version_of(&encoded);
+        let body_key = manifest_content_body_key(&self.name, manifest.generation, &body_version);
+        match self
+            .store
+            .put_if_absent(&body_key, Bytes::from(encoded.clone()))
+            .await
+        {
+            Ok(_) => {}
+            Err(Error::AlreadyExists(_)) => {
+                let got = self.store.get(&body_key).await?;
+                if got.bytes.as_ref() != encoded.as_slice() {
+                    return Err(Error::Corrupt(format!(
+                        "manifest body key collision at {body_key}"
+                    )));
+                }
+            }
+            Err(e) => return Err(e),
+        }
+
+        self.store
+            .compare_and_set(
+                &manifest_pointer_key(&self.name),
+                expected,
+                Bytes::from(ManifestPointer::for_body(manifest.generation, body_key).encode()?),
+            )
+            .await?;
+        Ok(())
     }
 
     /// The highest WAL position durably committed.
@@ -250,7 +314,12 @@ impl Namespace {
         operations: Vec<WalOp>,
         idempotency_key: Option<String>,
     ) -> Result<WalCursor> {
+        if operations.is_empty() {
+            return Err(Error::InvalidWrite("write batch cannot be empty".into()));
+        }
+
         let _g = self.append_lock.lock().await;
+        self.evolve_schema_for_ops(&operations).await?;
 
         let cursor_key = wal_commit_key(&self.name);
         let current = self.store.get(&cursor_key).await?;
@@ -282,9 +351,34 @@ impl Namespace {
         Ok(next)
     }
 
+    async fn evolve_schema_for_ops(&self, operations: &[WalOp]) -> Result<()> {
+        loop {
+            let snapshot = self.load_manifest_snapshot().await?;
+            let mut schema = snapshot.manifest.schema.clone();
+            if !schema.infer_and_validate_ops(operations)? {
+                return Ok(());
+            }
+
+            let mut manifest = snapshot.manifest;
+            manifest.generation = snapshot.pointer.generation + 1;
+            manifest.schema = schema;
+            manifest.updated_at_ms = now_ms();
+
+            match self
+                .publish_manifest(snapshot.pointer_version, &manifest)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(Error::CasMismatch { .. }) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     pub async fn upsert(&self, document: Document) -> Result<WalCursor> {
         let id = document.id.clone();
-        self.append(vec![WalOp::Upsert { id, document }], None).await
+        self.append(vec![WalOp::Upsert { id, document }], None)
+            .await
     }
 
     pub async fn delete(&self, id: Id) -> Result<WalCursor> {
@@ -307,7 +401,10 @@ impl Namespace {
             })
             .collect();
 
-        for op in self.read_overlay_ops(manifest.indexed_cursor, commit).await? {
+        for op in self
+            .read_overlay_ops(manifest.indexed_cursor, commit)
+            .await?
+        {
             apply_op(&mut docs, op);
         }
         Ok(docs)
@@ -325,12 +422,22 @@ impl Namespace {
         if let Some(DocRecord::Present(doc)) = self.sst_point_get(&manifest, id).await? {
             docs.insert(id.clone(), doc);
         }
-        for op in self.read_overlay_ops(manifest.indexed_cursor, commit).await? {
+        for op in self
+            .read_overlay_ops(manifest.indexed_cursor, commit)
+            .await?
+        {
             if op_id(&op) == id {
                 apply_op(&mut docs, op);
             }
         }
         Ok(docs.remove(id))
+    }
+
+    /// Execute a strong snapshot query. Stage 3 currently scans materialized
+    /// documents; attribute/vector index acceleration can replace the candidate
+    /// generation inside `query` without changing this entry point.
+    pub async fn query(&self, query: Query) -> Result<QueryResult> {
+        crate::query::execute(self, query).await
     }
 }
 

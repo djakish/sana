@@ -20,6 +20,27 @@ fn doc_with(id: u64, title: &str, score: i64) -> Document {
     d
 }
 
+fn indexed_bytes(manifest: &sana::manifest::NamespaceManifest) -> u64 {
+    manifest
+        .doc_ssts
+        .iter()
+        .chain(&manifest.attr_ssts)
+        .map(|s| s.size_bytes)
+        .sum::<u64>()
+        + manifest
+            .vector_indexes
+            .values()
+            .map(|m| m.size_bytes)
+            .sum::<u64>()
+}
+
+fn doc_with_vector(id: u64, title: &str, score: i64, vector: [f32; 2]) -> Document {
+    let mut doc = doc_with(id, title, score);
+    doc.vectors
+        .insert("embedding".into(), VectorValue::F32(vector.to_vec()));
+    doc
+}
+
 #[tokio::test]
 async fn flush_moves_overlay_into_sst() {
     let dir = tempfile::tempdir().unwrap();
@@ -31,13 +52,45 @@ async fn flush_moves_overlay_into_sst() {
 
     let manifest = ns.load_manifest().await.unwrap();
     assert_eq!(manifest.doc_ssts.len(), 1);
+    assert_eq!(manifest.attr_ssts.len(), 1);
     assert_eq!(manifest.doc_ssts[0].row_count, 2);
     // indexed_cursor caught up to the commit cursor: the overlay is now empty.
-    assert_eq!(manifest.indexed_cursor, Some(ns.commit_cursor().await.unwrap()));
+    assert_eq!(
+        manifest.indexed_cursor,
+        Some(ns.commit_cursor().await.unwrap())
+    );
 
     // Reads now come from the SST and are unchanged.
-    assert_eq!(ns.lookup(&Id::U64(1)).await.unwrap(), Some(doc_with(1, "alpha", 10)));
+    assert_eq!(
+        ns.lookup(&Id::U64(1)).await.unwrap(),
+        Some(doc_with(1, "alpha", 10))
+    );
     assert_eq!(ns.replay().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn flush_publishes_vector_indexes() {
+    let dir = tempfile::tempdir().unwrap();
+    let ns = Namespace::create(store(&dir), "docs").await.unwrap();
+    ns.upsert(doc_with_vector(1, "alpha", 10, [1.0, 0.0]))
+        .await
+        .unwrap();
+    ns.upsert(doc_with_vector(2, "beta", 20, [2.0, 0.0]))
+        .await
+        .unwrap();
+
+    assert!(indexer::flush(&ns).await.unwrap());
+
+    let manifest = ns.load_manifest().await.unwrap();
+    let meta = manifest.vector_indexes.get("embedding").unwrap();
+    assert_eq!(meta.row_count, 2);
+    assert_eq!(meta.dim, 2);
+    assert!(meta.centroid_count >= 1);
+    assert_eq!(
+        manifest.vector_index_generations["embedding"],
+        manifest.generation
+    );
+    assert_eq!(manifest.approx_logical_bytes, indexed_bytes(&manifest));
 }
 
 #[tokio::test]
@@ -77,7 +130,10 @@ async fn newest_sst_wins_across_flushes() {
     indexer::flush(&ns).await.unwrap();
 
     assert_eq!(ns.load_manifest().await.unwrap().doc_ssts.len(), 2);
-    assert_eq!(ns.lookup(&Id::U64(1)).await.unwrap(), Some(doc_with(1, "v2", 2)));
+    assert_eq!(
+        ns.lookup(&Id::U64(1)).await.unwrap(),
+        Some(doc_with(1, "v2", 2))
+    );
 }
 
 #[tokio::test]
@@ -160,7 +216,10 @@ async fn compaction_collapses_ssts_and_drops_tombstones() {
     assert_eq!(manifest.doc_ssts[0].row_count, 1); // only id 1 survives
     assert_eq!(manifest.approx_row_count, 1);
 
-    assert_eq!(ns.lookup(&Id::U64(1)).await.unwrap(), Some(doc_with(1, "v2", 2)));
+    assert_eq!(
+        ns.lookup(&Id::U64(1)).await.unwrap(),
+        Some(doc_with(1, "v2", 2))
+    );
     assert_eq!(ns.lookup(&Id::U64(2)).await.unwrap(), None);
     assert_eq!(ns.replay().await.unwrap().len(), 1);
 }
@@ -176,10 +235,7 @@ async fn flush_and_compact_update_stats() {
     let m = ns.load_manifest().await.unwrap();
     assert_eq!(m.approx_row_count, 2);
     assert!(m.approx_logical_bytes > 0);
-    assert_eq!(
-        m.approx_logical_bytes,
-        m.doc_ssts.iter().map(|s| s.size_bytes).sum::<u64>()
-    );
+    assert_eq!(m.approx_logical_bytes, indexed_bytes(&m));
 
     // Overwrite one, delete one, flush: live rows drop to 1 (counted across the
     // SST base + the new delta, not just the touched ids).
@@ -188,17 +244,15 @@ async fn flush_and_compact_update_stats() {
     indexer::flush(&ns).await.unwrap();
     let m = ns.load_manifest().await.unwrap();
     assert_eq!(m.approx_row_count, 1);
-    assert_eq!(
-        m.approx_logical_bytes,
-        m.doc_ssts.iter().map(|s| s.size_bytes).sum::<u64>()
-    );
+    assert_eq!(m.approx_logical_bytes, indexed_bytes(&m));
 
-    // Compaction keeps the count and resets bytes to the single compacted file.
+    // Compaction keeps the count and resets bytes to the compacted index files.
     assert!(indexer::compact(&ns).await.unwrap());
     let m = ns.load_manifest().await.unwrap();
     assert_eq!(m.approx_row_count, 1);
     assert_eq!(m.doc_ssts.len(), 1);
-    assert_eq!(m.approx_logical_bytes, m.doc_ssts[0].size_bytes);
+    assert_eq!(m.attr_ssts.len(), 1);
+    assert_eq!(m.approx_logical_bytes, indexed_bytes(&m));
 }
 
 #[tokio::test]

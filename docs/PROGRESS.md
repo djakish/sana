@@ -11,12 +11,14 @@ the next unchecked task under "Current milestone" / "Next up".
 
 ## Status snapshot
 
-- **Current stage:** Stage 2 (SST/LSM) — **complete**.
-- **Next stage:** Stage 3 (Attributes & Exact Search).
-- **Done:** Stage 0 (Skeleton), Stage 1 (Durable Documents), Stage 2 (SST/LSM).
-- **Tests:** `cargo test` green (52 tests); `cargo clippy --all-targets` clean.
+- **Current stage:** Stage 4 (ANN v0) — **in progress**.
+- **Next up:** Debug recall CLI/API endpoint and then Stage 5 native filtering.
+- **Done:** Stage 0 (Skeleton), Stage 1 (Durable Documents), Stage 2 (SST/LSM),
+  Stage 3 (Attributes & Exact Search).
+- **Tests:** `cargo test` green (69 tests); `cargo clippy --all-targets` clean.
 - **Note:** post-Stage-2 code-review fixes applied (efficiency + stats +
-  dedup); remaining findings tracked under "Stage 2 — code review follow-ups".
+  dedup + manifest publish safety); remaining findings tracked under
+  "Stage 2 — code review follow-ups".
 - **Last updated:** 2026-06-05.
 
 ---
@@ -31,7 +33,7 @@ the next unchecked task under "Current milestone" / "Next up".
       lookup. Small CLI.
 - [x] **Stage 2 — SST/LSM.** SST writer/reader, build doc SSTs from WAL
       (flush), compaction + tombstones, query from manifest SSTs + WAL overlay.
-- [ ] **Stage 3 — Attributes & exact search.** Schema inference/checking,
+- [x] **Stage 3 — Attributes & exact search.** Schema inference/checking,
       attribute inverted indexes (eq/range), filters, order-by, count/sum,
       exact vector kNN over filtered candidates.
 - [ ] **Stage 4 — ANN v0.** KMeans/IVF per column, immutable vector postings,
@@ -67,10 +69,12 @@ namespaces/{ns}/wal/{epoch}/{seq}.wal   # durable batches
 Stage 1 decisions / notes:
 
 - **D12 — Lightweight commit cursor separate from the manifest.** The write
-  path CAS-advances `wal_commit/current` per commit; the manifest only changes
-  when indexing publishes files. Realizes Principle 2 (write durability vs.
-  indexing freshness). Manifest's own `wal_commit_cursor`/`indexed_cursor` are
-  snapshots set at index-publish time (Stage 2+).
+  path CAS-advances `wal_commit/current` per commit; ordinary writes do not
+  move the manifest. Indexing publishes files through the manifest, and Stage 3
+  schema evolution can publish metadata-only manifest generations. This still
+  realizes Principle 2 (write durability vs. indexing freshness). Manifest's
+  own `wal_commit_cursor`/`indexed_cursor` are snapshots set at index-publish
+  time (Stage 2+).
 - **D13 — Single-writer-per-namespace append.** In-process append lock + cursor
   CAS. WAL object written with `put` (overwrite) before the cursor advances, so
   a crashed prior attempt at that seq is a harmless orphan we overwrite. Same
@@ -83,7 +87,7 @@ Known limitations to fix in later stages:
 
 - `replay`/`lookup` are O(WAL) — full scan per call. Stage 2 SSTs fix this.
 - No idempotency-key dedup yet (field is plumbed through the WAL batch).
-- No schema inference/validation yet (Stage 3); attributes are free-form.
+- Idempotency-key dedup and conditional writes are still future work.
 - Single WAL epoch only; epoch rotation is unused.
 
 ---
@@ -157,42 +161,42 @@ A high-effort recall review of the Stage 2 diff ran after it landed. Outcomes:
   wins" loop now lives once in `Namespace::sst_records`, shared by `replay`,
   `compact`, and `flush`. `lookup` intentionally keeps the point-get path
   (`sst_point_get`): early-stop + min/max pruning for a single id.
+- **Concurrency — manifest body overwrite race.** `ManifestPointer` can now
+  name a content-derived manifest body key. `Namespace::publish_manifest` writes
+  immutable bodies at `manifest/g/{generation}-{body_version}.json` and CASes
+  the pointer to that exact body, so a CAS loser cannot overwrite the winner's
+  body.
+- **Empty-batch / empty-SST churn.** `append` rejects empty batches, and `flush`
+  skips emitting a zero-row SST if it encounters an old empty WAL batch.
+- **Dead manifest field partially retired.** Index publishes now maintain
+  `wal_commit_cursor` as a snapshot of the commit cursor at flush/compaction
+  time. Per-write durability still uses `wal_commit/current`.
+- **Manifest load duplication.** `Namespace::load_manifest_snapshot` is now the
+  shared pointer→body helper used by reads, schema evolution, and indexer
+  publication.
+- **Manifest serde test gap.** `tests/manifest_codec.rs` now round-trips
+  populated `doc_ssts` metadata and content-keyed manifest pointers.
 
 **Outstanding (address before/within Stage 3 — none fire under the current
 single-process, epoch-0, trusted-storage assumptions, but they are real):**
 
-- [ ] **Concurrency: non-atomic manifest publish.** `commit_manifest` `put`s
-      the new body before the pointer CAS, so two indexers at the same `new_gen`
-      let the CAS loser overwrite the winner's body. Fix when concurrent
-      indexers become possible (write body under a content-unique/generation
-      key only after — or make publish a single CAS). Latent today (manual,
-      single-process flush).
 - [ ] **Epoch-blind reads.** `read_overlay_ops` builds WAL keys with `to.epoch`
       and `flush`'s `from_seq >= commit.seq` compares only `seq`; both break if
       the WAL epoch ever rotates. Make the overlay range epoch-aware when epoch
       rotation is implemented.
-- [ ] **Empty-batch / empty-SST churn.** `append` accepts an empty operations
-      batch (advances the commit cursor); `flush` then writes a zero-row SST
-      with `min_id/max_id = None` that can never be pruned. Reject empty
-      batches and/or skip emitting an empty SST.
 - [ ] **Point lookups load whole SSTs.** Implement the ranged read (footer →
       index → one block) the SST format already supports (D16).
-- [ ] **Dead manifest field.** `wal_commit_cursor` is serialized but never
-      written; either maintain it or remove it.
 - [ ] **SST footer not checksummed.** Unlike blocks/index, footer fields aren't
       CRC'd, so accidental corruption can overflow/panic instead of erroring;
       add a footer checksum and use checked arithmetic on parsed offsets.
 - [ ] **`u32` size/offset fields** (restart offsets, index key length) silently
       truncate for >4 GiB blocks/keys — widen or bound.
-- [ ] **Test gaps.** No test round-trips a manifest with a populated `doc_ssts`
-      (SstMeta serde uncovered), and none asserts `min_id/max_id` or exercises
-      the prune path.
-- [ ] **`load_manifest` vs `indexer::read_manifest`** duplicate the
-      pointer→generation→body load; share one helper.
+- [ ] **Test gap.** No test directly exercises the point-lookup `min_id/max_id`
+      prune path.
 
 ---
 
-## Current milestone: Stage 3 — Attributes & Exact Search
+## Stage 3 — Attributes & Exact Search (done)
 
 Goal: typed schema + filtering + ordering + simple aggregation, then exact
 vector kNN over filtered candidates. This is the first stage that makes Sana a
@@ -200,22 +204,106 @@ vector kNN over filtered candidates. This is the first stage that makes Sana a
 
 Planned tasks (refine when started):
 
-- [ ] Schema inference/checking: infer column types from upserts, validate on
-      write, evolve `Schema.version`. Decide strictness (reject vs. coerce).
-- [ ] Attribute inverted index as a new SST family (`attr/{col}/{value}` →
-      bitmap/posting of ids). Reuse `sst.rs`; design an order-preserving
-      composite key encoding (the `encode_id` note in `doc.rs`).
-- [ ] Filter expressions (Eq, range, And/Or/Not) compiled to id sets, evaluated
-      against attribute SSTs + WAL overlay. Start with equality + range.
-- [ ] Order-by (primary key or one attribute) and count/sum aggregation.
-- [ ] Exact vector kNN: brute-force distance over a filtered candidate set
-      (L2/cosine/dot), top-k heap. Reference scalar kernels (SIMD is Stage 8).
-- [ ] A query entry point (logical query → plan → execute) and a `query` CLI/
-      API verb. Integration tests for filters, order-by, aggregation, kNN.
+- [x] Schema inference/checking: infer column types from upserts/patches,
+      validate on write, evolve `Schema.version`. Decision: strict validation,
+      no coercion. Null is patch-only clear, arrays are homogeneous scalar
+      arrays, vectors have fixed dimension/encoding and finite values.
+- [x] Attribute inverted index as a new SST family: full-snapshot sorted
+      postings at `index/g/{generation}/attr/*.sst`, keyed by
+      `column + encoded scalar value`, with sorted id postings. This is correct
+      but write-amplifying; delta/levelled attr LSM files are still future work.
+- [x] Filter expressions (Eq, range, And/Or/Not) evaluated with attribute SST
+      candidate generation when possible, then rechecked against the strong
+      materialized snapshot including the WAL overlay.
+- [x] Order-by (primary key or one attribute) and count/sum aggregation.
+- [x] Exact vector kNN: brute-force distance over a filtered candidate set
+      (L2/cosine/dot), top-k via deterministic score sort. Reference scalar
+      kernels only (SIMD is Stage 8).
+- [x] A library query entry point: `src/query.rs` logical request/response types
+      and `Namespace::query`. Integration tests cover filters, order-by,
+      aggregation, kNN, and invalid vector queries.
+- [x] A `query` CLI verb over the library query entry point
+      (`sana query <dir> <ns> [json-query]`). HTTP/API surface is still future
+      work.
 
-Open questions for Stage 3: bitmap representation (roaring-style vs. simple
-sorted-id postings — start simple); how filters compose with the WAL overlay
-(re-evaluate overlay docs against the predicate, like patch/delete-by-filter).
+Known limitations to improve later:
+
+- Attribute postings are full-snapshot SSTs, not a levelled/delta attribute LSM.
+  This is correct but write-amplifying.
+- Query execution still materializes candidate documents for predicate recheck,
+  ordering, aggregates, and exact kNN. This is acceptable for Stage 3; later
+  stages should push more work into index families and vector postings.
+- The CLI query accepts the internal serde JSON shape for `Query`; a polished
+  public HTTP/API shape is still future work.
+
+Stage 3 decisions / notes so far:
+
+- **D21 — Strict inferred schema at write time.** Writes infer missing columns
+  from non-null upsert/patch values and reject later type changes before the
+  WAL cursor advances. Attribute columns default to `filterable=true,
+  indexed=true`; vector columns default to `indexed=true`, `filterable=false`,
+  and `DistanceMetric::Cosine`.
+- **D22 — Schema manifest updates are separate from WAL durability.** A write
+  that introduces columns first publishes a schema-only manifest generation,
+  then appends the WAL. Writes that match the schema do not touch the manifest.
+  This keeps ordinary write durability on `wal_commit/current` while making the
+  schema durable for later validators.
+- **D23 — Query semantics before index acceleration.** `Namespace::query`
+  executes against the strong materialized snapshot for now, which gives correct
+  filter/order/aggregate/exact-kNN behavior before attribute SSTs exist.
+  Attribute indexes should become a candidate-generation optimization under the
+  same logical `Query` API, not a separate user-facing path.
+- **D24 — Full-snapshot attribute postings for Stage 3.** Each flush/compaction
+  writes one attribute postings SST for all live indexed documents. Queries use
+  it to narrow candidate ids for supported filters, then always re-run the
+  predicate after applying the WAL overlay. This favors correctness and simple
+  delete/update semantics over write amplification; a proper attribute LSM can
+  replace it later.
+
+---
+
+## Current milestone: Stage 4 — ANN v0
+
+Goal: build the first approximate vector index while preserving exact rerank and
+strong-read overlay semantics. This stage validates the object-store-native ANN
+shape before SPFresh-style incremental updates and RaBitQ compression.
+
+Planned tasks:
+
+- [x] KMeans/IVF per vector column: deterministic full-snapshot KMeans builds
+      from live indexed documents during flush/compaction.
+- [x] Immutable vector postings: each vector column publishes one encoded
+      `vector/{column}/ivf.bin` object with centroids and full-vector postings,
+      referenced by `manifest.vector_indexes`.
+- [x] Probe + scan + rerank: `ApproxVectorQuery` probes nearest centroids,
+      scans selected postings, scores full vectors, and returns deterministic
+      top-k.
+- [x] Strong overlay merge: ANN results skip ids touched in unindexed WAL and
+      exact-score overlay vectors before final top-k merge.
+- [x] Recall checks in tests: full-probe ANN is compared against exact kNN via
+      `vector::recall_at`.
+- [ ] Debug recall CLI/API endpoint over sampled vectors.
+
+Known limitations to improve later:
+
+- IVF files are full-snapshot rebuilds, not incremental vector postings.
+- The current index stores full f32 vectors in postings; f16 storage,
+  contiguous vector blocks, quantization, and SIMD kernels are later stages.
+- Filtering with ANN currently falls back to exact filtered kNN. Stage 5 should
+  make attribute filters cluster-aware instead of exact-fallback.
+
+Stage 4 decisions / notes so far:
+
+- **D25 — Deterministic full-snapshot IVF v0.** Build KMeans with stable initial
+  centroids from id-sorted vectors and a small fixed iteration count. This keeps
+  tests reproducible and makes object output deterministic enough for review.
+- **D26 — ANN is an optimization under `Query`.** `ApproxVectorQuery` uses IVF
+  only for unfiltered, no-aggregate vector queries. If filters/order/aggregates
+  are present, it falls back to exact scoring over the strong candidate set.
+  This avoids incorrect filtered ANN before Stage 5 native filtering.
+- **D27 — Exact rerank always uses stored full vectors.** The IVF posting scan
+  narrows candidates but final scores come from the full vector values in the
+  posting object, with unindexed WAL vectors exact-scored and merged.
 
 ---
 
@@ -265,7 +353,7 @@ Decisions I (the implementer) made; the user delegated architectural calls.
 ```
 src/
   lib.rs                 module exports
-  main.rs                CLI (create/upsert/get/delete/list/flush/compact/demo)
+  main.rs                CLI (create/upsert/get/delete/list/query/flush/compact/demo)
   error.rs               shared Error / Result
   value.rs               Id, Value, VectorValue, Document
   schema.rs              ScalarType, ColumnType, Schema, ...
@@ -276,8 +364,11 @@ src/
   wal.rs                 WalCursor, WalOp, WalBatch (+ binary codec)
   sst.rs                 generic sorted-string-table writer/reader
   doc.rs                 Id key encoding (order-preserving) + DocRecord
+  attr.rs                attribute postings SST encoding/query helpers
+  query.rs               logical query types + exact/ANN execution
+  vector.rs              IVF vector index, distance scoring, recall helper
   namespace.rs           Namespace: create/append + SST-aware replay/lookup
-  indexer.rs             flush (WAL -> SST) and compaction
+  indexer.rs             flush/compaction + attr/vector index publication
 tests/
   common/mod.rs          assert_golden snapshot helper
   fs_object_store.rs     object store behavior (CAS, ranges, list, ...)
@@ -287,5 +378,7 @@ tests/
   doc_codec.rs           Id key order + record round-trip
   namespace.rs           namespace lifecycle + durability across reopen
   indexer.rs             flush/compaction + SST+overlay merge semantics
+  schema.rs              write-time schema inference/validation
+  query.rs               filters, ordering, aggregation, exact kNN, ANN v0
   fixtures/              committed golden snapshots
 ```

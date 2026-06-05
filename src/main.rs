@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use sana::namespace::Namespace;
 use sana::object_store::{FsObjectStore, ObjectStore};
+use sana::query::Query;
 use sana::value::{Document, Id, Value};
 
 type CliResult = Result<(), Box<dyn std::error::Error>>;
@@ -21,6 +22,7 @@ async fn main() -> CliResult {
         Some("get") => get(&args).await,
         Some("delete") => delete(&args).await,
         Some("list") => list(&args).await,
+        Some("query") => query(&args).await,
         Some("flush") => flush(&args).await,
         Some("compact") => compact(&args).await,
         Some("demo") => demo(&args).await,
@@ -42,6 +44,7 @@ fn usage() {
     eprintln!("  sana get    <dir> <ns> <id>");
     eprintln!("  sana delete <dir> <ns> <id>");
     eprintln!("  sana list    <dir> <ns>");
+    eprintln!("  sana query   <dir> <ns> [json-query]");
     eprintln!("  sana flush   <dir> <ns>   # fold WAL into a document SST");
     eprintln!("  sana compact <dir> <ns>   # merge SSTs, drop tombstones");
     eprintln!("  sana demo    <dir>");
@@ -124,11 +127,49 @@ async fn list(args: &[String]) -> CliResult {
     Ok(())
 }
 
+async fn query(args: &[String]) -> CliResult {
+    let (dir, ns) = (arg(args, 2)?, arg(args, 3)?);
+    let namespace = Namespace::open(store(dir), ns).await?;
+    let query = match args.get(4) {
+        Some(json) => serde_json::from_str::<Query>(json)?,
+        None => Query::all(),
+    };
+    let result = namespace.query(query).await?;
+    println!("{} row(s):", result.rows.len());
+    for row in &result.rows {
+        match row.score {
+            Some(score) => println!(
+                "  {:?} score={score:.6} -> {} attr(s), {} vector(s)",
+                row.id,
+                row.document.attributes.len(),
+                row.document.vectors.len()
+            ),
+            None => println!(
+                "  {:?} -> {} attr(s), {} vector(s)",
+                row.id,
+                row.document.attributes.len(),
+                row.document.vectors.len()
+            ),
+        }
+    }
+    if !result.aggregates.is_empty() {
+        println!("aggregates: {:?}", result.aggregates);
+    }
+    Ok(())
+}
+
 async fn flush(args: &[String]) -> CliResult {
     let (dir, ns) = (arg(args, 2)?, arg(args, 3)?);
     let namespace = Namespace::open(store(dir), ns).await?;
     let did = sana::indexer::flush(&namespace).await?;
-    println!("{}", if did { "flushed WAL into a new SST" } else { "nothing to flush" });
+    println!(
+        "{}",
+        if did {
+            "flushed WAL into a new SST"
+        } else {
+            "nothing to flush"
+        }
+    );
     Ok(())
 }
 
@@ -136,7 +177,14 @@ async fn compact(args: &[String]) -> CliResult {
     let (dir, ns) = (arg(args, 2)?, arg(args, 3)?);
     let namespace = Namespace::open(store(dir), ns).await?;
     let did = sana::indexer::compact(&namespace).await?;
-    println!("{}", if did { "compacted SSTs" } else { "nothing to compact" });
+    println!(
+        "{}",
+        if did {
+            "compacted SSTs"
+        } else {
+            "nothing to compact"
+        }
+    );
     Ok(())
 }
 
@@ -145,12 +193,14 @@ async fn demo(args: &[String]) -> CliResult {
     let ns = Namespace::create_or_open(store(dir), "demo").await?;
 
     let mut a = Document::new(Id::U64(1));
-    a.attributes.insert("title".into(), Value::String("alpha".into()));
+    a.attributes
+        .insert("title".into(), Value::String("alpha".into()));
     a.attributes.insert("score".into(), Value::Int(10));
     ns.upsert(a).await?;
 
     let mut b = Document::new(Id::U64(2));
-    b.attributes.insert("title".into(), Value::String("beta".into()));
+    b.attributes
+        .insert("title".into(), Value::String("beta".into()));
     ns.upsert(b).await?;
 
     ns.delete(Id::U64(1)).await?;
