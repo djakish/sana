@@ -197,6 +197,60 @@ async fn array_columns_are_homogeneous_but_can_later_be_empty() {
     ));
 }
 
+#[test]
+fn full_text_schema_accepts_strings_and_string_arrays() {
+    let mut schema = sana::schema::Schema {
+        columns: BTreeMap::from([(
+            "body".to_string(),
+            ColumnSpec {
+                column_type: ColumnType::FullText,
+                filterable: false,
+                indexed: true,
+            },
+        )]),
+        version: 1,
+    };
+
+    let mut ok = Document::new(Id::U64(1));
+    ok.attributes
+        .insert("body".into(), Value::String("rust database".into()));
+    assert!(
+        !schema
+            .infer_and_validate_ops(&[WalOp::Upsert {
+                id: Id::U64(1),
+                document: ok,
+            }])
+            .unwrap()
+    );
+
+    let mut ok_array = Document::new(Id::U64(2));
+    ok_array.attributes.insert(
+        "body".into(),
+        Value::Array(vec![
+            Value::String("rust".into()),
+            Value::String("search".into()),
+        ]),
+    );
+    assert!(
+        !schema
+            .infer_and_validate_ops(&[WalOp::Upsert {
+                id: Id::U64(2),
+                document: ok_array,
+            }])
+            .unwrap()
+    );
+
+    let mut bad = Document::new(Id::U64(3));
+    bad.attributes.insert("body".into(), Value::Int(10));
+    assert!(matches!(
+        schema.infer_and_validate_ops(&[WalOp::Upsert {
+            id: Id::U64(3),
+            document: bad,
+        }]),
+        Err(Error::InvalidSchema(_))
+    ));
+}
+
 #[tokio::test]
 async fn empty_batches_are_rejected() {
     let dir = tempfile::tempdir().unwrap();

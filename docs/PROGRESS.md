@@ -12,18 +12,20 @@ the next unchecked task under "Current milestone" / "Next up".
 ## Status snapshot
 
 - **Current stage:** Stage 7 (Full-text search) — **in progress**.
-- **Next up:** Tokenizer, BM25 stats, and simple text postings.
+- **Next up:** Fixed-size text posting blocks with block-max scores, then
+  MAXSCORE.
 - **Done:** Stage 0 (Skeleton), Stage 1 (Durable Documents), Stage 2 (SST/LSM),
   Stage 3 (Attributes & Exact Search), Stage 4 (ANN v0), Stage 5 (Native
   Filtering), Stage 6 (SPFresh local rebuild).
-- **Tests:** `cargo test` green (93 tests); `cargo clippy --all-targets` clean.
+- **Tests:** `cargo test` green (100 tests); `cargo clippy --all-targets` clean.
 - **Note:** post-Stage-2 and Stage-3–5 code-review fixes applied; remaining
   findings tracked under "Stage 2 — code review follow-ups" and "Stages 3–5 —
   code review follow-ups". Recently fixed limitations: Stage 2 ranged
   point-lookup (`sst::ranged_get`), LSM levels for `doc_ssts` (`tier_doc_ssts`),
   and orphaned-object GC (`indexer::gc`, `sana gc [--apply]`); Stage 3 attribute
   write-amplification via delta + tiered `attr_ssts` (`tier_attr_ssts`); vector
-  read path fetches append deltas concurrently.
+  read path fetches append deltas concurrently; Stage 7 now has tokenizer,
+  simple full-snapshot text postings, and BM25 query support.
 - **Last updated:** 2026-06-06.
 
 ---
@@ -586,11 +588,24 @@ rank/filter by text before upgrading to fixed posting blocks and MAXSCORE.
 
 Planned tasks:
 
-- [ ] Add text schema support and tokenizer configuration.
-- [ ] Build immutable full-text postings during flush/compaction.
-- [ ] Implement BM25 scoring over text postings.
-- [ ] Add text query API/CLI support and hybrid-ready score plumbing.
-- [ ] Add tests for tokenization, ranking, filtering, and SST persistence.
+- [x] Add text schema support and tokenizer configuration.
+- [x] Build immutable full-text postings during flush/compaction.
+- [x] Implement BM25 scoring over text postings.
+- [x] Add text query API/CLI support and hybrid-ready score plumbing.
+- [x] Add tests for tokenization, ranking, filtering, and SST persistence.
+- [ ] Upgrade postings to fixed-size blocks with block-local max scores.
+- [ ] Add rank-safe MAXSCORE over the block postings.
+- [ ] Add hybrid multi-query planning for combined text/vector/attribute ranks.
+
+Stage 7 decisions / notes:
+
+- **D39 — Text MVP is a full-snapshot BM25 family.** Flush/compaction now publish
+  `text_ssts` containing per-field document-length stats and term postings
+  `(id, tf, doc_len)` for string and string-array attributes. Query uses the
+  text SST only when `indexed_cursor == commit`; if WAL is ahead it falls back
+  to scoring the strong replayed snapshot. This keeps read-after-write
+  correctness simple while Stage 7 moves toward fixed posting blocks and
+  MAXSCORE.
 
 ---
 
@@ -652,10 +667,11 @@ src/
   sst.rs                 generic sorted-string-table writer/reader
   doc.rs                 Id key encoding (order-preserving) + DocRecord
   attr.rs                attribute postings SST encoding/query helpers
-  query.rs               logical query types + exact/ANN/native filtering + recall
+  text.rs                tokenizer, BM25 stats/scoring, text postings SST helpers
+  query.rs               logical query types + exact/ANN/text/native filtering + recall
   vector.rs              IVF vector index, version map, native filter bitmaps
   namespace.rs           Namespace: create/append + SST-aware replay/lookup
-  indexer.rs             flush/compaction + attr/vector index publication
+  indexer.rs             flush/compaction + attr/text/vector index publication
 tests/
   common/mod.rs          assert_golden snapshot helper
   fs_object_store.rs     object store behavior (CAS, ranges, list, ...)
@@ -666,6 +682,7 @@ tests/
   namespace.rs           namespace lifecycle + durability across reopen
   indexer.rs             flush/compaction + SST+overlay merge semantics
   schema.rs              write-time schema inference/validation
-  query.rs               filters, ordering, aggregation, exact kNN, ANN, recall
+  query.rs               filters, ordering, aggregation, exact kNN, ANN, BM25, recall
+  text.rs                tokenization, BM25, text SST round-trip
   fixtures/              committed golden snapshots
 ```

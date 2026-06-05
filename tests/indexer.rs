@@ -33,6 +33,7 @@ fn indexed_bytes(manifest: &sana::manifest::NamespaceManifest) -> u64 {
         .doc_ssts
         .iter()
         .chain(&manifest.attr_ssts)
+        .chain(&manifest.text_ssts)
         .map(|s| s.size_bytes)
         .sum::<u64>()
         + manifest
@@ -423,6 +424,7 @@ async fn vector_maintenance_publishes_local_rebuild_delta() {
                 probes: Some(1),
                 metric: Some(DistanceMetric::Cosine),
             }),
+            text: None,
         })
         .await
         .unwrap();
@@ -659,6 +661,7 @@ async fn attr_postings_are_delta_appended_and_tiered() {
         aggregates: Vec::new(),
         exact_vector: None,
         approx_vector: None,
+        text: None,
     };
     let ids =
         |r: sana::query::QueryResult| -> Vec<Id> { r.rows.into_iter().map(|row| row.id).collect() };

@@ -12,6 +12,7 @@ pub mod object_store;
 pub mod query;
 pub mod schema;
 pub mod sst;
+pub mod text;
 pub mod value;
 pub mod vector;
 pub mod wal;

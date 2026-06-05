@@ -9,10 +9,11 @@ use sana::namespace::Namespace;
 use sana::object_store::{FsObjectStore, GetResult, ObjectMeta, ObjectStore, ObjectVersion};
 use sana::query::{
     Aggregate, AggregateResult, ApproxVectorQuery, ExactVectorQuery, FilterExpr, OrderBy,
-    OrderTarget, Query, RangeBound, RecallRequest, SortDirection,
+    OrderTarget, Query, RangeBound, RecallRequest, SortDirection, TextQuery,
 };
 use sana::schema::DistanceMetric;
 use sana::sst::SstReader;
+use sana::text::Bm25Params;
 use sana::value::{Document, Id, Value, VectorValue};
 use sana::vector;
 use sana::{attr, indexer};
@@ -142,6 +143,7 @@ async fn query_filters_orders_and_aggregates() {
             ],
             exact_vector: None,
             approx_vector: None,
+            text: None,
         })
         .await
         .unwrap();
@@ -195,6 +197,7 @@ async fn query_supports_or_not_and_primary_key_order() {
             aggregates: vec![Aggregate::Count],
             exact_vector: None,
             approx_vector: None,
+            text: None,
         })
         .await
         .unwrap();
@@ -234,6 +237,7 @@ async fn exact_vector_knn_scores_filtered_candidates() {
                 metric: Some(DistanceMetric::L2),
             }),
             approx_vector: None,
+            text: None,
         })
         .await
         .unwrap();
@@ -266,6 +270,7 @@ async fn exact_vector_query_validates_schema_and_dimension() {
                 metric: None,
             }),
             approx_vector: None,
+            text: None,
         })
         .await
         .unwrap_err();
@@ -326,6 +331,7 @@ async fn indexed_attribute_filter_rechecks_wal_overlay() {
             aggregates: vec![Aggregate::Count],
             exact_vector: None,
             approx_vector: None,
+            text: None,
         })
         .await
         .unwrap();
@@ -362,12 +368,106 @@ async fn indexed_numeric_eq_matches_cross_type_query_value() {
             aggregates: vec![Aggregate::Count],
             exact_vector: None,
             approx_vector: None,
+            text: None,
         })
         .await
         .unwrap();
 
     let ids: Vec<Id> = result.rows.into_iter().map(|row| row.id).collect();
     assert_eq!(ids, vec![Id::U64(1)]);
+}
+
+#[tokio::test]
+async fn bm25_text_query_reads_flushed_text_sst() {
+    let dir = tempfile::tempdir().unwrap();
+    let ns = Namespace::create(store(&dir), "docs").await.unwrap();
+    ns.upsert(doc(1, "rust rust database", 10, &["public"], [1.0, 0.0]))
+        .await
+        .unwrap();
+    ns.upsert(doc(
+        2,
+        "rust database storage engine",
+        20,
+        &["public"],
+        [2.0, 0.0],
+    ))
+    .await
+    .unwrap();
+    ns.upsert(doc(3, "python database", 30, &["public"], [3.0, 0.0]))
+        .await
+        .unwrap();
+    indexer::flush(&ns).await.unwrap();
+
+    let manifest = ns.load_manifest().await.unwrap();
+    assert_eq!(manifest.text_ssts.len(), 1);
+
+    let result = ns
+        .query(Query {
+            filter: None,
+            order_by: None,
+            limit: None,
+            aggregates: vec![Aggregate::Count],
+            exact_vector: None,
+            approx_vector: None,
+            text: Some(TextQuery {
+                column: "title".into(),
+                query: "rust database".into(),
+                k: 3,
+                params: Bm25Params::default(),
+            }),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(result.aggregates, vec![AggregateResult::Count(3)]);
+    let ids: Vec<Id> = result.rows.iter().map(|row| row.id.clone()).collect();
+    assert_eq!(ids, vec![Id::U64(1), Id::U64(2), Id::U64(3)]);
+    assert!(result.rows[0].score.unwrap() > result.rows[1].score.unwrap());
+}
+
+#[tokio::test]
+async fn bm25_text_query_filters_and_falls_back_to_wal_overlay() {
+    let dir = tempfile::tempdir().unwrap();
+    let ns = Namespace::create(store(&dir), "docs").await.unwrap();
+    ns.upsert(doc(1, "rust database", 10, &["public"], [1.0, 0.0]))
+        .await
+        .unwrap();
+    indexer::flush(&ns).await.unwrap();
+
+    ns.upsert(doc(
+        2,
+        "rust database internals",
+        20,
+        &["private"],
+        [2.0, 0.0],
+    ))
+    .await
+    .unwrap();
+
+    let result = ns
+        .query(Query {
+            filter: Some(FilterExpr::Eq {
+                column: "tags".into(),
+                value: Value::String("private".into()),
+            }),
+            order_by: None,
+            limit: None,
+            aggregates: vec![Aggregate::Count],
+            exact_vector: None,
+            approx_vector: None,
+            text: Some(TextQuery {
+                column: "title".into(),
+                query: "database internals".into(),
+                k: 5,
+                params: Bm25Params::default(),
+            }),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(result.aggregates, vec![AggregateResult::Count(1)]);
+    let ids: Vec<Id> = result.rows.into_iter().map(|row| row.id).collect();
+    assert_eq!(ids, vec![Id::U64(2)]);
 }
 
 #[tokio::test]
@@ -395,6 +495,7 @@ async fn approx_vector_query_honors_limit_below_k() {
                 probes: Some(16),
                 metric: Some(DistanceMetric::L2),
             }),
+            text: None,
         })
         .await
         .unwrap();
@@ -436,6 +537,7 @@ async fn filtered_query_resolution_does_not_scale_with_candidate_count() {
             aggregates: vec![Aggregate::Count],
             exact_vector: None,
             approx_vector: None,
+            text: None,
         })
         .await
         .unwrap();
@@ -480,6 +582,7 @@ async fn ann_vector_query_matches_exact_with_full_probes() {
                 metric: Some(DistanceMetric::L2),
             }),
             approx_vector: None,
+            text: None,
         })
         .await
         .unwrap();
@@ -497,6 +600,7 @@ async fn ann_vector_query_matches_exact_with_full_probes() {
                 probes: Some(16),
                 metric: Some(DistanceMetric::L2),
             }),
+            text: None,
         })
         .await
         .unwrap();
@@ -541,6 +645,7 @@ async fn ann_vector_query_reads_flushed_append_postings() {
                 probes: Some(16),
                 metric: Some(DistanceMetric::L2),
             }),
+            text: None,
         })
         .await
         .unwrap();
@@ -604,6 +709,7 @@ async fn ann_recall_survives_flushed_insert_update_delete_churn_without_rebuild(
                 metric: Some(DistanceMetric::L2),
             }),
             approx_vector: None,
+            text: None,
         })
         .await
         .unwrap();
@@ -621,6 +727,7 @@ async fn ann_recall_survives_flushed_insert_update_delete_churn_without_rebuild(
                 probes: Some(16),
                 metric: Some(DistanceMetric::L2),
             }),
+            text: None,
         })
         .await
         .unwrap();
@@ -676,6 +783,7 @@ async fn ann_vector_query_rechecks_wal_overlay() {
                 probes: Some(16),
                 metric: Some(DistanceMetric::L2),
             }),
+            text: None,
         })
         .await
         .unwrap();
@@ -737,6 +845,7 @@ async fn ann_vector_query_drops_stale_index_versions() {
                 probes: Some(16),
                 metric: Some(DistanceMetric::L2),
             }),
+            text: None,
         })
         .await
         .unwrap();
@@ -786,6 +895,7 @@ async fn ann_vector_query_uses_native_filtering_to_probe_matching_clusters() {
                 probes: Some(1),
                 metric: Some(DistanceMetric::L2),
             }),
+            text: None,
         })
         .await
         .unwrap();
@@ -831,6 +941,7 @@ async fn ann_vector_query_applies_filters_to_wal_overlay() {
                 probes: Some(16),
                 metric: Some(DistanceMetric::L2),
             }),
+            text: None,
         })
         .await
         .unwrap();

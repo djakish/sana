@@ -30,6 +30,7 @@ use crate::namespace::{
 };
 use crate::schema::{ColumnType, DistanceMetric};
 use crate::sst::SstWriter;
+use crate::text;
 use crate::value::{Document, Id};
 use crate::vector::{VectorEntry, VectorIndex, VectorVersionMap, vector_to_f32};
 use crate::wal::WalCursor;
@@ -116,6 +117,34 @@ async fn publish_attr_sst(
     };
     let sst_key = format!(
         "namespaces/{}/index/g/{}/attr/{}.sst",
+        ns.name(),
+        generation,
+        suffix
+    );
+    ns.store()
+        .put(&sst_key, Bytes::from(built.bytes.clone()))
+        .await?;
+    Ok(vec![SstMeta {
+        key: sst_key,
+        size_bytes: built.bytes.len() as u64,
+        row_count: built.entry_count,
+        min_id: None,
+        max_id: None,
+        level: 0,
+    }])
+}
+
+async fn publish_text_sst(
+    ns: &Namespace,
+    generation: u64,
+    suffix: &str,
+    docs: &BTreeMap<Id, Document>,
+) -> Result<Vec<SstMeta>> {
+    let Some(built) = text::build_text_sst(docs)? else {
+        return Ok(Vec::new());
+    };
+    let sst_key = format!(
+        "namespaces/{}/index/g/{}/fts/{}.sst",
         ns.name(),
         generation,
         suffix
@@ -456,6 +485,7 @@ pub async fn flush(ns: &Namespace) -> Result<bool> {
 
     let vector_indexes =
         publish_vector_indexes(ns, new_gen, &manifest, &live_docs, Some(&touched_ids)).await?;
+    let text_ssts = publish_text_sst(ns, new_gen, "full", &live_docs).await?;
 
     manifest.generation = new_gen;
     manifest.updated_at_ms = now_ms();
@@ -476,6 +506,7 @@ pub async fn flush(ns: &Namespace) -> Result<bool> {
     // read fan-out without rewriting the whole index on every flush.
     tier_doc_ssts(ns, new_gen, &mut manifest.doc_ssts, commit.seq).await?;
     manifest.attr_ssts = attr_ssts;
+    manifest.text_ssts = text_ssts;
     manifest.vector_index_generations = vector_indexes
         .keys()
         .map(|column| (column.clone(), new_gen))
@@ -486,6 +517,7 @@ pub async fn flush(ns: &Namespace) -> Result<bool> {
         .doc_ssts
         .iter()
         .chain(&manifest.attr_ssts)
+        .chain(&manifest.text_ssts)
         .map(|m| m.size_bytes)
         .sum::<u64>()
         + manifest
@@ -663,6 +695,7 @@ pub async fn compact(ns: &Namespace) -> Result<bool> {
     manifest.wal_commit_cursor = Some(ns.commit_cursor().await?);
     manifest.approx_row_count = built.row_count;
     manifest.attr_ssts = publish_attr_sst(ns, new_gen, "full", &live_docs).await?;
+    manifest.text_ssts = publish_text_sst(ns, new_gen, "full", &live_docs).await?;
     manifest.vector_indexes =
         publish_vector_indexes(ns, new_gen, &manifest, &live_docs, None).await?;
     manifest.vector_index_generations = manifest
@@ -672,6 +705,7 @@ pub async fn compact(ns: &Namespace) -> Result<bool> {
         .collect();
     manifest.approx_logical_bytes = built.bytes.len() as u64
         + manifest.attr_ssts.iter().map(|m| m.size_bytes).sum::<u64>()
+        + manifest.text_ssts.iter().map(|m| m.size_bytes).sum::<u64>()
         + manifest
             .vector_indexes
             .values()
@@ -723,7 +757,12 @@ pub async fn gc(ns: &Namespace, apply: bool) -> Result<GcReport> {
     live.insert(manifest_pointer_key(ns.name()));
     live.insert(wal_commit_key(ns.name()));
     live.insert(manifest_body_key_for_pointer(ns.name(), &snapshot.pointer));
-    for meta in manifest.doc_ssts.iter().chain(&manifest.attr_ssts) {
+    for meta in manifest
+        .doc_ssts
+        .iter()
+        .chain(&manifest.attr_ssts)
+        .chain(&manifest.text_ssts)
+    {
         live.insert(meta.key.clone());
     }
     for vmeta in manifest.vector_indexes.values() {
@@ -912,6 +951,7 @@ pub async fn maintain_vectors(ns: &Namespace) -> Result<bool> {
         .doc_ssts
         .iter()
         .chain(&manifest.attr_ssts)
+        .chain(&manifest.text_ssts)
         .map(|m| m.size_bytes)
         .sum::<u64>()
         + manifest

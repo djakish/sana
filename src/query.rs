@@ -7,7 +7,7 @@
 //! logical request/response types.
 
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +17,7 @@ use crate::error::{Error, Result};
 use crate::manifest::{NamespaceManifest, VectorIndexMeta};
 use crate::namespace::{Namespace, op_id};
 use crate::schema::{ColumnType, DistanceMetric};
+use crate::text::{self, Bm25Params};
 use crate::value::{Document, Id, Value, compare_scalars, scalar_eq};
 use crate::vector::{self, VectorFilterMask, VectorIndex, VectorVersionMap};
 
@@ -37,6 +38,8 @@ pub struct Query {
     pub exact_vector: Option<ExactVectorQuery>,
     #[serde(default)]
     pub approx_vector: Option<ApproxVectorQuery>,
+    #[serde(default)]
+    pub text: Option<TextQuery>,
 }
 
 impl Query {
@@ -48,6 +51,7 @@ impl Query {
             aggregates: Vec::new(),
             exact_vector: None,
             approx_vector: None,
+            text: None,
         }
     }
 }
@@ -116,6 +120,15 @@ pub struct ApproxVectorQuery {
     pub probes: Option<usize>,
     #[serde(default)]
     pub metric: Option<DistanceMetric>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TextQuery {
+    pub column: String,
+    pub query: String,
+    pub k: usize,
+    #[serde(default)]
+    pub params: Bm25Params,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -212,6 +225,28 @@ pub async fn execute(ns: &Namespace, query: Query) -> Result<QueryResult> {
             "query cannot specify both exact_vector and approx_vector".into(),
         ));
     }
+    if query.text.is_some() && (query.exact_vector.is_some() || query.approx_vector.is_some()) {
+        return Err(Error::InvalidQuery(
+            "text and vector ranking cannot be combined until hybrid query planning lands".into(),
+        ));
+    }
+
+    if let Some(text_query) = &query.text {
+        if query.order_by.is_some() {
+            return Err(Error::InvalidQuery(
+                "text queries rank by BM25 score and cannot also specify order_by".into(),
+            ));
+        }
+        return execute_text(
+            ns,
+            &manifest,
+            text_query,
+            query.filter.as_ref(),
+            query.limit,
+            &query.aggregates,
+        )
+        .await;
+    }
 
     if let Some(ann_query) = &query.approx_vector
         && query.order_by.is_none()
@@ -250,6 +285,73 @@ pub async fn execute(ns: &Namespace, query: Query) -> Result<QueryResult> {
         rows: candidates,
         aggregates,
     })
+}
+
+async fn execute_text(
+    ns: &Namespace,
+    manifest: &NamespaceManifest,
+    text_query: &TextQuery,
+    filter: Option<&FilterExpr>,
+    limit: Option<usize>,
+    aggregates: &[Aggregate],
+) -> Result<QueryResult> {
+    validate_text_query(manifest, text_query)?;
+
+    let (hits, docs) = text_hits_and_docs(ns, manifest, text_query).await?;
+    let score_by_id: BTreeMap<Id, f32> = hits.into_iter().map(|hit| (hit.id, hit.score)).collect();
+
+    let mut rows = Vec::new();
+    for (id, document) in docs {
+        let Some(score) = score_by_id.get(&id).copied() else {
+            continue;
+        };
+        if matches_filter(filter, &document)? {
+            rows.push(QueryRow {
+                id,
+                document,
+                score: Some(score),
+            });
+        }
+    }
+    rows.sort_by(compare_score_rows);
+
+    let aggregate_rows = rows.clone();
+    let aggregates = compute_aggregates(aggregates, &aggregate_rows)?;
+
+    let effective_limit = limit.unwrap_or(text_query.k).min(text_query.k);
+    rows.truncate(effective_limit);
+    Ok(QueryResult { rows, aggregates })
+}
+
+async fn text_hits_and_docs(
+    ns: &Namespace,
+    manifest: &NamespaceManifest,
+    text_query: &TextQuery,
+) -> Result<(Vec<text::TextHit>, BTreeMap<Id, Document>)> {
+    let commit = ns.commit_cursor().await?;
+    if manifest.indexed_cursor == Some(commit)
+        && let Some(meta) = manifest.text_ssts.first()
+    {
+        let reader = ns.load_sst(&meta.key).await?;
+        let hits = text::search_sst(
+            &reader,
+            &text_query.column,
+            &text_query.query,
+            text_query.params,
+        )?;
+        let ids: BTreeSet<Id> = hits.iter().map(|hit| hit.id.clone()).collect();
+        let docs = ns.resolve_ids(manifest, &[], &ids).await?;
+        return Ok((hits, docs));
+    }
+
+    let docs = ns.replay().await?;
+    let hits = text::score_documents(
+        &docs,
+        &text_query.column,
+        &text_query.query,
+        text_query.params,
+    )?;
+    Ok((hits, docs))
 }
 
 pub async fn recall(ns: &Namespace, request: RecallRequest) -> Result<RecallResult> {
@@ -324,6 +426,7 @@ pub async fn recall(ns: &Namespace, request: RecallRequest) -> Result<RecallResu
                 metric: Some(metric),
             }),
             approx_vector: None,
+            text: None,
         };
         let ann_query = Query {
             filter: request.filter.clone(),
@@ -338,6 +441,7 @@ pub async fn recall(ns: &Namespace, request: RecallRequest) -> Result<RecallResu
                 probes: request.probes,
                 metric: Some(metric),
             }),
+            text: None,
         };
         let (exact, ann) = tokio::join!(execute(ns, exact_query), execute(ns, ann_query));
         let (exact, ann) = (exact?, ann?);
@@ -964,6 +1068,31 @@ fn is_sortable_value(value: &Value) -> bool {
         value,
         Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::String(_)
     )
+}
+
+fn validate_text_query(manifest: &NamespaceManifest, text_query: &TextQuery) -> Result<()> {
+    if text_query.k == 0 {
+        return Err(Error::InvalidQuery(
+            "text query k must be greater than zero".into(),
+        ));
+    }
+    text_query.params.validate()?;
+    let spec = manifest
+        .schema
+        .columns
+        .get(&text_query.column)
+        .ok_or_else(|| {
+            Error::InvalidQuery(format!("unknown text column '{}'", text_query.column))
+        })?;
+    match &spec.column_type {
+        ColumnType::Scalar(crate::schema::ScalarType::String)
+        | ColumnType::Array(crate::schema::ScalarType::String)
+        | ColumnType::FullText => Ok(()),
+        other => Err(Error::InvalidQuery(format!(
+            "column '{}' is not a text column: {:?}",
+            text_query.column, other
+        ))),
+    }
 }
 
 fn vector_schema(

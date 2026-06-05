@@ -262,7 +262,22 @@ fn validate_attribute_value(name: &str, value: &Value, expected: &ColumnType) ->
                 )))
             }
         },
-        ColumnType::Vector { .. } | ColumnType::FullText => {
+        ColumnType::FullText => match value {
+            Value::String(_) => Ok(()),
+            Value::Array(values)
+                if values.iter().all(|value| matches!(value, Value::String(_))) =>
+            {
+                Ok(())
+            }
+            _ => {
+                let actual = infer_attribute_type(name, value)?;
+                Err(Error::InvalidSchema(format!(
+                    "column '{name}' expected full-text string or string array, got {:?}",
+                    actual
+                )))
+            }
+        },
+        ColumnType::Vector { .. } => {
             let actual = infer_attribute_type(name, value)?;
             Err(Error::InvalidSchema(format!(
                 "column '{name}' expected {:?}, got {:?}",

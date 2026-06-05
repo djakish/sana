@@ -147,6 +147,10 @@ pub struct NamespaceManifest {
     /// levels and compatibility with the document family shape.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attr_ssts: Vec<SstMeta>,
+    /// Full-text postings SST files. Stage 7 starts with one full-snapshot run
+    /// containing BM25 field stats plus term postings.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub text_ssts: Vec<SstMeta>,
     #[serde(default)]
     pub vector_index_generations: BTreeMap<String, u64>,
     /// Full-snapshot immutable IVF indexes by vector column.
@@ -174,6 +178,7 @@ impl NamespaceManifest {
             indexed_cursor: None,
             doc_ssts: Vec::new(),
             attr_ssts: Vec::new(),
+            text_ssts: Vec::new(),
             vector_index_generations: BTreeMap::new(),
             vector_indexes: BTreeMap::new(),
             branch_parent: None,
