@@ -12,11 +12,16 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 
 use crate::attr::{self, AttrBound};
+use crate::doc::encode_id;
 use crate::error::{Error, Result};
+use crate::manifest::NamespaceManifest;
 use crate::namespace::{Namespace, op_id};
 use crate::schema::{ColumnType, DistanceMetric};
 use crate::value::{Document, Id, Value, VectorValue};
 use crate::vector::{self, VectorIndex};
+
+const DEFAULT_RECALL_NUM: usize = 25;
+const DEFAULT_RECALL_TOP_K: usize = 10;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Query {
@@ -120,6 +125,59 @@ pub struct QueryResult {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RecallRequest {
+    #[serde(default = "default_recall_num")]
+    pub num: usize,
+    #[serde(default = "default_recall_top_k")]
+    pub top_k: usize,
+    #[serde(default)]
+    pub column: Option<String>,
+    #[serde(default)]
+    pub probes: Option<usize>,
+    #[serde(default)]
+    pub metric: Option<DistanceMetric>,
+    #[serde(default)]
+    pub filter: Option<FilterExpr>,
+}
+
+impl Default for RecallRequest {
+    fn default() -> Self {
+        Self {
+            num: DEFAULT_RECALL_NUM,
+            top_k: DEFAULT_RECALL_TOP_K,
+            column: None,
+            probes: None,
+            metric: None,
+            filter: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RecallResult {
+    pub column: String,
+    pub requested: usize,
+    pub sampled: usize,
+    pub top_k: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probes: Option<usize>,
+    pub avg_recall: f64,
+    pub avg_exhaustive_count: f64,
+    pub avg_ann_count: f64,
+    pub samples: Vec<RecallSample>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RecallSample {
+    pub query_id: Id,
+    pub recall: f64,
+    pub exhaustive_count: usize,
+    pub ann_count: usize,
+    pub exhaustive_ids: Vec<Id>,
+    pub ann_ids: Vec<Id>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct QueryRow {
     pub id: Id,
     pub document: Document,
@@ -137,6 +195,14 @@ pub enum AggregateResult {
         value_count: u64,
         total: f64,
     },
+}
+
+fn default_recall_num() -> usize {
+    DEFAULT_RECALL_NUM
+}
+
+fn default_recall_top_k() -> usize {
+    DEFAULT_RECALL_TOP_K
 }
 
 pub async fn execute(ns: &Namespace, query: Query) -> Result<QueryResult> {
@@ -209,9 +275,131 @@ pub async fn execute(ns: &Namespace, query: Query) -> Result<QueryResult> {
     })
 }
 
+pub async fn recall(ns: &Namespace, request: RecallRequest) -> Result<RecallResult> {
+    if request.num == 0 {
+        return Err(Error::InvalidQuery(
+            "recall num must be greater than zero".into(),
+        ));
+    }
+    if request.top_k == 0 {
+        return Err(Error::InvalidQuery(
+            "recall top_k must be greater than zero".into(),
+        ));
+    }
+    if request.filter.is_some() {
+        return Err(Error::InvalidQuery(
+            "filtered recall requires native filtered ANN (Stage 5)".into(),
+        ));
+    }
+
+    let manifest = ns.load_manifest().await?;
+    let column = match request.column.clone() {
+        Some(column) => column,
+        None => manifest
+            .vector_indexes
+            .keys()
+            .next()
+            .cloned()
+            .ok_or_else(|| {
+                Error::InvalidQuery(
+                    "recall requires a published vector index; run flush or compact first".into(),
+                )
+            })?,
+    };
+    if !manifest.vector_indexes.contains_key(&column) {
+        return Err(Error::InvalidQuery(format!(
+            "recall requires a published vector index for '{column}'; run flush or compact first"
+        )));
+    }
+
+    let (dim, default_metric) = vector_column_schema(&manifest, &column)?;
+    let metric = request.metric.unwrap_or(default_metric);
+    let mut candidates = recall_candidates(ns, &column, dim).await?;
+    if candidates.is_empty() {
+        return Err(Error::InvalidQuery(format!(
+            "recall column '{column}' has no stored vectors"
+        )));
+    }
+
+    candidates.sort_by_key(|candidate| stable_sample_key(&candidate.id, &column));
+    candidates.truncate(request.num.min(candidates.len()));
+
+    let mut samples = Vec::with_capacity(candidates.len());
+    let mut recall_sum = 0.0;
+    let mut exhaustive_count_sum = 0usize;
+    let mut ann_count_sum = 0usize;
+
+    for candidate in candidates {
+        let exact = execute(
+            ns,
+            Query {
+                filter: None,
+                order_by: None,
+                limit: None,
+                aggregates: Vec::new(),
+                exact_vector: Some(ExactVectorQuery {
+                    column: column.clone(),
+                    vector: candidate.vector.clone(),
+                    k: request.top_k,
+                    metric: Some(metric),
+                }),
+                approx_vector: None,
+            },
+        )
+        .await?;
+        let ann = execute(
+            ns,
+            Query {
+                filter: None,
+                order_by: None,
+                limit: None,
+                aggregates: Vec::new(),
+                exact_vector: None,
+                approx_vector: Some(ApproxVectorQuery {
+                    column: column.clone(),
+                    vector: candidate.vector,
+                    k: request.top_k,
+                    probes: request.probes,
+                    metric: Some(metric),
+                }),
+            },
+        )
+        .await?;
+
+        let exhaustive_ids = exact.rows.into_iter().map(|row| row.id).collect::<Vec<_>>();
+        let ann_ids = ann.rows.into_iter().map(|row| row.id).collect::<Vec<_>>();
+        let sample_recall = vector::recall_at(&exhaustive_ids, &ann_ids, request.top_k);
+
+        recall_sum += sample_recall;
+        exhaustive_count_sum += exhaustive_ids.len();
+        ann_count_sum += ann_ids.len();
+        samples.push(RecallSample {
+            query_id: candidate.id,
+            recall: sample_recall,
+            exhaustive_count: exhaustive_ids.len(),
+            ann_count: ann_ids.len(),
+            exhaustive_ids,
+            ann_ids,
+        });
+    }
+
+    let sampled = samples.len();
+    Ok(RecallResult {
+        column,
+        requested: request.num,
+        sampled,
+        top_k: request.top_k,
+        probes: request.probes,
+        avg_recall: recall_sum / sampled as f64,
+        avg_exhaustive_count: exhaustive_count_sum as f64 / sampled as f64,
+        avg_ann_count: ann_count_sum as f64 / sampled as f64,
+        samples,
+    })
+}
+
 async fn execute_ann_vector(
     ns: &Namespace,
-    manifest: &crate::manifest::NamespaceManifest,
+    manifest: &NamespaceManifest,
     query: &ApproxVectorQuery,
 ) -> Result<QueryResult> {
     let exact_query = ExactVectorQuery {
@@ -299,7 +487,7 @@ async fn execute_ann_vector(
 
 async fn materialize_candidates(
     ns: &Namespace,
-    manifest: &crate::manifest::NamespaceManifest,
+    manifest: &NamespaceManifest,
     filter: Option<&FilterExpr>,
 ) -> Result<Vec<QueryRow>> {
     if let Some(filter) = filter
@@ -342,7 +530,7 @@ async fn materialize_candidates(
 
 async fn indexed_filter_candidate_ids(
     ns: &Namespace,
-    manifest: &crate::manifest::NamespaceManifest,
+    manifest: &NamespaceManifest,
     filter: &FilterExpr,
 ) -> Result<Option<BTreeSet<Id>>> {
     let Some(meta) = manifest.attr_ssts.first() else {
@@ -615,7 +803,7 @@ fn is_sortable_value(value: &Value) -> bool {
 }
 
 fn vector_schema(
-    manifest: &crate::manifest::NamespaceManifest,
+    manifest: &NamespaceManifest,
     vector_query: &ExactVectorQuery,
 ) -> Result<(usize, DistanceMetric)> {
     if vector_query.k == 0 {
@@ -633,20 +821,71 @@ fn vector_schema(
             "exact vector query contains a non-finite value".into(),
         ));
     }
+    vector_column_schema(manifest, &vector_query.column)
+}
+
+fn vector_column_schema(
+    manifest: &NamespaceManifest,
+    column: &str,
+) -> Result<(usize, DistanceMetric)> {
     let spec = manifest
         .schema
         .columns
-        .get(&vector_query.column)
-        .ok_or_else(|| {
-            Error::InvalidQuery(format!("unknown vector column '{}'", vector_query.column))
-        })?;
+        .get(column)
+        .ok_or_else(|| Error::InvalidQuery(format!("unknown vector column '{column}'")))?;
     match &spec.column_type {
         ColumnType::Vector { dim, metric, .. } => Ok((*dim, *metric)),
         other => Err(Error::InvalidQuery(format!(
             "column '{}' is not a vector column: {:?}",
-            vector_query.column, other
+            column, other
         ))),
     }
+}
+
+struct RecallCandidate {
+    id: Id,
+    vector: Vec<f32>,
+}
+
+async fn recall_candidates(
+    ns: &Namespace,
+    column: &str,
+    dim: usize,
+) -> Result<Vec<RecallCandidate>> {
+    let docs = ns.replay().await?;
+    let mut out = Vec::new();
+    for (id, document) in docs {
+        let Some(vector) = document.vectors.get(column) else {
+            continue;
+        };
+        let values = vector_to_f32(vector);
+        if values.len() != dim {
+            return Err(Error::Corrupt(format!(
+                "stored vector '{column}' for {:?} has dim {}, expected {dim}",
+                id,
+                values.len()
+            )));
+        }
+        out.push(RecallCandidate { id, vector: values });
+    }
+    Ok(out)
+}
+
+fn stable_sample_key(id: &Id, column: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in column.as_bytes().iter().chain(encode_id(id).iter()) {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    splitmix64(hash)
+}
+
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    let mut z = x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
 }
 
 fn score_vectors(

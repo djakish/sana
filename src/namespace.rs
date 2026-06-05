@@ -26,7 +26,7 @@ use crate::doc::{DocRecord, decode_id, encode_id};
 use crate::error::{Error, Result};
 use crate::manifest::{ManifestPointer, NamespaceManifest};
 use crate::object_store::{ObjectStore, ObjectVersion, version_of};
-use crate::query::{Query, QueryResult};
+use crate::query::{Query, QueryResult, RecallRequest, RecallResult};
 use crate::sst::SstReader;
 use crate::value::{Document, Id, Value};
 use crate::wal::{WalBatch, WalCursor, WalOp};
@@ -438,6 +438,12 @@ impl Namespace {
     /// generation inside `query` without changing this entry point.
     pub async fn query(&self, query: Query) -> Result<QueryResult> {
         crate::query::execute(self, query).await
+    }
+
+    /// Evaluate ANN recall by comparing approximate vector search with exact
+    /// search over sampled vectors from the strong snapshot.
+    pub async fn recall(&self, request: RecallRequest) -> Result<RecallResult> {
+        crate::query::recall(self, request).await
     }
 }
 

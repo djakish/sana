@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use sana::namespace::Namespace;
 use sana::object_store::{FsObjectStore, ObjectStore};
-use sana::query::Query;
+use sana::query::{Query, RecallRequest};
 use sana::value::{Document, Id, Value};
 
 type CliResult = Result<(), Box<dyn std::error::Error>>;
@@ -23,6 +23,7 @@ async fn main() -> CliResult {
         Some("delete") => delete(&args).await,
         Some("list") => list(&args).await,
         Some("query") => query(&args).await,
+        Some("recall") => recall(&args).await,
         Some("flush") => flush(&args).await,
         Some("compact") => compact(&args).await,
         Some("demo") => demo(&args).await,
@@ -45,6 +46,7 @@ fn usage() {
     eprintln!("  sana delete <dir> <ns> <id>");
     eprintln!("  sana list    <dir> <ns>");
     eprintln!("  sana query   <dir> <ns> [json-query]");
+    eprintln!("  sana recall  <dir> <ns> [json-recall-request]");
     eprintln!("  sana flush   <dir> <ns>   # fold WAL into a document SST");
     eprintln!("  sana compact <dir> <ns>   # merge SSTs, drop tombstones");
     eprintln!("  sana demo    <dir>");
@@ -155,6 +157,18 @@ async fn query(args: &[String]) -> CliResult {
     if !result.aggregates.is_empty() {
         println!("aggregates: {:?}", result.aggregates);
     }
+    Ok(())
+}
+
+async fn recall(args: &[String]) -> CliResult {
+    let (dir, ns) = (arg(args, 2)?, arg(args, 3)?);
+    let namespace = Namespace::open(store(dir), ns).await?;
+    let request = match args.get(4) {
+        Some(json) => serde_json::from_str::<RecallRequest>(json)?,
+        None => RecallRequest::default(),
+    };
+    let result = namespace.recall(request).await?;
+    println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
 }
 

@@ -5,7 +5,7 @@ use sana::namespace::Namespace;
 use sana::object_store::{FsObjectStore, ObjectStore};
 use sana::query::{
     Aggregate, AggregateResult, ApproxVectorQuery, ExactVectorQuery, FilterExpr, OrderBy,
-    OrderTarget, Query, RangeBound, SortDirection,
+    OrderTarget, Query, RangeBound, RecallRequest, SortDirection,
 };
 use sana::schema::DistanceMetric;
 use sana::sst::SstReader;
@@ -365,4 +365,100 @@ async fn ann_vector_query_rechecks_wal_overlay() {
     let ids: Vec<Id> = ann.rows.iter().map(|row| row.id.clone()).collect();
     assert_eq!(ids, vec![Id::U64(3), Id::U64(2)]);
     assert_eq!(ann.rows[0].score, Some(-0.0025000002));
+}
+
+#[tokio::test]
+async fn recall_reports_perfect_recall_with_full_probes() {
+    let dir = tempfile::tempdir().unwrap();
+    let ns = Namespace::create(store(&dir), "docs").await.unwrap();
+    for (id, x) in [(1, 0.1), (2, 0.2), (3, 1.0), (4, 2.0), (5, 4.0), (6, 8.0)] {
+        ns.upsert(doc(id, &format!("doc-{id}"), id as i64, &["v"], [x, 0.0]))
+            .await
+            .unwrap();
+    }
+    indexer::flush(&ns).await.unwrap();
+
+    let result = ns
+        .recall(RecallRequest {
+            num: 4,
+            top_k: 3,
+            column: Some("embedding".into()),
+            probes: Some(16),
+            metric: Some(DistanceMetric::L2),
+            filter: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(result.column, "embedding");
+    assert_eq!(result.requested, 4);
+    assert_eq!(result.sampled, 4);
+    assert_eq!(result.top_k, 3);
+    assert_eq!(result.avg_recall, 1.0);
+    assert_eq!(result.avg_exhaustive_count, 3.0);
+    assert_eq!(result.avg_ann_count, 3.0);
+    for sample in &result.samples {
+        assert_eq!(sample.recall, 1.0);
+        assert_eq!(sample.exhaustive_ids, sample.ann_ids);
+    }
+}
+
+#[tokio::test]
+async fn recall_rechecks_wal_overlay() {
+    let dir = tempfile::tempdir().unwrap();
+    let ns = Namespace::create(store(&dir), "docs").await.unwrap();
+    ns.upsert(doc(1, "alpha", 10, &["v"], [0.1, 0.0]))
+        .await
+        .unwrap();
+    ns.upsert(doc(2, "beta", 20, &["v"], [10.0, 0.0]))
+        .await
+        .unwrap();
+    indexer::flush(&ns).await.unwrap();
+
+    ns.delete(Id::U64(1)).await.unwrap();
+    ns.upsert(doc(3, "gamma", 30, &["v"], [0.05, 0.0]))
+        .await
+        .unwrap();
+
+    let result = ns
+        .recall(RecallRequest {
+            num: 2,
+            top_k: 2,
+            column: Some("embedding".into()),
+            probes: Some(16),
+            metric: Some(DistanceMetric::L2),
+            filter: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(result.sampled, 2);
+    assert_eq!(result.avg_recall, 1.0);
+    for sample in &result.samples {
+        assert_eq!(sample.exhaustive_ids, sample.ann_ids);
+        assert!(!sample.ann_ids.contains(&Id::U64(1)));
+    }
+}
+
+#[tokio::test]
+async fn recall_requires_published_vector_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let ns = Namespace::create(store(&dir), "docs").await.unwrap();
+    ns.upsert(doc(1, "alpha", 10, &["v"], [0.1, 0.0]))
+        .await
+        .unwrap();
+
+    let err = ns
+        .recall(RecallRequest {
+            num: 1,
+            top_k: 1,
+            column: Some("embedding".into()),
+            probes: None,
+            metric: Some(DistanceMetric::L2),
+            filter: None,
+        })
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, Error::InvalidQuery(_)));
 }

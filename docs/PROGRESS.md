@@ -11,11 +11,12 @@ the next unchecked task under "Current milestone" / "Next up".
 
 ## Status snapshot
 
-- **Current stage:** Stage 4 (ANN v0) — **in progress**.
-- **Next up:** Debug recall CLI/API endpoint and then Stage 5 native filtering.
+- **Current stage:** Stage 5 (Native Filtering) — **in progress**.
+- **Next up:** Cluster-level attribute summaries, row-level local-ID bitmaps,
+  and filter-aware ANN traversal.
 - **Done:** Stage 0 (Skeleton), Stage 1 (Durable Documents), Stage 2 (SST/LSM),
-  Stage 3 (Attributes & Exact Search).
-- **Tests:** `cargo test` green (69 tests); `cargo clippy --all-targets` clean.
+  Stage 3 (Attributes & Exact Search), Stage 4 (ANN v0).
+- **Tests:** `cargo test` green (72 tests); `cargo clippy --all-targets` clean.
 - **Note:** post-Stage-2 code-review fixes applied (efficiency + stats +
   dedup + manifest publish safety); remaining findings tracked under
   "Stage 2 — code review follow-ups".
@@ -36,7 +37,7 @@ the next unchecked task under "Current milestone" / "Next up".
 - [x] **Stage 3 — Attributes & exact search.** Schema inference/checking,
       attribute inverted indexes (eq/range), filters, order-by, count/sum,
       exact vector kNN over filtered candidates.
-- [ ] **Stage 4 — ANN v0.** KMeans/IVF per column, immutable vector postings,
+- [x] **Stage 4 — ANN v0.** KMeans/IVF per column, immutable vector postings,
       probe + scan + rerank, recall endpoint.
 - [ ] **Stage 5 — Native filtering.** Cluster-level summaries, row-level
       bitmaps, filter-aware ANN traversal, filtered recall.
@@ -262,7 +263,7 @@ Stage 3 decisions / notes so far:
 
 ---
 
-## Current milestone: Stage 4 — ANN v0
+## Stage 4 — ANN v0 (done)
 
 Goal: build the first approximate vector index while preserving exact rerank and
 strong-read overlay semantics. This stage validates the object-store-native ANN
@@ -282,15 +283,20 @@ Planned tasks:
       exact-score overlay vectors before final top-k merge.
 - [x] Recall checks in tests: full-probe ANN is compared against exact kNN via
       `vector::recall_at`.
-- [ ] Debug recall CLI/API endpoint over sampled vectors.
+- [x] Debug recall CLI/API endpoint over sampled vectors:
+      `Namespace::recall` and `sana recall <dir> <ns> [json-request]` compare
+      ANN against exhaustive exact search, report averages, and include
+      per-sample ids for mismatch debugging.
 
 Known limitations to improve later:
 
 - IVF files are full-snapshot rebuilds, not incremental vector postings.
 - The current index stores full f32 vectors in postings; f16 storage,
   contiguous vector blocks, quantization, and SIMD kernels are later stages.
-- Filtering with ANN currently falls back to exact filtered kNN. Stage 5 should
-  make attribute filters cluster-aware instead of exact-fallback.
+- Filtering with ANN currently falls back to exact filtered kNN, and the recall
+  endpoint rejects filtered recall to avoid reporting a misleading perfect score
+  before native filtering exists. Stage 5 should make attribute filters
+  cluster-aware and then enable filtered recall measurement.
 
 Stage 4 decisions / notes so far:
 
@@ -304,6 +310,36 @@ Stage 4 decisions / notes so far:
 - **D27 — Exact rerank always uses stored full vectors.** The IVF posting scan
   narrows candidates but final scores come from the full vector values in the
   posting object, with unindexed WAL vectors exact-scored and merged.
+- **D28 — Recall endpoint measures the actual ANN path.** `Namespace::recall`
+  requires a published vector index, samples vectors from the strong snapshot
+  deterministically for reproducible tests, and runs exact-vs-ANN queries
+  through the public `Query` executor so overlay behavior is measured too.
+
+---
+
+## Current milestone: Stage 5 — Native Filtering
+
+Goal: make attribute filtering cooperate with vector clustering instead of
+falling back to exact pre-filtered kNN or post-filtering ANN results.
+
+Planned tasks:
+
+- [ ] Persist vector addresses: `{cluster_id, local_id, row_id}` for each
+      indexed vector entry so attribute indexes can point into vector postings.
+- [ ] Add cluster-level attribute summaries for equality/range-friendly
+      filters, first as full-snapshot metadata tied to the current IVF index.
+- [ ] Add row-level local-ID bitmaps per attribute value and cluster.
+- [ ] Compile filters into cluster masks and posting-local row masks.
+- [ ] Make ANN traversal use cluster masks before probing/scanning postings.
+- [ ] Enable filtered recall in `Namespace::recall` and add tests that catch
+      pre-filter/post-filter recall failures.
+
+Known limitations to improve later:
+
+- Stage 5 should start with full-snapshot summaries keyed to the current IVF
+  generation; incremental maintenance belongs with Stage 6 SPFresh updates.
+- Bitmap compression can start simple. Roaring/bitpacking and block-level range
+  summaries can follow once the semantics are correct.
 
 ---
 
@@ -353,7 +389,7 @@ Decisions I (the implementer) made; the user delegated architectural calls.
 ```
 src/
   lib.rs                 module exports
-  main.rs                CLI (create/upsert/get/delete/list/query/flush/compact/demo)
+  main.rs                CLI (create/upsert/get/delete/list/query/recall/flush/compact/demo)
   error.rs               shared Error / Result
   value.rs               Id, Value, VectorValue, Document
   schema.rs              ScalarType, ColumnType, Schema, ...
@@ -365,7 +401,7 @@ src/
   sst.rs                 generic sorted-string-table writer/reader
   doc.rs                 Id key encoding (order-preserving) + DocRecord
   attr.rs                attribute postings SST encoding/query helpers
-  query.rs               logical query types + exact/ANN execution
+  query.rs               logical query types + exact/ANN execution + recall
   vector.rs              IVF vector index, distance scoring, recall helper
   namespace.rs           Namespace: create/append + SST-aware replay/lookup
   indexer.rs             flush/compaction + attr/vector index publication
@@ -379,6 +415,6 @@ tests/
   namespace.rs           namespace lifecycle + durability across reopen
   indexer.rs             flush/compaction + SST+overlay merge semantics
   schema.rs              write-time schema inference/validation
-  query.rs               filters, ordering, aggregation, exact kNN, ANN v0
+  query.rs               filters, ordering, aggregation, exact kNN, ANN v0, recall
   fixtures/              committed golden snapshots
 ```
