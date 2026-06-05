@@ -91,6 +91,60 @@ pub struct VectorHit {
     pub score: f32,
 }
 
+pub trait DistanceKernel {
+    fn l2_f32_batch(query: &[f32], candidates: &[&[f32]], out: &mut [f32]) -> Result<()>;
+    fn dot_f32_batch(query: &[f32], candidates: &[&[f32]], out: &mut [f32]) -> Result<()>;
+    fn cosine_f32_batch(query: &[f32], candidates: &[&[f32]], out: &mut [f32]) -> Result<()>;
+}
+
+pub struct ScalarDistanceKernel;
+
+impl DistanceKernel for ScalarDistanceKernel {
+    fn l2_f32_batch(query: &[f32], candidates: &[&[f32]], out: &mut [f32]) -> Result<()> {
+        validate_batch(query, candidates, out)?;
+        for (candidate, score) in candidates.iter().zip(out) {
+            *score = -query
+                .iter()
+                .zip(*candidate)
+                .map(|(a, b)| {
+                    let d = a - b;
+                    d * d
+                })
+                .sum::<f32>();
+        }
+        Ok(())
+    }
+
+    fn dot_f32_batch(query: &[f32], candidates: &[&[f32]], out: &mut [f32]) -> Result<()> {
+        validate_batch(query, candidates, out)?;
+        for (candidate, score) in candidates.iter().zip(out) {
+            *score = query.iter().zip(*candidate).map(|(a, b)| a * b).sum();
+        }
+        Ok(())
+    }
+
+    fn cosine_f32_batch(query: &[f32], candidates: &[&[f32]], out: &mut [f32]) -> Result<()> {
+        validate_batch(query, candidates, out)?;
+        let q_norm = squared_norm(query).sqrt();
+        if q_norm == 0.0 {
+            return Err(Error::InvalidQuery(
+                "cosine query and candidate vectors must be non-zero".into(),
+            ));
+        }
+        for (candidate, score) in candidates.iter().zip(out) {
+            let c_norm = squared_norm(candidate).sqrt();
+            if c_norm == 0.0 {
+                return Err(Error::InvalidQuery(
+                    "cosine query and candidate vectors must be non-zero".into(),
+                ));
+            }
+            let dot: f32 = query.iter().zip(*candidate).map(|(a, b)| a * b).sum();
+            *score = dot / (q_norm * c_norm);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VectorReassignment {
     pub id: Id,
@@ -429,13 +483,23 @@ impl VectorIndex {
             .unwrap_or_else(|| self.centroids.len().min(4))
             .clamp(1, self.centroids.len());
 
-        let mut centroid_scores = self
+        let centroids = self
             .centroids
             .iter()
             .enumerate()
             .filter(|(idx, _)| filter.is_none_or(|mask| mask.cluster_has_any(*idx)))
-            .map(|(idx, centroid)| Ok((idx, score(query, centroid, metric)?)))
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Vec<_>>();
+        let centroid_vectors = centroids
+            .iter()
+            .map(|(_, centroid)| centroid.as_slice())
+            .collect::<Vec<_>>();
+        let mut scores = vec![0.0f32; centroid_vectors.len()];
+        score_batch(query, &centroid_vectors, metric, &mut scores)?;
+        let mut centroid_scores = centroids
+            .into_iter()
+            .zip(scores)
+            .map(|((idx, _), score)| (idx, score))
+            .collect::<Vec<_>>();
         centroid_scores.sort_by(|a, b| compare_scores(a.1, b.1).then_with(|| a.0.cmp(&b.0)));
 
         let mut hits = Vec::new();
@@ -443,14 +507,27 @@ impl VectorIndex {
             let Some(posting) = self.postings.get(centroid_id) else {
                 return Err(Error::Corrupt("vector posting id out of bounds".into()));
             };
-            for entry in &posting.vectors {
-                if filter.is_some_and(|mask| !mask.allows(centroid_id, entry.local_id as usize)) {
-                    continue;
-                }
+            let entries = posting
+                .vectors
+                .iter()
+                .filter(|entry| {
+                    filter.is_none_or(|mask| mask.allows(centroid_id, entry.local_id as usize))
+                })
+                .collect::<Vec<_>>();
+            if entries.is_empty() {
+                continue;
+            }
+            let vectors = entries
+                .iter()
+                .map(|entry| entry.vector.as_slice())
+                .collect::<Vec<_>>();
+            let mut scores = vec![0.0f32; vectors.len()];
+            score_batch(query, &vectors, metric, &mut scores)?;
+            for (entry, score) in entries.into_iter().zip(scores) {
                 hits.push(VectorHit {
                     id: entry.id.clone(),
                     version: entry.version,
-                    score: score(query, &entry.vector, metric)?,
+                    score,
                 });
             }
         }
@@ -1183,29 +1260,57 @@ pub fn vector_to_f32(vector: &VectorValue) -> Vec<f32> {
     }
 }
 
-pub fn score(query: &[f32], candidate: &[f32], metric: DistanceMetric) -> Result<f32> {
+pub fn score_batch(
+    query: &[f32],
+    candidates: &[&[f32]],
+    metric: DistanceMetric,
+    out: &mut [f32],
+) -> Result<()> {
     match metric {
-        DistanceMetric::L2 => Ok(-query
-            .iter()
-            .zip(candidate)
-            .map(|(a, b)| {
-                let d = a - b;
-                d * d
-            })
-            .sum::<f32>()),
-        DistanceMetric::Dot => Ok(query.iter().zip(candidate).map(|(a, b)| a * b).sum()),
-        DistanceMetric::Cosine => {
-            let dot: f32 = query.iter().zip(candidate).map(|(a, b)| a * b).sum();
-            let q_norm: f32 = query.iter().map(|v| v * v).sum::<f32>().sqrt();
-            let c_norm: f32 = candidate.iter().map(|v| v * v).sum::<f32>().sqrt();
-            if q_norm == 0.0 || c_norm == 0.0 {
-                return Err(Error::InvalidQuery(
-                    "cosine query and candidate vectors must be non-zero".into(),
-                ));
-            }
-            Ok(dot / (q_norm * c_norm))
-        }
+        DistanceMetric::L2 => ScalarDistanceKernel::l2_f32_batch(query, candidates, out),
+        DistanceMetric::Dot => ScalarDistanceKernel::dot_f32_batch(query, candidates, out),
+        DistanceMetric::Cosine => ScalarDistanceKernel::cosine_f32_batch(query, candidates, out),
     }
+}
+
+pub fn score(query: &[f32], candidate: &[f32], metric: DistanceMetric) -> Result<f32> {
+    let candidates = [candidate];
+    let mut out = [0.0f32];
+    score_batch(query, &candidates, metric, &mut out)?;
+    Ok(out[0])
+}
+
+fn validate_batch(query: &[f32], candidates: &[&[f32]], out: &[f32]) -> Result<()> {
+    if candidates.len() != out.len() {
+        return Err(Error::InvalidQuery(format!(
+            "score output has len {}, expected {}",
+            out.len(),
+            candidates.len()
+        )));
+    }
+    if candidates
+        .iter()
+        .any(|candidate| candidate.len() != query.len())
+    {
+        return Err(Error::InvalidQuery(
+            "query and candidate vectors must have matching dimensions".into(),
+        ));
+    }
+    if query.iter().any(|v| !v.is_finite())
+        || candidates
+            .iter()
+            .flat_map(|candidate| candidate.iter())
+            .any(|v| !v.is_finite())
+    {
+        return Err(Error::InvalidQuery(
+            "query and candidate vectors must contain only finite values".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn squared_norm(vector: &[f32]) -> f32 {
+    vector.iter().map(|v| v * v).sum()
 }
 
 pub fn sort_hits(hits: &mut [VectorHit]) {

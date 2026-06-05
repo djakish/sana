@@ -11,12 +11,12 @@ the next unchecked task under "Current milestone" / "Next up".
 
 ## Status snapshot
 
-- **Current stage:** Stage 8 (RaBitQ & kernels) — **not started**.
-- **Next up:** RaBitQ per-cluster quantized codes and portable batch kernels.
+- **Current stage:** Stage 8 (RaBitQ & kernels) — **in progress**.
+- **Next up:** RaBitQ per-cluster quantized codes.
 - **Done:** Stage 0 (Skeleton), Stage 1 (Durable Documents), Stage 2 (SST/LSM),
   Stage 3 (Attributes & Exact Search), Stage 4 (ANN v0), Stage 5 (Native
   Filtering), Stage 6 (SPFresh local rebuild), Stage 7 (Full-text search).
-- **Tests:** `cargo test` green (105 tests); `cargo clippy --all-targets` clean.
+- **Tests:** `cargo test` green (107 tests); `cargo clippy --all-targets` clean.
 - **Note:** post-Stage-2 and Stage-3–5 code-review fixes applied; remaining
   findings tracked under "Stage 2 — code review follow-ups" and "Stages 3–5 —
   code review follow-ups". Recently fixed limitations: Stage 2 ranged
@@ -26,7 +26,8 @@ the next unchecked task under "Current milestone" / "Next up".
   read path fetches append deltas concurrently; Stage 7 now has tokenizer,
   block-shaped full-snapshot text postings, BM25 query support, rank-safe
   batched block MAXSCORE top-k, and consistent-snapshot multi-query for hybrid
-  retrieval.
+  retrieval. Stage 8 has started with portable scalar batch distance kernels
+  wired into exact and ANN vector scoring.
 - **Last updated:** 2026-06-06.
 
 ---
@@ -631,6 +632,32 @@ Stage 7 decisions / notes:
   threshold with a small ordered top-k tracker instead of sorting all accumulated
   document scores after every block. This keeps the block-skip rule rank-safe
   while matching the FTS v2 guidance to favor sequential per-list work.
+
+---
+
+## Current milestone: Stage 8 — RaBitQ & Kernels
+
+Goal: add a compressed vector distance-estimation layer and isolate CPU kernels
+behind a portable reference implementation before adding SIMD-specialized
+paths.
+
+Planned tasks:
+
+- [x] Add portable scalar batch distance kernels for L2, dot, and cosine.
+- [ ] Add per-cluster RaBitQ code generation.
+- [ ] Add quantized query path and error-bound rerank selection.
+- [ ] Add portable bitwise RaBitQ estimator, then SIMD kernels with feature
+      detection.
+- [ ] Benchmark cache/memory/CPU bottlenecks.
+
+Stage 8 decisions / notes:
+
+- **D44 — Kernel boundary starts with the existing vector layout.**
+  `DistanceKernel` and `ScalarDistanceKernel` batch over slices of `f32`
+  candidates, so the current `Vec<f32>`-per-entry index remains unchanged while
+  exact query scoring and ANN centroid/posting scans share one batch scoring
+  API. RaBitQ can add code-oriented kernels behind this boundary without
+  changing query semantics.
 
 ---
 

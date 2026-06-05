@@ -15,6 +15,37 @@ fn doc_with_vector(id: u64, vector: [f32; 2]) -> Document {
 }
 
 #[test]
+fn score_batch_matches_scalar_scores_for_all_metrics() {
+    let query = [1.0, 2.0];
+    let first = [1.0, 2.0];
+    let second = [3.0, 4.0];
+    let candidates = [&first[..], &second[..]];
+
+    let mut l2 = [0.0; 2];
+    sana::vector::score_batch(&query, &candidates, DistanceMetric::L2, &mut l2).unwrap();
+    assert_eq!(l2, [0.0, -8.0]);
+
+    let mut dot = [0.0; 2];
+    sana::vector::score_batch(&query, &candidates, DistanceMetric::Dot, &mut dot).unwrap();
+    assert_eq!(dot, [5.0, 11.0]);
+
+    let mut cosine = [0.0; 2];
+    sana::vector::score_batch(&query, &candidates, DistanceMetric::Cosine, &mut cosine).unwrap();
+    assert!((cosine[0] - 1.0).abs() < 1e-6);
+    assert!((cosine[1] - 0.983_869_9).abs() < 1e-6);
+}
+
+#[test]
+fn score_batch_rejects_dimension_mismatch() {
+    let query = [1.0, 2.0];
+    let bad = [1.0];
+    let candidates = [&bad[..]];
+    let mut out = [0.0];
+
+    assert!(sana::vector::score_batch(&query, &candidates, DistanceMetric::L2, &mut out).is_err());
+}
+
+#[test]
 fn maintenance_plan_merges_underfull_posting() {
     let docs = [
         doc_with_vector(1, [0.0, 0.0]),

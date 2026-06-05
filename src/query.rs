@@ -1322,7 +1322,8 @@ fn score_vectors(
     metric: DistanceMetric,
     dim: usize,
 ) -> Result<()> {
-    for row in rows {
+    let mut candidates = Vec::new();
+    for (idx, row) in rows.iter().enumerate() {
         let Some(vector) = row.document.vectors.get(&vector_query.column) else {
             continue;
         };
@@ -1335,7 +1336,16 @@ fn score_vectors(
                 values.len()
             )));
         }
-        row.score = Some(vector::score(&vector_query.vector, &values, metric)?);
+        candidates.push((idx, values));
+    }
+    let vectors = candidates
+        .iter()
+        .map(|(_, values)| values.as_slice())
+        .collect::<Vec<_>>();
+    let mut scores = vec![0.0f32; vectors.len()];
+    vector::score_batch(&vector_query.vector, &vectors, metric, &mut scores)?;
+    for ((idx, _), score) in candidates.into_iter().zip(scores) {
+        rows[idx].score = Some(score);
     }
     Ok(())
 }
