@@ -9,14 +9,17 @@
 //! [ footer (fixed 32 bytes) ]      # index handle, format version, magic, crc
 //! ```
 //!
-//! Stage 2 loads the whole object and parses in memory (one large round trip,
-//! which the architecture prefers over many small ones). The format already
-//! supports ranged reads — footer, then index, then only the needed block — as
-//! a future optimization without changing on-disk bytes.
+//! Scans and the batch resolve path load the whole object and parse in memory
+//! (one large round trip, which the architecture prefers over many small ones).
+//! Single-key point lookups instead use [`ranged_get`], which reads only the
+//! footer, the index, and the one candidate block — never the data region. Both
+//! paths share the same footer/index/block decoders, so the format is described
+//! once.
 
 use bytes::Bytes;
 
 use crate::error::{Error, Result};
+use crate::object_store::ObjectStore;
 
 const MAGIC: &[u8; 8] = b"SANASST1";
 const FORMAT_VERSION: u32 = 1;
@@ -224,59 +227,15 @@ impl SstReader {
         if n < FOOTER_LEN {
             return Err(Error::Corrupt("sst shorter than footer".into()));
         }
-        let footer = &data[n - FOOTER_LEN..];
-        if &footer[24..32] != MAGIC {
-            return Err(Error::Corrupt("bad sst magic".into()));
-        }
-        let version = u32::from_le_bytes(
-            footer[20..24]
-                .try_into()
-                .expect("slice is a fixed-size window"),
-        );
-        if version != FORMAT_VERSION {
-            return Err(Error::Corrupt(format!("unsupported sst version {version}")));
-        }
-        let index_offset = u64::from_le_bytes(
-            footer[0..8]
-                .try_into()
-                .expect("slice is a fixed-size window"),
-        ) as usize;
-        let index_size = u64::from_le_bytes(
-            footer[8..16]
-                .try_into()
-                .expect("slice is a fixed-size window"),
-        ) as usize;
-        let index_crc = u32::from_le_bytes(
-            footer[16..20]
-                .try_into()
-                .expect("slice is a fixed-size window"),
-        );
-
+        let footer = parse_footer(&data[n - FOOTER_LEN..])?;
+        let start = footer.index_offset as usize;
+        let end = start
+            .checked_add(footer.index_size as usize)
+            .ok_or_else(|| Error::Corrupt("sst index region overflow".into()))?;
         let idx = data
-            .get(index_offset..index_offset + index_size)
+            .get(start..end)
             .ok_or_else(|| Error::Corrupt("sst index region out of bounds".into()))?;
-        if crc32fast::hash(idx) != index_crc {
-            return Err(Error::Corrupt("sst index crc mismatch".into()));
-        }
-
-        let mut pos = 0usize;
-        let count = read_u32(idx, &mut pos)? as usize;
-        let mut index = Vec::with_capacity(count);
-        for _ in 0..count {
-            let klen = read_u32(idx, &mut pos)? as usize;
-            let key = idx
-                .get(pos..pos + klen)
-                .ok_or_else(|| Error::Corrupt("sst index key out of bounds".into()))?
-                .to_vec();
-            pos += klen;
-            let offset = read_u64(idx, &mut pos)?;
-            let size = read_u64(idx, &mut pos)?;
-            index.push(IndexEntry {
-                last_key: key,
-                offset,
-                size,
-            });
-        }
+        let index = parse_index(idx, footer.index_crc)?;
         Ok(Self { data, index })
     }
 
@@ -310,58 +269,200 @@ impl SstReader {
     fn decode_block(&self, bi: usize) -> Result<Vec<(Vec<u8>, Bytes)>> {
         let entry = &self.index[bi];
         let start = entry.offset as usize;
-        let size = entry.size as usize;
-        let content = self
-            .data
-            .get(start..start + size)
-            .ok_or_else(|| Error::Corrupt("sst block out of bounds".into()))?;
-        let crc_bytes = self
-            .data
-            .get(start + size..start + size + 4)
-            .ok_or_else(|| Error::Corrupt("sst block crc out of bounds".into()))?;
-        let crc = u32::from_le_bytes(crc_bytes.try_into().expect("slice is a fixed-size window"));
-        if crc32fast::hash(content) != crc {
-            return Err(Error::Corrupt("sst block crc mismatch".into()));
+        let end = start
+            .checked_add(entry.size as usize)
+            .and_then(|e| e.checked_add(4))
+            .ok_or_else(|| Error::Corrupt("sst block region overflow".into()))?;
+        if end > self.data.len() {
+            return Err(Error::Corrupt("sst block out of bounds".into()));
         }
+        let content = verify_block(&self.data.slice(start..end))?;
+        decode_block_entries(&content)
+    }
+}
 
-        if content.len() < 4 {
-            return Err(Error::Corrupt("sst block too small".into()));
-        }
-        let num_restarts = u32::from_le_bytes(
-            content[content.len() - 4..]
+struct Footer {
+    index_offset: u64,
+    index_size: u64,
+    index_crc: u32,
+}
+
+/// Parse the fixed 32-byte footer: validate magic and format version, return the
+/// index region handle. The footer is the only fixed-position structure, so a
+/// ranged reader can locate everything else from it.
+fn parse_footer(footer: &[u8]) -> Result<Footer> {
+    if footer.len() != FOOTER_LEN {
+        return Err(Error::Corrupt("sst footer wrong length".into()));
+    }
+    if &footer[24..32] != MAGIC {
+        return Err(Error::Corrupt("bad sst magic".into()));
+    }
+    let version = u32::from_le_bytes(
+        footer[20..24]
+            .try_into()
+            .expect("slice is a fixed-size window"),
+    );
+    if version != FORMAT_VERSION {
+        return Err(Error::Corrupt(format!("unsupported sst version {version}")));
+    }
+    Ok(Footer {
+        index_offset: u64::from_le_bytes(
+            footer[0..8]
                 .try_into()
                 .expect("slice is a fixed-size window"),
-        ) as usize;
-        let entries_end = content
-            .len()
-            .checked_sub(4 + num_restarts * 4)
-            .ok_or_else(|| Error::Corrupt("sst block restart array out of bounds".into()))?;
+        ),
+        index_size: u64::from_le_bytes(
+            footer[8..16]
+                .try_into()
+                .expect("slice is a fixed-size window"),
+        ),
+        index_crc: u32::from_le_bytes(
+            footer[16..20]
+                .try_into()
+                .expect("slice is a fixed-size window"),
+        ),
+    })
+}
 
-        let mut out = Vec::new();
-        let mut last_key: Vec<u8> = Vec::new();
-        let mut pos = 0usize;
-        while pos < entries_end {
-            let shared = get_uvarint(content, &mut pos)? as usize;
-            let non_shared = get_uvarint(content, &mut pos)? as usize;
-            let value_len = get_uvarint(content, &mut pos)? as usize;
-            if shared > last_key.len() || pos + non_shared > entries_end {
-                return Err(Error::Corrupt("sst entry key out of bounds".into()));
-            }
-            let mut key = Vec::with_capacity(shared + non_shared);
-            key.extend_from_slice(&last_key[..shared]);
-            key.extend_from_slice(&content[pos..pos + non_shared]);
-            pos += non_shared;
-            let value_start = start + pos;
-            if pos + value_len > entries_end {
-                return Err(Error::Corrupt("sst entry value out of bounds".into()));
-            }
-            pos += value_len;
-            let value = self.data.slice(value_start..value_start + value_len);
-            last_key = key.clone();
-            out.push((key, value));
-        }
-        Ok(out)
+/// Verify the index region's CRC and decode it into per-block handles.
+fn parse_index(idx: &[u8], index_crc: u32) -> Result<Vec<IndexEntry>> {
+    if crc32fast::hash(idx) != index_crc {
+        return Err(Error::Corrupt("sst index crc mismatch".into()));
     }
+    let mut pos = 0usize;
+    let count = read_u32(idx, &mut pos)? as usize;
+    let mut index = Vec::with_capacity(count);
+    for _ in 0..count {
+        let klen = read_u32(idx, &mut pos)? as usize;
+        let key = idx
+            .get(pos..pos + klen)
+            .ok_or_else(|| Error::Corrupt("sst index key out of bounds".into()))?
+            .to_vec();
+        pos += klen;
+        let offset = read_u64(idx, &mut pos)?;
+        let size = read_u64(idx, &mut pos)?;
+        index.push(IndexEntry {
+            last_key: key,
+            offset,
+            size,
+        });
+    }
+    Ok(index)
+}
+
+/// Split a `content || crc32` block, verify the CRC, and return the content as a
+/// zero-copy sub-slice. Shared by the whole-object reader and [`ranged_get`].
+fn verify_block(block_with_crc: &Bytes) -> Result<Bytes> {
+    let content_len = block_with_crc
+        .len()
+        .checked_sub(4)
+        .ok_or_else(|| Error::Corrupt("sst block crc out of bounds".into()))?;
+    let crc = u32::from_le_bytes(
+        block_with_crc[content_len..]
+            .try_into()
+            .expect("slice is a fixed-size window"),
+    );
+    let content = block_with_crc.slice(0..content_len);
+    if crc32fast::hash(&content) != crc {
+        return Err(Error::Corrupt("sst block crc mismatch".into()));
+    }
+    Ok(content)
+}
+
+/// Decode every (key, value) pair from a verified block's content. Values are
+/// zero-copy slices into `content`.
+fn decode_block_entries(content: &Bytes) -> Result<Vec<(Vec<u8>, Bytes)>> {
+    if content.len() < 4 {
+        return Err(Error::Corrupt("sst block too small".into()));
+    }
+    let num_restarts = u32::from_le_bytes(
+        content[content.len() - 4..]
+            .try_into()
+            .expect("slice is a fixed-size window"),
+    ) as usize;
+    let entries_end = content
+        .len()
+        .checked_sub(4 + num_restarts * 4)
+        .ok_or_else(|| Error::Corrupt("sst block restart array out of bounds".into()))?;
+
+    let mut out = Vec::new();
+    let mut last_key: Vec<u8> = Vec::new();
+    let mut pos = 0usize;
+    while pos < entries_end {
+        let shared = get_uvarint(content, &mut pos)? as usize;
+        let non_shared = get_uvarint(content, &mut pos)? as usize;
+        let value_len = get_uvarint(content, &mut pos)? as usize;
+        if shared > last_key.len() || pos + non_shared > entries_end {
+            return Err(Error::Corrupt("sst entry key out of bounds".into()));
+        }
+        let mut key = Vec::with_capacity(shared + non_shared);
+        key.extend_from_slice(&last_key[..shared]);
+        key.extend_from_slice(&content[pos..pos + non_shared]);
+        pos += non_shared;
+        let value_start = pos;
+        if pos + value_len > entries_end {
+            return Err(Error::Corrupt("sst entry value out of bounds".into()));
+        }
+        pos += value_len;
+        let value = content.slice(value_start..value_start + value_len);
+        last_key = key.clone();
+        out.push((key, value));
+    }
+    Ok(out)
+}
+
+/// Point lookup that reads only the bytes it needs from the object store: the
+/// 32-byte footer, the index region, then the one candidate block — never the
+/// (potentially large) data region. `size` is the object length, which the
+/// manifest records as `SstMeta::size_bytes`, so no extra `head` is needed.
+///
+/// This is the ranged read the format was designed for (architecture D16): three
+/// small round trips instead of one whole-object GET. On object storage that
+/// trades a couple of tiny requests for not transferring megabytes of data
+/// blocks. The whole-object [`SstReader`] still backs scans and the batch
+/// resolve path, where the full object is read anyway.
+pub async fn ranged_get(
+    store: &dyn ObjectStore,
+    key: &str,
+    size: u64,
+    lookup_key: &[u8],
+) -> Result<Option<Bytes>> {
+    let footer_len = FOOTER_LEN as u64;
+    if size < footer_len {
+        return Err(Error::Corrupt("sst shorter than footer".into()));
+    }
+
+    let footer = store.get_range(key, size - footer_len..size).await?;
+    let footer = parse_footer(&footer)?;
+
+    let index_end = footer
+        .index_offset
+        .checked_add(footer.index_size)
+        .ok_or_else(|| Error::Corrupt("sst index region overflow".into()))?;
+    let idx = store.get_range(key, footer.index_offset..index_end).await?;
+    let index = parse_index(&idx, footer.index_crc)?;
+
+    let bi = index.partition_point(|e| e.last_key.as_slice() < lookup_key);
+    let Some(entry) = index.get(bi) else {
+        return Ok(None);
+    };
+    let block_end = entry
+        .offset
+        .checked_add(entry.size)
+        .and_then(|e| e.checked_add(4))
+        .ok_or_else(|| Error::Corrupt("sst block region overflow".into()))?;
+    let block = store.get_range(key, entry.offset..block_end).await?;
+    let content = verify_block(&block)?;
+
+    for (k, v) in decode_block_entries(&content)? {
+        if k.as_slice() == lookup_key {
+            return Ok(Some(v));
+        }
+        if k.as_slice() > lookup_key {
+            break;
+        }
+    }
+    Ok(None)
 }
 
 fn read_u32(buf: &[u8], pos: &mut usize) -> Result<u32> {

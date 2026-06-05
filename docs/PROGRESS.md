@@ -16,11 +16,12 @@ the next unchecked task under "Current milestone" / "Next up".
 - **Done:** Stage 0 (Skeleton), Stage 1 (Durable Documents), Stage 2 (SST/LSM),
   Stage 3 (Attributes & Exact Search), Stage 4 (ANN v0), Stage 5 (Native
   Filtering), Stage 6 (SPFresh local rebuild).
-- **Tests:** `cargo test` green (87 tests); `cargo clippy --all-targets` clean.
+- **Tests:** `cargo test` green (89 tests); `cargo clippy --all-targets` clean.
 - **Note:** post-Stage-2 and Stage-3–5 code-review fixes applied; remaining
   findings tracked under "Stage 2 — code review follow-ups" and "Stages 3–5 —
-  code review follow-ups".
-- **Last updated:** 2026-06-05.
+  code review follow-ups". Stage 2's ranged point-lookup limitation is now fixed
+  (`sst::ranged_get`).
+- **Last updated:** 2026-06-06.
 
 ---
 
@@ -185,8 +186,13 @@ single-process, epoch-0, trusted-storage assumptions, but they are real):**
       and `flush`'s `from_seq >= commit.seq` compares only `seq`; both break if
       the WAL epoch ever rotates. Make the overlay range epoch-aware when epoch
       rotation is implemented.
-- [ ] **Point lookups load whole SSTs.** Implement the ranged read (footer →
-      index → one block) the SST format already supports (D16).
+- [x] **Point lookups load whole SSTs.** *Done.* `sst::ranged_get` reads only
+      the footer, the index, and the one candidate block (using the manifest's
+      `size_bytes` to find the footer — no extra `head`), so `Namespace::lookup`
+      no longer transfers whole objects. The whole-object `SstReader` still backs
+      scans and the batch `resolve_ids` path. Whole-object and ranged paths now
+      share one set of footer/index/block decoders. A counting-store test asserts
+      a point lookup makes ≤3 requests and reads under a quarter of the object.
 - [ ] **SST footer not checksummed.** Unlike blocks/index, footer fields aren't
       CRC'd, so accidental corruption can overflow/panic instead of erroring;
       add a footer checksum and use checked arithmetic on parsed offsets.

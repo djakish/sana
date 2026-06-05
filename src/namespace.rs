@@ -228,6 +228,14 @@ impl Namespace {
 
     /// Resolve the newest SST record for an id (point lookup, newest-first),
     /// skipping files whose `[min_id, max_id]` cannot contain it.
+    ///
+    /// Each probed SST is read with [`sst::ranged_get`], which fetches only the
+    /// footer, index, and one block (using the manifest's `size_bytes`), rather
+    /// than loading the whole object. The batch path ([`resolve_ids`]) keeps the
+    /// whole-object load because it point-gets many ids against each file.
+    ///
+    /// [`sst::ranged_get`]: crate::sst::ranged_get
+    /// [`resolve_ids`]: Self::resolve_ids
     pub(crate) async fn sst_point_get(
         &self,
         manifest: &NamespaceManifest,
@@ -240,7 +248,10 @@ impl Namespace {
             {
                 continue;
             }
-            if let Some(value) = self.load_sst(&meta.key).await?.get(&key)? {
+            if let Some(value) =
+                crate::sst::ranged_get(self.store.as_ref(), &meta.key, meta.size_bytes, &key)
+                    .await?
+            {
                 return Ok(Some(DocRecord::decode(&value)?));
             }
         }
