@@ -16,7 +16,7 @@ the next unchecked task under "Current milestone" / "Next up".
 - **Done:** Stage 0 (Skeleton), Stage 1 (Durable Documents), Stage 2 (SST/LSM),
   Stage 3 (Attributes & Exact Search), Stage 4 (ANN v0), Stage 5 (Native
   Filtering), Stage 6 (SPFresh local rebuild).
-- **Tests:** `cargo test` green (89 tests); `cargo clippy --all-targets` clean.
+- **Tests:** `cargo test` green (90 tests); `cargo clippy --all-targets` clean.
 - **Note:** post-Stage-2 and Stage-3–5 code-review fixes applied; remaining
   findings tracked under "Stage 2 — code review follow-ups" and "Stages 3–5 —
   code review follow-ups". Stage 2's ranged point-lookup limitation is now fixed
@@ -198,8 +198,10 @@ single-process, epoch-0, trusted-storage assumptions, but they are real):**
       add a footer checksum and use checked arithmetic on parsed offsets.
 - [ ] **`u32` size/offset fields** (restart offsets, index key length) silently
       truncate for >4 GiB blocks/keys — widen or bound.
-- [ ] **Test gap.** No test directly exercises the point-lookup `min_id/max_id`
-      prune path.
+- [x] **Test gap.** *Done.* `point_lookup_prunes_ssts_by_id_range`
+      (`tests/namespace.rs`) builds two un-compacted doc SSTs with disjoint id
+      ranges and asserts, via a key-recording store, that a lookup issues zero
+      reads against the SST its `[min_id, max_id]` excludes.
 
 ---
 
