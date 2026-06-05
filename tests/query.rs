@@ -8,8 +8,8 @@ use sana::error::Error;
 use sana::namespace::Namespace;
 use sana::object_store::{FsObjectStore, GetResult, ObjectMeta, ObjectStore, ObjectVersion};
 use sana::query::{
-    Aggregate, AggregateResult, ApproxVectorQuery, ExactVectorQuery, FilterExpr, OrderBy,
-    OrderTarget, Query, RangeBound, RecallRequest, SortDirection, TextQuery,
+    Aggregate, AggregateResult, ApproxVectorQuery, ExactVectorQuery, FilterExpr, MultiQuery,
+    OrderBy, OrderTarget, Query, RangeBound, RecallRequest, SortDirection, TextQuery,
 };
 use sana::schema::DistanceMetric;
 use sana::sst::SstReader;
@@ -468,6 +468,92 @@ async fn bm25_text_query_filters_and_falls_back_to_wal_overlay() {
     assert_eq!(result.aggregates, vec![AggregateResult::Count(1)]);
     let ids: Vec<Id> = result.rows.into_iter().map(|row| row.id).collect();
     assert_eq!(ids, vec![Id::U64(2)]);
+}
+
+#[tokio::test]
+async fn multi_query_batches_text_and_vector_results() {
+    let dir = tempfile::tempdir().unwrap();
+    let ns = Namespace::create(store(&dir), "docs").await.unwrap();
+    ns.upsert(doc(
+        1,
+        "rust database internals",
+        10,
+        &["public"],
+        [0.05, 0.0],
+    ))
+    .await
+    .unwrap();
+    ns.upsert(doc(2, "python database", 20, &["public"], [5.0, 0.0]))
+        .await
+        .unwrap();
+    ns.upsert(doc(3, "rust search engine", 30, &["public"], [0.2, 0.0]))
+        .await
+        .unwrap();
+    ns.upsert(doc(4, "cold storage", 40, &["public"], [10.0, 0.0]))
+        .await
+        .unwrap();
+    indexer::flush(&ns).await.unwrap();
+
+    let result = ns
+        .multi_query(MultiQuery {
+            queries: vec![
+                Query {
+                    filter: None,
+                    order_by: None,
+                    limit: None,
+                    aggregates: Vec::new(),
+                    exact_vector: None,
+                    approx_vector: None,
+                    text: Some(TextQuery {
+                        column: "title".into(),
+                        query: "rust database".into(),
+                        k: 3,
+                        params: Bm25Params::default(),
+                    }),
+                },
+                Query {
+                    filter: None,
+                    order_by: None,
+                    limit: None,
+                    aggregates: Vec::new(),
+                    exact_vector: None,
+                    approx_vector: Some(ApproxVectorQuery {
+                        column: "embedding".into(),
+                        vector: vec![0.0, 0.0],
+                        k: 2,
+                        probes: Some(16),
+                        metric: Some(DistanceMetric::L2),
+                    }),
+                    text: None,
+                },
+            ],
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(result.results.len(), 2);
+    assert_eq!(result.results[0].rows[0].id, Id::U64(1));
+    let vector_ids: Vec<Id> = result.results[1]
+        .rows
+        .iter()
+        .map(|row| row.id.clone())
+        .collect();
+    assert_eq!(vector_ids, vec![Id::U64(1), Id::U64(3)]);
+}
+
+#[tokio::test]
+async fn multi_query_rejects_empty_batches() {
+    let dir = tempfile::tempdir().unwrap();
+    let ns = Namespace::create(store(&dir), "docs").await.unwrap();
+
+    let err = ns
+        .multi_query(MultiQuery {
+            queries: Vec::new(),
+        })
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, Error::InvalidQuery(_)));
 }
 
 #[tokio::test]

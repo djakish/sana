@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use sana::namespace::Namespace;
 use sana::object_store::{FsObjectStore, ObjectStore};
-use sana::query::{Query, RecallRequest};
+use sana::query::{MultiQuery, Query, RecallRequest};
 use sana::value::{Document, Id, Value};
 
 type CliResult = Result<(), Box<dyn std::error::Error>>;
@@ -23,6 +23,7 @@ async fn main() -> CliResult {
         Some("delete") => delete(&args).await,
         Some("list") => list(&args).await,
         Some("query") => query(&args).await,
+        Some("multi-query") => multi_query(&args).await,
         Some("recall") => recall(&args).await,
         Some("flush") => flush(&args).await,
         Some("compact") => compact(&args).await,
@@ -48,6 +49,7 @@ fn usage() {
     eprintln!("  sana delete <dir> <ns> <id>");
     eprintln!("  sana list    <dir> <ns>");
     eprintln!("  sana query   <dir> <ns> [json-query]");
+    eprintln!("  sana multi-query <dir> <ns> <json-multi-query>");
     eprintln!("  sana recall  <dir> <ns> [json-recall-request]");
     eprintln!("  sana flush   <dir> <ns>   # fold WAL into a document SST");
     eprintln!("  sana compact <dir> <ns>   # merge SSTs, drop tombstones");
@@ -161,6 +163,15 @@ async fn query(args: &[String]) -> CliResult {
     if !result.aggregates.is_empty() {
         println!("aggregates: {:?}", result.aggregates);
     }
+    Ok(())
+}
+
+async fn multi_query(args: &[String]) -> CliResult {
+    let (dir, ns, json) = (arg(args, 2)?, arg(args, 3)?, arg(args, 4)?);
+    let namespace = Namespace::open(store(dir), ns).await?;
+    let request = serde_json::from_str::<MultiQuery>(json)?;
+    let result = namespace.multi_query(request).await?;
+    println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
 }
 

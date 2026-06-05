@@ -26,7 +26,7 @@ use crate::doc::{DocRecord, decode_id, encode_id};
 use crate::error::{Error, Result};
 use crate::manifest::{ManifestPointer, NamespaceManifest};
 use crate::object_store::{ObjectStore, ObjectVersion, version_of};
-use crate::query::{Query, QueryResult, RecallRequest, RecallResult};
+use crate::query::{MultiQuery, MultiQueryResult, Query, QueryResult, RecallRequest, RecallResult};
 use crate::sst::SstReader;
 use crate::value::{Document, Id, Value};
 use crate::wal::{WalBatch, WalCursor, WalOp};
@@ -450,9 +450,16 @@ impl Namespace {
     pub async fn replay(&self) -> Result<BTreeMap<Id, Document>> {
         let manifest = self.load_manifest().await?;
         let commit = self.commit_cursor().await?;
+        self.replay_at(&manifest, commit).await
+    }
 
+    pub(crate) async fn replay_at(
+        &self,
+        manifest: &NamespaceManifest,
+        commit: WalCursor,
+    ) -> Result<BTreeMap<Id, Document>> {
         let mut docs: BTreeMap<Id, Document> = self
-            .sst_records(&manifest)
+            .sst_records(manifest)
             .await?
             .into_iter()
             .filter_map(|(id, rec)| match rec {
@@ -498,6 +505,13 @@ impl Namespace {
     /// generation inside `query` without changing this entry point.
     pub async fn query(&self, query: Query) -> Result<QueryResult> {
         crate::query::execute(self, query).await
+    }
+
+    /// Execute several independent query plans against one captured manifest
+    /// and WAL commit snapshot. Hybrid rank fusion stays a caller concern; this
+    /// gives text/vector/attribute subqueries a consistent read timestamp.
+    pub async fn multi_query(&self, query: MultiQuery) -> Result<MultiQueryResult> {
+        crate::query::execute_multi(self, query).await
     }
 
     /// Evaluate ANN recall by comparing approximate vector search with exact

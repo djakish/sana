@@ -20,6 +20,7 @@ use crate::schema::{ColumnType, DistanceMetric};
 use crate::text::{self, Bm25Params};
 use crate::value::{Document, Id, Value, compare_scalars, scalar_eq};
 use crate::vector::{self, VectorFilterMask, VectorIndex, VectorVersionMap};
+use crate::wal::WalCursor;
 
 const DEFAULT_RECALL_NUM: usize = 25;
 const DEFAULT_RECALL_TOP_K: usize = 10;
@@ -138,6 +139,16 @@ pub struct QueryResult {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MultiQuery {
+    pub queries: Vec<Query>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MultiQueryResult {
+    pub results: Vec<QueryResult>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RecallRequest {
     #[serde(default = "default_recall_num")]
     pub num: usize,
@@ -190,6 +201,12 @@ pub struct RecallSample {
     pub ann_ids: Vec<Id>,
 }
 
+#[derive(Clone, Copy)]
+struct VectorPlan {
+    metric: DistanceMetric,
+    dim: usize,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct QueryRow {
     pub id: Id,
@@ -220,6 +237,31 @@ fn default_recall_top_k() -> usize {
 
 pub async fn execute(ns: &Namespace, query: Query) -> Result<QueryResult> {
     let manifest = ns.load_manifest().await?;
+    let commit = ns.commit_cursor().await?;
+    execute_with_snapshot(ns, &manifest, commit, query).await
+}
+
+pub async fn execute_multi(ns: &Namespace, request: MultiQuery) -> Result<MultiQueryResult> {
+    if request.queries.is_empty() {
+        return Err(Error::InvalidQuery(
+            "multi-query requires at least one query".into(),
+        ));
+    }
+    let manifest = ns.load_manifest().await?;
+    let commit = ns.commit_cursor().await?;
+    let mut results = Vec::with_capacity(request.queries.len());
+    for query in request.queries {
+        results.push(execute_with_snapshot(ns, &manifest, commit, query).await?);
+    }
+    Ok(MultiQueryResult { results })
+}
+
+async fn execute_with_snapshot(
+    ns: &Namespace,
+    manifest: &NamespaceManifest,
+    commit: WalCursor,
+    query: Query,
+) -> Result<QueryResult> {
     if query.exact_vector.is_some() && query.approx_vector.is_some() {
         return Err(Error::InvalidQuery(
             "query cannot specify both exact_vector and approx_vector".into(),
@@ -239,7 +281,8 @@ pub async fn execute(ns: &Namespace, query: Query) -> Result<QueryResult> {
         }
         return execute_text(
             ns,
-            &manifest,
+            manifest,
+            commit,
             text_query,
             query.filter.as_ref(),
             query.limit,
@@ -252,16 +295,24 @@ pub async fn execute(ns: &Namespace, query: Query) -> Result<QueryResult> {
         && query.order_by.is_none()
         && query.aggregates.is_empty()
     {
-        return execute_ann_vector(ns, &manifest, ann_query, query.filter.as_ref(), query.limit)
-            .await;
+        return execute_ann_vector(
+            ns,
+            manifest,
+            commit,
+            ann_query,
+            query.filter.as_ref(),
+            query.limit,
+        )
+        .await;
     }
 
-    let mut candidates = materialize_candidates(ns, &manifest, query.filter.as_ref()).await?;
+    let mut candidates =
+        materialize_candidates(ns, manifest, commit, query.filter.as_ref()).await?;
 
     let aggregates = compute_aggregates(&query.aggregates, &candidates)?;
 
     if let Some(vector_query) = &query.exact_vector {
-        finish_exact_vector(&mut candidates, &manifest, vector_query)?;
+        finish_exact_vector(&mut candidates, manifest, vector_query)?;
     } else if let Some(vector_query) = &query.approx_vector {
         // Forced off the ANN fast path by an order_by/aggregate; score exactly.
         let exact_query = ExactVectorQuery {
@@ -270,7 +321,7 @@ pub async fn execute(ns: &Namespace, query: Query) -> Result<QueryResult> {
             k: vector_query.k,
             metric: vector_query.metric,
         };
-        finish_exact_vector(&mut candidates, &manifest, &exact_query)?;
+        finish_exact_vector(&mut candidates, manifest, &exact_query)?;
     } else if let Some(order_by) = &query.order_by {
         sort_rows(&mut candidates, order_by)?;
     } else {
@@ -290,6 +341,7 @@ pub async fn execute(ns: &Namespace, query: Query) -> Result<QueryResult> {
 async fn execute_text(
     ns: &Namespace,
     manifest: &NamespaceManifest,
+    commit: WalCursor,
     text_query: &TextQuery,
     filter: Option<&FilterExpr>,
     limit: Option<usize>,
@@ -303,7 +355,7 @@ async fn execute_text(
     } else {
         None
     };
-    let (hits, docs) = text_hits_and_docs(ns, manifest, text_query, top_k).await?;
+    let (hits, docs) = text_hits_and_docs(ns, manifest, commit, text_query, top_k).await?;
     let score_by_id: BTreeMap<Id, f32> = hits.into_iter().map(|hit| (hit.id, hit.score)).collect();
 
     let mut rows = Vec::new();
@@ -331,10 +383,10 @@ async fn execute_text(
 async fn text_hits_and_docs(
     ns: &Namespace,
     manifest: &NamespaceManifest,
+    commit: WalCursor,
     text_query: &TextQuery,
     top_k: Option<usize>,
 ) -> Result<(Vec<text::TextHit>, BTreeMap<Id, Document>)> {
-    let commit = ns.commit_cursor().await?;
     if manifest.indexed_cursor == Some(commit)
         && let Some(meta) = manifest.text_ssts.first()
     {
@@ -363,7 +415,7 @@ async fn text_hits_and_docs(
         return Ok((hits, docs));
     }
 
-    let docs = ns.replay().await?;
+    let docs = ns.replay_at(manifest, commit).await?;
     let hits = text::score_documents(
         &docs,
         &text_query.column,
@@ -499,6 +551,7 @@ pub async fn recall(ns: &Namespace, request: RecallRequest) -> Result<RecallResu
 async fn execute_ann_vector(
     ns: &Namespace,
     manifest: &NamespaceManifest,
+    commit: WalCursor,
     query: &ApproxVectorQuery,
     filter: Option<&FilterExpr>,
     limit: Option<usize>,
@@ -518,9 +571,11 @@ async fn execute_ann_vector(
         )));
     }
     let metric = query.metric.unwrap_or(default_metric);
+    let plan = VectorPlan { metric, dim };
 
     let Some(meta) = manifest.vector_indexes.get(&query.column) else {
-        return exact_vector_fallback(ns, manifest, filter, &exact_query, metric, dim, limit).await;
+        return exact_vector_fallback(ns, manifest, commit, filter, &exact_query, plan, limit)
+            .await;
     };
 
     let index_bytes = ns.store().get(&meta.key).await?.bytes;
@@ -533,10 +588,10 @@ async fn execute_ann_vector(
                 return exact_vector_fallback(
                     ns,
                     manifest,
+                    commit,
                     Some(filter),
                     &exact_query,
-                    metric,
-                    dim,
+                    plan,
                     limit,
                 )
                 .await;
@@ -563,10 +618,10 @@ async fn execute_ann_vector(
                     return exact_vector_fallback(
                         ns,
                         manifest,
+                        commit,
                         Some(filter),
                         &exact_query,
-                        metric,
-                        dim,
+                        plan,
                         limit,
                     )
                     .await;
@@ -583,7 +638,6 @@ async fn execute_ann_vector(
         )?);
     }
 
-    let commit = ns.commit_cursor().await?;
     let overlay = ns.read_overlay_ops(manifest.indexed_cursor, commit).await?;
     let touched: BTreeSet<Id> = overlay.iter().map(|op| op_id(op).clone()).collect();
 
@@ -639,7 +693,7 @@ async fn execute_ann_vector(
         rows.push(QueryRow {
             id,
             document: document.clone(),
-            score: Some(vector::score(&query.vector, &values, metric)?),
+            score: Some(vector::score(&query.vector, &values, plan.metric)?),
         });
     }
 
@@ -695,14 +749,14 @@ async fn load_vector_version_map(
 async fn exact_vector_fallback(
     ns: &Namespace,
     manifest: &NamespaceManifest,
+    commit: WalCursor,
     filter: Option<&FilterExpr>,
     exact_query: &ExactVectorQuery,
-    metric: DistanceMetric,
-    dim: usize,
+    plan: VectorPlan,
     limit: Option<usize>,
 ) -> Result<QueryResult> {
-    let mut candidates = materialize_candidates(ns, manifest, filter).await?;
-    score_vectors(&mut candidates, exact_query, metric, dim)?;
+    let mut candidates = materialize_candidates(ns, manifest, commit, filter).await?;
+    score_vectors(&mut candidates, exact_query, plan.metric, plan.dim)?;
     candidates.retain(|row| row.score.is_some());
     candidates.sort_by(compare_score_rows);
     candidates.truncate(keep_count(exact_query.k, limit));
@@ -744,12 +798,12 @@ fn finish_exact_vector(
 async fn materialize_candidates(
     ns: &Namespace,
     manifest: &NamespaceManifest,
+    commit: WalCursor,
     filter: Option<&FilterExpr>,
 ) -> Result<Vec<QueryRow>> {
     if let Some(filter) = filter
         && let Some(mut ids) = indexed_filter_candidate_ids(ns, manifest, filter).await?
     {
-        let commit = ns.commit_cursor().await?;
         let overlay = ns.read_overlay_ops(manifest.indexed_cursor, commit).await?;
         for op in &overlay {
             ids.insert(op_id(op).clone());
@@ -775,7 +829,7 @@ async fn materialize_candidates(
         return Ok(rows);
     }
 
-    let docs = ns.replay().await?;
+    let docs = ns.replay_at(manifest, commit).await?;
     let mut rows = Vec::new();
     for (id, document) in docs {
         if matches_filter(filter, &document)? {
