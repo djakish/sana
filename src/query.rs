@@ -297,7 +297,13 @@ async fn execute_text(
 ) -> Result<QueryResult> {
     validate_text_query(manifest, text_query)?;
 
-    let (hits, docs) = text_hits_and_docs(ns, manifest, text_query).await?;
+    let effective_limit = limit.unwrap_or(text_query.k).min(text_query.k);
+    let top_k = if filter.is_none() && aggregates.is_empty() {
+        Some(effective_limit)
+    } else {
+        None
+    };
+    let (hits, docs) = text_hits_and_docs(ns, manifest, text_query, top_k).await?;
     let score_by_id: BTreeMap<Id, f32> = hits.into_iter().map(|hit| (hit.id, hit.score)).collect();
 
     let mut rows = Vec::new();
@@ -318,7 +324,6 @@ async fn execute_text(
     let aggregate_rows = rows.clone();
     let aggregates = compute_aggregates(aggregates, &aggregate_rows)?;
 
-    let effective_limit = limit.unwrap_or(text_query.k).min(text_query.k);
     rows.truncate(effective_limit);
     Ok(QueryResult { rows, aggregates })
 }
@@ -327,20 +332,34 @@ async fn text_hits_and_docs(
     ns: &Namespace,
     manifest: &NamespaceManifest,
     text_query: &TextQuery,
+    top_k: Option<usize>,
 ) -> Result<(Vec<text::TextHit>, BTreeMap<Id, Document>)> {
     let commit = ns.commit_cursor().await?;
     if manifest.indexed_cursor == Some(commit)
         && let Some(meta) = manifest.text_ssts.first()
     {
         let reader = ns.load_sst(&meta.key).await?;
-        let hits = text::search_sst(
-            &reader,
-            &text_query.column,
-            &text_query.query,
-            text_query.params,
-        )?;
+        let hits = match top_k {
+            Some(k) => text::search_sst_top_k(
+                &reader,
+                &text_query.column,
+                &text_query.query,
+                k,
+                text_query.params,
+            )?,
+            None => text::search_sst(
+                &reader,
+                &text_query.column,
+                &text_query.query,
+                text_query.params,
+            )?,
+        };
         let ids: BTreeSet<Id> = hits.iter().map(|hit| hit.id.clone()).collect();
-        let docs = ns.resolve_ids(manifest, &[], &ids).await?;
+        let docs = if ids.is_empty() {
+            BTreeMap::new()
+        } else {
+            ns.resolve_ids(manifest, &[], &ids).await?
+        };
         return Ok((hits, docs));
     }
 

@@ -12,12 +12,12 @@ the next unchecked task under "Current milestone" / "Next up".
 ## Status snapshot
 
 - **Current stage:** Stage 7 (Full-text search) — **in progress**.
-- **Next up:** Rank-safe MAXSCORE over text posting blocks, then hybrid
-  multi-query planning.
+- **Next up:** Hybrid multi-query planning, then vectorized/batched MAXSCORE
+  inner loops.
 - **Done:** Stage 0 (Skeleton), Stage 1 (Durable Documents), Stage 2 (SST/LSM),
   Stage 3 (Attributes & Exact Search), Stage 4 (ANN v0), Stage 5 (Native
   Filtering), Stage 6 (SPFresh local rebuild).
-- **Tests:** `cargo test` green (101 tests); `cargo clippy --all-targets` clean.
+- **Tests:** `cargo test` green (103 tests); `cargo clippy --all-targets` clean.
 - **Note:** post-Stage-2 and Stage-3–5 code-review fixes applied; remaining
   findings tracked under "Stage 2 — code review follow-ups" and "Stages 3–5 —
   code review follow-ups". Recently fixed limitations: Stage 2 ranged
@@ -25,7 +25,8 @@ the next unchecked task under "Current milestone" / "Next up".
   and orphaned-object GC (`indexer::gc`, `sana gc [--apply]`); Stage 3 attribute
   write-amplification via delta + tiered `attr_ssts` (`tier_attr_ssts`); vector
   read path fetches append deltas concurrently; Stage 7 now has tokenizer,
-  block-shaped full-snapshot text postings, and BM25 query support.
+  block-shaped full-snapshot text postings, BM25 query support, and rank-safe
+  block MAXSCORE top-k.
 - **Last updated:** 2026-06-06.
 
 ---
@@ -594,8 +595,9 @@ Planned tasks:
 - [x] Add text query API/CLI support and hybrid-ready score plumbing.
 - [x] Add tests for tokenization, ranking, filtering, and SST persistence.
 - [x] Upgrade postings to fixed-size blocks with block-local max scores.
-- [ ] Add rank-safe MAXSCORE over the block postings.
+- [x] Add rank-safe MAXSCORE over the block postings.
 - [ ] Add hybrid multi-query planning for combined text/vector/attribute ranks.
+- [ ] Vectorize/batch the MAXSCORE inner loop.
 
 Stage 7 decisions / notes:
 
@@ -612,6 +614,12 @@ Stage 7 decisions / notes:
   path still exhaustively consumes blocks, but the on-disk shape now matches the
   FTS v2 direction and can support block skipping without another manifest
   family change.
+- **D41 — MAXSCORE is rank-safe and conservative.** Unfiltered, non-aggregate
+  text top-k queries use block upper bounds to skip posting blocks whose maximum
+  possible final contribution cannot reach the current heap threshold. Filtered
+  or aggregate text queries still use exhaustive scoring until filters become
+  native to the text planner. Custom BM25 parameters also fall back to exhaustive
+  scoring because block maxima are stored for the default BM25 parameters.
 
 ---
 
