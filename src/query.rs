@@ -310,41 +310,37 @@ pub async fn recall(ns: &Namespace, request: RecallRequest) -> Result<RecallResu
     let mut ann_count_sum = 0usize;
 
     for candidate in candidates {
-        let exact = execute(
-            ns,
-            Query {
-                filter: request.filter.clone(),
-                order_by: None,
-                limit: None,
-                aggregates: Vec::new(),
-                exact_vector: Some(ExactVectorQuery {
-                    column: column.clone(),
-                    vector: candidate.vector.clone(),
-                    k: request.top_k,
-                    metric: Some(metric),
-                }),
-                approx_vector: None,
-            },
-        )
-        .await?;
-        let ann = execute(
-            ns,
-            Query {
-                filter: request.filter.clone(),
-                order_by: None,
-                limit: None,
-                aggregates: Vec::new(),
-                exact_vector: None,
-                approx_vector: Some(ApproxVectorQuery {
-                    column: column.clone(),
-                    vector: candidate.vector,
-                    k: request.top_k,
-                    probes: request.probes,
-                    metric: Some(metric),
-                }),
-            },
-        )
-        .await?;
+        // The exact and ANN queries for a sample are independent read-only
+        // executions; run them concurrently rather than back to back.
+        let exact_query = Query {
+            filter: request.filter.clone(),
+            order_by: None,
+            limit: None,
+            aggregates: Vec::new(),
+            exact_vector: Some(ExactVectorQuery {
+                column: column.clone(),
+                vector: candidate.vector.clone(),
+                k: request.top_k,
+                metric: Some(metric),
+            }),
+            approx_vector: None,
+        };
+        let ann_query = Query {
+            filter: request.filter.clone(),
+            order_by: None,
+            limit: None,
+            aggregates: Vec::new(),
+            exact_vector: None,
+            approx_vector: Some(ApproxVectorQuery {
+                column: column.clone(),
+                vector: candidate.vector,
+                k: request.top_k,
+                probes: request.probes,
+                metric: Some(metric),
+            }),
+        };
+        let (exact, ann) = tokio::join!(execute(ns, exact_query), execute(ns, ann_query));
+        let (exact, ann) = (exact?, ann?);
 
         let exhaustive_ids = exact.rows.into_iter().map(|row| row.id).collect::<Vec<_>>();
         let ann_ids = ann.rows.into_iter().map(|row| row.id).collect::<Vec<_>>();
