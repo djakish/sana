@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use bytes::Bytes;
 use sana::error::Error;
 use sana::namespace::Namespace;
 use sana::object_store::{FsObjectStore, ObjectStore};
@@ -433,6 +434,66 @@ async fn ann_vector_query_rechecks_wal_overlay() {
     let ids: Vec<Id> = ann.rows.iter().map(|row| row.id.clone()).collect();
     assert_eq!(ids, vec![Id::U64(3), Id::U64(2)]);
     assert_eq!(ann.rows[0].score, Some(-0.0025000002));
+}
+
+#[tokio::test]
+async fn ann_vector_query_drops_stale_index_versions() {
+    let dir = tempfile::tempdir().unwrap();
+    let object_store = store(&dir);
+    let ns = Namespace::create(object_store.clone(), "docs")
+        .await
+        .unwrap();
+    ns.upsert(doc(1, "old", 10, &["v"], [0.01, 0.0]))
+        .await
+        .unwrap();
+    ns.upsert(doc(2, "near", 20, &["v"], [10.0, 0.0]))
+        .await
+        .unwrap();
+    indexer::flush(&ns).await.unwrap();
+    let old_version = ns.load_manifest().await.unwrap().generation;
+
+    ns.upsert(doc(1, "new", 30, &["v"], [100.0, 0.0]))
+        .await
+        .unwrap();
+    indexer::flush(&ns).await.unwrap();
+
+    let manifest = ns.load_manifest().await.unwrap();
+    let meta = manifest.vector_indexes.get("embedding").unwrap();
+    assert!(manifest.generation > old_version);
+    let mut index =
+        vector::VectorIndex::decode(&object_store.get(&meta.key).await.unwrap().bytes).unwrap();
+    let stale_local_id = index.postings[0].vectors.len() as u32;
+    index.postings[0].vectors.push(vector::VectorEntry {
+        id: Id::U64(1),
+        vector: vec![0.0, 0.0],
+        local_id: stale_local_id,
+        version: old_version,
+    });
+    object_store
+        .put(&meta.key, Bytes::from(index.encode().unwrap()))
+        .await
+        .unwrap();
+
+    let ann = ns
+        .query(Query {
+            filter: None,
+            order_by: None,
+            limit: None,
+            aggregates: Vec::new(),
+            exact_vector: None,
+            approx_vector: Some(ApproxVectorQuery {
+                column: "embedding".into(),
+                vector: vec![0.0, 0.0],
+                k: 1,
+                probes: Some(16),
+                metric: Some(DistanceMetric::L2),
+            }),
+        })
+        .await
+        .unwrap();
+
+    let ids: Vec<Id> = ann.rows.iter().map(|row| row.id.clone()).collect();
+    assert_eq!(ids, vec![Id::U64(2)]);
 }
 
 #[tokio::test]

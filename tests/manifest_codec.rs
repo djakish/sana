@@ -82,6 +82,10 @@ fn manifest_round_trips_doc_sst_metadata() {
         VectorIndexMeta {
             key: "namespaces/docs/index/g/7/vector/656d62656464696e67/ivf.bin".into(),
             size_bytes: 8192,
+            version_map_key: Some(
+                "namespaces/docs/index/g/7/vector/656d62656464696e67/versions.bin".into(),
+            ),
+            version_map_size_bytes: 1024,
             row_count: 2,
             centroid_count: 2,
             dim: 768,

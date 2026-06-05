@@ -12,12 +12,12 @@ the next unchecked task under "Current milestone" / "Next up".
 ## Status snapshot
 
 - **Current stage:** Stage 6 (SPFresh local rebuild) — **in progress**.
-- **Next up:** Mutable vector posting append, version map, and stale-vector
-  handling before split/merge/reassign jobs.
+- **Next up:** Mutable vector posting append objects before split/merge/reassign
+  jobs.
 - **Done:** Stage 0 (Skeleton), Stage 1 (Durable Documents), Stage 2 (SST/LSM),
   Stage 3 (Attributes & Exact Search), Stage 4 (ANN v0), Stage 5 (Native
   Filtering).
-- **Tests:** `cargo test` green (77 tests); `cargo clippy --all-targets` clean.
+- **Tests:** `cargo test` green (78 tests); `cargo clippy --all-targets` clean.
 - **Note:** post-Stage-2 and Stage-3–5 code-review fixes applied; remaining
   findings tracked under "Stage 2 — code review follow-ups" and "Stages 3–5 —
   code review follow-ups".
@@ -427,15 +427,37 @@ rebalance postings with background split/merge/reassign work.
 
 Planned tasks:
 
-- [ ] Add versioned vector entries and a vector version map keyed by document id
+- [x] Add versioned vector entries and a vector version map keyed by document id
       and vector column.
 - [ ] Add mutable posting append objects for new vectors instead of rebuilding
       the whole IVF object on every flush.
-- [ ] Make ANN drop stale/deleted vector versions using the version map.
+- [x] Make ANN drop stale/deleted vector versions using the version map.
 - [ ] Add posting-level split/merge thresholds and local rebuild planning.
 - [ ] Implement bounded-neighborhood reassignment after split/merge.
 - [ ] Add tests for insert/delete churn preserving recall without global
       rebuild.
+
+Known limitations to improve later:
+
+- Stage 6 still rebuilds the IVF object on each flush. The new version map is
+  the correctness layer needed before append-only vector posting deltas can
+  leave old copies behind.
+- Version numbers are currently index generation numbers. Future append objects
+  should use monotonic per-column vector versions or WAL positions so local
+  rebuilds can CAS the map without rebuilding unrelated postings.
+
+Stage 6 decisions / notes so far:
+
+- **D32 — Version map is the source of truth for indexed vector liveness.**
+  Each vector entry/address now carries a `version`, and each vector column
+  publishes a `versions.bin` object mapping document id to the current indexed
+  version. ANN asks the IVF object for candidate copies, then drops any hit
+  whose `(id, version)` does not match the map before final top-k.
+- **D33 — Query returns all probed posting hits before liveness filtering.**
+  The query path asks the IVF scan for every candidate in the selected postings,
+  not only the user-visible `k`, because stale/touched entries may be removed
+  after the scan. Final truncation still applies after stale filtering and WAL
+  overlay merge.
 
 ---
 
@@ -498,7 +520,7 @@ src/
   doc.rs                 Id key encoding (order-preserving) + DocRecord
   attr.rs                attribute postings SST encoding/query helpers
   query.rs               logical query types + exact/ANN/native filtering + recall
-  vector.rs              IVF vector index, native filter bitmaps, recall helper
+  vector.rs              IVF vector index, version map, native filter bitmaps
   namespace.rs           Namespace: create/append + SST-aware replay/lookup
   indexer.rs             flush/compaction + attr/vector index publication
 tests/

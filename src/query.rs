@@ -14,11 +14,11 @@ use serde::{Deserialize, Serialize};
 use crate::attr::{self, AttrBound};
 use crate::doc::encode_id;
 use crate::error::{Error, Result};
-use crate::manifest::NamespaceManifest;
+use crate::manifest::{NamespaceManifest, VectorIndexMeta};
 use crate::namespace::{Namespace, op_id};
 use crate::schema::{ColumnType, DistanceMetric};
 use crate::value::{Document, Id, Value};
-use crate::vector::{self, VectorFilterMask, VectorIndex};
+use crate::vector::{self, VectorFilterMask, VectorIndex, VectorVersionMap};
 
 const DEFAULT_RECALL_NUM: usize = 25;
 const DEFAULT_RECALL_TOP_K: usize = 10;
@@ -407,6 +407,7 @@ async fn execute_ann_vector(
 
     let index_bytes = ns.store().get(&meta.key).await?.bytes;
     let index = VectorIndex::decode(&index_bytes)?;
+    let version_map = load_vector_version_map(ns, meta).await?;
     let native_filter = match filter {
         Some(filter) => match native_filter_mask(&index, filter)? {
             Some(mask) => Some(mask),
@@ -427,7 +428,7 @@ async fn execute_ann_vector(
     };
     let ann_hits = index.search_with_filter(
         &query.vector,
-        query.k,
+        usize::MAX,
         query.probes,
         Some(metric),
         native_filter.as_ref(),
@@ -442,6 +443,12 @@ async fn execute_ann_vector(
     let mut rows = Vec::new();
     for hit in ann_hits {
         if touched.contains(&hit.id) {
+            continue;
+        }
+        if version_map
+            .as_ref()
+            .is_some_and(|versions| !versions.is_live(&hit.id, hit.version))
+        {
             continue;
         }
         let Some(document) = ns.lookup(&hit.id).await? else {
@@ -489,6 +496,18 @@ async fn execute_ann_vector(
         rows,
         aggregates: Vec::new(),
     })
+}
+
+async fn load_vector_version_map(
+    ns: &Namespace,
+    meta: &VectorIndexMeta,
+) -> Result<Option<VectorVersionMap>> {
+    let Some(key) = &meta.version_map_key else {
+        return Ok(None);
+    };
+    Ok(Some(VectorVersionMap::decode(
+        &ns.store().get(key).await?.bytes,
+    )?))
 }
 
 async fn exact_vector_fallback(

@@ -6,7 +6,7 @@ use sana::namespace::Namespace;
 use sana::object_store::{FsObjectStore, ObjectStore};
 use sana::schema::DistanceMetric;
 use sana::value::{Document, Id, Value, VectorValue};
-use sana::vector::VectorIndex;
+use sana::vector::{VectorIndex, VectorVersionMap};
 use sana::wal::WalOp;
 use tempfile::TempDir;
 
@@ -32,7 +32,7 @@ fn indexed_bytes(manifest: &sana::manifest::NamespaceManifest) -> u64 {
         + manifest
             .vector_indexes
             .values()
-            .map(|m| m.size_bytes)
+            .map(|m| m.size_bytes + m.version_map_size_bytes)
             .sum::<u64>()
 }
 
@@ -103,10 +103,31 @@ async fn flush_publishes_vector_indexes() {
         index
             .addresses
             .iter()
-            .any(|addr| addr.id == Id::U64(1) && addr.local_id == 0)
+            .any(|addr| addr.id == Id::U64(1) && addr.local_id == 0 && addr.version > 0)
+    );
+    assert!(
+        index
+            .postings
+            .iter()
+            .flat_map(|posting| &posting.vectors)
+            .all(|entry| entry.version == manifest.generation)
     );
     assert!(index.filter_index.columns.contains_key("title"));
     assert!(index.filter_index.columns.contains_key("score"));
+
+    let version_map = VectorVersionMap::decode(
+        &object_store
+            .get(meta.version_map_key.as_ref().unwrap())
+            .await
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
+    assert_eq!(
+        version_map.live_version(&Id::U64(1)),
+        Some(manifest.generation)
+    );
+    assert!(version_map.is_live(&Id::U64(2), manifest.generation));
 
     let mask = index
         .filter_mask_by_value("title", |value| value == &Value::String("alpha".into()))

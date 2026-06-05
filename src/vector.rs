@@ -15,7 +15,9 @@ use crate::schema::DistanceMetric;
 use crate::value::{Document, Id, Value, VectorValue};
 
 const VECTOR_MAGIC: &[u8; 8] = b"SANAVEC1";
+const VERSION_MAP_MAGIC: &[u8; 8] = b"SANAVM1!";
 const VECTOR_FORMAT_VERSION: u32 = 1;
+const VERSION_MAP_FORMAT_VERSION: u32 = 1;
 const HEADER_LEN: usize = 8 + 4 + 4 + 4;
 const KMEANS_ITERS: usize = 8;
 const MAX_CLUSTERS: usize = 16;
@@ -43,6 +45,7 @@ pub struct VectorEntry {
     pub id: Id,
     pub vector: Vec<f32>,
     pub local_id: u32,
+    pub version: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +53,7 @@ pub struct VectorAddress {
     pub id: Id,
     pub cluster_id: u32,
     pub local_id: u32,
+    pub version: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -78,13 +82,91 @@ pub struct VectorFilterRows {
 #[derive(Clone, Debug, PartialEq)]
 pub struct VectorHit {
     pub id: Id,
+    pub version: u64,
     pub score: f32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct VectorVersionMap {
+    pub format_version: u32,
+    pub column: String,
+    pub versions: BTreeMap<Id, u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VectorFilterMask {
     row_counts: Vec<usize>,
     rows: Vec<Vec<u64>>,
+}
+
+impl VectorVersionMap {
+    pub fn from_index(index: &VectorIndex) -> Self {
+        let mut versions = BTreeMap::new();
+        for posting in &index.postings {
+            for entry in &posting.vectors {
+                let version = versions.entry(entry.id.clone()).or_insert(entry.version);
+                *version = (*version).max(entry.version);
+            }
+        }
+        Self {
+            format_version: VERSION_MAP_FORMAT_VERSION,
+            column: index.column.clone(),
+            versions,
+        }
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let body = postcard::to_allocvec(self).map_err(|e| Error::Codec(e.to_string()))?;
+        let crc = crc32fast::hash(&body);
+        let mut out = Vec::with_capacity(HEADER_LEN + body.len());
+        out.extend_from_slice(VERSION_MAP_MAGIC);
+        out.extend_from_slice(&VERSION_MAP_FORMAT_VERSION.to_le_bytes());
+        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(&body);
+        Ok(out)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < HEADER_LEN {
+            return Err(Error::Corrupt(
+                "vector version map frame shorter than header".into(),
+            ));
+        }
+        if &bytes[0..8] != VERSION_MAP_MAGIC {
+            return Err(Error::Corrupt("bad vector version map magic".into()));
+        }
+        let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        if version != VERSION_MAP_FORMAT_VERSION {
+            return Err(Error::Corrupt(format!(
+                "unsupported vector version map version {version}"
+            )));
+        }
+        let body_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        let crc = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
+        let body = bytes
+            .get(HEADER_LEN..HEADER_LEN + body_len)
+            .ok_or_else(|| Error::Corrupt("vector version map body truncated".into()))?;
+        if crc32fast::hash(body) != crc {
+            return Err(Error::Corrupt("vector version map crc mismatch".into()));
+        }
+        let map: Self = postcard::from_bytes(body).map_err(|e| Error::Codec(e.to_string()))?;
+        if map.format_version != VERSION_MAP_FORMAT_VERSION {
+            return Err(Error::Corrupt(format!(
+                "unsupported vector version map body version {}",
+                map.format_version
+            )));
+        }
+        Ok(map)
+    }
+
+    pub fn live_version(&self, id: &Id) -> Option<u64> {
+        self.versions.get(id).copied()
+    }
+
+    pub fn is_live(&self, id: &Id, version: u64) -> bool {
+        self.live_version(id) == Some(version)
+    }
 }
 
 impl VectorIndex {
@@ -126,6 +208,7 @@ impl VectorIndex {
                 id: entry.id.clone(),
                 cluster_id: centroid_id as u32,
                 local_id: entry.local_id,
+                version: entry.version,
             });
             postings[centroid_id].vectors.push(entry);
         }
@@ -243,6 +326,7 @@ impl VectorIndex {
                 }
                 hits.push(VectorHit {
                     id: entry.id.clone(),
+                    version: entry.version,
                     score: score(query, &entry.vector, metric)?,
                 });
             }

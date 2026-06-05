@@ -36,10 +36,18 @@ pub struct SstMeta {
 pub struct VectorIndexMeta {
     pub key: String,
     pub size_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_map_key: Option<String>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub version_map_size_bytes: u64,
     pub row_count: u64,
     pub centroid_count: u64,
     pub dim: usize,
     pub metric: DistanceMetric,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 /// The immutable manifest body for one generation. Stored as pretty JSON so it

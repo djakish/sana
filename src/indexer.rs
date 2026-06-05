@@ -25,7 +25,11 @@ use crate::namespace::{Namespace, apply_op, now_ms, op_id};
 use crate::schema::ColumnType;
 use crate::sst::SstWriter;
 use crate::value::{Document, Id};
-use crate::vector::{VectorEntry, VectorIndex, vector_to_f32};
+use crate::vector::{VectorEntry, VectorIndex, VectorVersionMap, vector_to_f32};
+
+fn vector_family_bytes(meta: &VectorIndexMeta) -> u64 {
+    meta.size_bytes + meta.version_map_size_bytes
+}
 
 struct BuiltSst {
     bytes: Vec<u8>,
@@ -82,6 +86,7 @@ async fn publish_vector_indexes(
                 id: id.clone(),
                 vector: vector_to_f32(vector),
                 local_id: 0,
+                version: generation,
             });
         }
 
@@ -89,18 +94,31 @@ async fn publish_vector_indexes(
             continue;
         };
         let bytes = index.encode()?;
+        let version_map = VectorVersionMap::from_index(&index);
+        let version_map_bytes = version_map.encode()?;
         let key = format!(
             "namespaces/{}/index/g/{}/vector/{}/ivf.bin",
             ns.name(),
             generation,
             object_path_component(column)
         );
+        let version_map_key = format!(
+            "namespaces/{}/index/g/{}/vector/{}/versions.bin",
+            ns.name(),
+            generation,
+            object_path_component(column)
+        );
         ns.store().put(&key, Bytes::from(bytes.clone())).await?;
+        ns.store()
+            .put(&version_map_key, Bytes::from(version_map_bytes.clone()))
+            .await?;
         out.insert(
             column.clone(),
             VectorIndexMeta {
                 key,
                 size_bytes: bytes.len() as u64,
+                version_map_key: Some(version_map_key),
+                version_map_size_bytes: version_map_bytes.len() as u64,
                 row_count: index.row_count() as u64,
                 centroid_count: index.centroids.len() as u64,
                 dim,
@@ -255,7 +273,7 @@ pub async fn flush(ns: &Namespace) -> Result<bool> {
         + manifest
             .vector_indexes
             .values()
-            .map(|m| m.size_bytes)
+            .map(vector_family_bytes)
             .sum::<u64>();
 
     ns.publish_manifest(snapshot.pointer_version, &manifest)
@@ -308,7 +326,7 @@ pub async fn compact(ns: &Namespace) -> Result<bool> {
         + manifest
             .vector_indexes
             .values()
-            .map(|m| m.size_bytes)
+            .map(vector_family_bytes)
             .sum::<u64>();
     manifest.doc_ssts = vec![SstMeta {
         key: sst_key,
