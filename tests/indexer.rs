@@ -592,6 +592,59 @@ async fn flush_and_compact_update_stats() {
 }
 
 #[tokio::test]
+async fn size_tiered_compaction_merges_overflowing_level() {
+    let dir = tempfile::tempdir().unwrap();
+    let ns = Namespace::create(store(&dir), "docs").await.unwrap();
+
+    // Four flushes, each its own L0 run, trip the tier trigger on the fourth.
+    for id in 1..=4u64 {
+        ns.upsert(doc_with(id, &format!("doc{id}"), id as i64))
+            .await
+            .unwrap();
+        indexer::flush(&ns).await.unwrap();
+    }
+    let m = ns.load_manifest().await.unwrap();
+    assert_eq!(m.doc_ssts.len(), 1, "four L0 runs should merge into one");
+    assert_eq!(m.doc_ssts[0].level, 1);
+    assert_eq!(m.doc_ssts[0].row_count, 4);
+
+    // Every row survives the merge.
+    for id in 1..=4u64 {
+        assert_eq!(
+            ns.lookup(&Id::U64(id)).await.unwrap(),
+            Some(doc_with(id, &format!("doc{id}"), id as i64))
+        );
+    }
+
+    // A later flush lands a fresh L0 run above the L1 run. A tombstone there must
+    // shadow the older Present in L1 — tiering retains tombstones across levels.
+    ns.delete(Id::U64(1)).await.unwrap();
+    ns.upsert(doc_with(5, "doc5", 5)).await.unwrap();
+    indexer::flush(&ns).await.unwrap();
+
+    let m = ns.load_manifest().await.unwrap();
+    assert_eq!(m.doc_ssts.len(), 2); // one fresh L0 run over one L1 run
+    assert_eq!(m.doc_ssts.iter().filter(|s| s.level == 0).count(), 1);
+    assert_eq!(m.doc_ssts.iter().filter(|s| s.level == 1).count(), 1);
+    // Precedence order: the L0 run comes before the L1 run.
+    assert_eq!(m.doc_ssts[0].level, 0);
+    assert_eq!(m.doc_ssts[1].level, 1);
+
+    assert_eq!(ns.lookup(&Id::U64(1)).await.unwrap(), None); // tombstone wins
+    assert_eq!(
+        ns.lookup(&Id::U64(5)).await.unwrap(),
+        Some(doc_with(5, "doc5", 5))
+    );
+    assert_eq!(ns.replay().await.unwrap().len(), 4); // 2, 3, 4, 5
+
+    // A full compaction still collapses every level into one tombstone-free run.
+    assert!(indexer::compact(&ns).await.unwrap());
+    let m = ns.load_manifest().await.unwrap();
+    assert_eq!(m.doc_ssts.len(), 1);
+    assert_eq!(m.doc_ssts[0].row_count, 4);
+}
+
+#[tokio::test]
 async fn compaction_noop_with_single_sst() {
     let dir = tempfile::tempdir().unwrap();
     let ns = Namespace::create(store(&dir), "docs").await.unwrap();

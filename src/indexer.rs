@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use bytes::Bytes;
 
 use crate::attr;
-use crate::doc::{DocRecord, encode_id};
+use crate::doc::{DocRecord, decode_id, encode_id};
 use crate::error::Result;
 use crate::manifest::{
     NamespaceManifest, SstMeta, VectorAppendKind, VectorAppendMeta, VectorIndexMeta,
@@ -125,6 +125,7 @@ async fn publish_attr_sst(
         row_count: built.entry_count,
         min_id: None,
         max_id: None,
+        level: 0,
     }])
 }
 
@@ -448,8 +449,12 @@ pub async fn flush(ns: &Namespace) -> Result<bool> {
             row_count: built.row_count,
             min_id: built.min_id,
             max_id: built.max_id,
+            level: 0,
         },
     );
+    // Size-tiered compaction: fold any overflowing level into the next, bounding
+    // read fan-out without rewriting the whole index on every flush.
+    tier_doc_ssts(ns, new_gen, &mut manifest.doc_ssts, commit.seq).await?;
     manifest.attr_ssts = attr_ssts;
     manifest.vector_index_generations = vector_indexes
         .keys()
@@ -472,6 +477,79 @@ pub async fn flush(ns: &Namespace) -> Result<bool> {
     ns.publish_manifest(snapshot.pointer_version, &manifest)
         .await?;
     Ok(true)
+}
+
+/// Number of runs at one level that triggers a size-tiered merge into the next.
+const TIER_TRIGGER: usize = 4;
+
+/// Size-tiered minor compaction over `doc_ssts`. While some level holds at least
+/// [`TIER_TRIGGER`] runs, merge that level's runs (newest-wins) into a single
+/// run at the next level. Tombstones are *retained* — older levels may still
+/// hold the key, so only the full [`compact`] (which merges everything) may drop
+/// them. The live document set is unchanged, so attribute/vector families are
+/// untouched; this only reorganizes the document family and bounds read
+/// fan-out. Old run objects become unreferenced orphans (GC is future work).
+///
+/// `doc_ssts` is kept ordered by read precedence: lower level (and, within a
+/// level, more recently written) first. The merged run is the newest of its new
+/// level, so it is inserted just before the first run of a strictly higher level.
+async fn tier_doc_ssts(
+    ns: &Namespace,
+    generation: u64,
+    doc_ssts: &mut Vec<SstMeta>,
+    commit_seq: u64,
+) -> Result<()> {
+    let mut step = 0u32;
+    loop {
+        let mut counts: BTreeMap<u32, usize> = BTreeMap::new();
+        for meta in doc_ssts.iter() {
+            *counts.entry(meta.level).or_default() += 1;
+        }
+        let Some((&level, _)) = counts.iter().find(|&(_, &count)| count >= TIER_TRIGGER) else {
+            return Ok(());
+        };
+
+        // Merge this level's runs in precedence order (they are already
+        // newest-first in `doc_ssts`); first write of an id wins.
+        let mut merged: BTreeMap<Id, DocRecord> = BTreeMap::new();
+        for meta in doc_ssts.iter().filter(|meta| meta.level == level) {
+            let reader = ns.load_sst(&meta.key).await?;
+            for (key, value) in reader.entries()? {
+                merged
+                    .entry(decode_id(&key)?)
+                    .or_insert(DocRecord::decode(&value)?);
+            }
+        }
+
+        let built = build_sst(&merged)?;
+        let sst_key = format!(
+            "namespaces/{}/index/g/{}/doc/tier-{}-{}-{}.sst",
+            ns.name(),
+            generation,
+            level + 1,
+            commit_seq,
+            step
+        );
+        ns.store()
+            .put(&sst_key, Bytes::from(built.bytes.clone()))
+            .await?;
+        let merged_meta = SstMeta {
+            key: sst_key,
+            size_bytes: built.bytes.len() as u64,
+            row_count: built.row_count,
+            min_id: built.min_id,
+            max_id: built.max_id,
+            level: level + 1,
+        };
+
+        doc_ssts.retain(|meta| meta.level != level);
+        let pos = doc_ssts
+            .iter()
+            .position(|meta| meta.level > level)
+            .unwrap_or(doc_ssts.len());
+        doc_ssts.insert(pos, merged_meta);
+        step += 1;
+    }
 }
 
 /// Merge all document SSTs into a single file, dropping shadowed values and
@@ -528,6 +606,7 @@ pub async fn compact(ns: &Namespace) -> Result<bool> {
         row_count: built.row_count,
         min_id: built.min_id,
         max_id: built.max_id,
+        level: 0,
     }];
 
     ns.publish_manifest(snapshot.pointer_version, &manifest)

@@ -30,6 +30,12 @@ pub struct SstMeta {
     pub min_id: Option<Id>,
     #[serde(default)]
     pub max_id: Option<Id>,
+    /// Size-tiered LSM level. 0 = freshly flushed (L0); higher levels hold
+    /// older, already-merged runs. `doc_ssts` stays ordered by read precedence
+    /// (lower level / more recently written first), so a point read still takes
+    /// the first run whose `[min_id, max_id]` can contain the key.
+    #[serde(default, skip_serializing_if = "level_is_zero")]
+    pub level: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -111,6 +117,10 @@ pub enum VectorMaintenanceAction {
 
 fn is_zero(value: &u64) -> bool {
     *value == 0
+}
+
+fn level_is_zero(level: &u32) -> bool {
+    *level == 0
 }
 
 /// The immutable manifest body for one generation. Stored as pretty JSON so it

@@ -16,11 +16,12 @@ the next unchecked task under "Current milestone" / "Next up".
 - **Done:** Stage 0 (Skeleton), Stage 1 (Durable Documents), Stage 2 (SST/LSM),
   Stage 3 (Attributes & Exact Search), Stage 4 (ANN v0), Stage 5 (Native
   Filtering), Stage 6 (SPFresh local rebuild).
-- **Tests:** `cargo test` green (90 tests); `cargo clippy --all-targets` clean.
+- **Tests:** `cargo test` green (91 tests); `cargo clippy --all-targets` clean.
 - **Note:** post-Stage-2 and Stage-3–5 code-review fixes applied; remaining
   findings tracked under "Stage 2 — code review follow-ups" and "Stages 3–5 —
-  code review follow-ups". Stage 2's ranged point-lookup limitation is now fixed
-  (`sst::ranged_get`).
+  code review follow-ups". Stage 2's ranged point-lookup and flat-doc_ssts (no
+  LSM levels) limitations are now fixed (`sst::ranged_get`, size-tiered
+  `tier_doc_ssts`); the vector read path now fetches append deltas concurrently.
 - **Last updated:** 2026-06-06.
 
 ---
@@ -133,8 +134,15 @@ Stage 2 decisions / notes:
 
 Known limitations to fix later:
 
-- No LSM levels yet — `doc_ssts` is a flat newest-first list; compaction is
-  all-or-nothing. Introduce levels/size-tiering when flush frequency grows.
+- ~~No LSM levels yet — `doc_ssts` is a flat newest-first list; compaction is
+  all-or-nothing.~~ **Done (size-tiered).** `SstMeta.level` tags each run; flush
+  writes L0 and, when a level reaches `TIER_TRIGGER` (4) runs, `tier_doc_ssts`
+  folds it into one run at the next level (newest-wins, tombstones retained since
+  older levels may still hold the key). `doc_ssts` stays ordered by read
+  precedence (lower level / newer first), so the read path is unchanged. The full
+  `compact` still merges everything and drops tombstones. Remaining refinement:
+  leveling is by run *count*, not bytes, and old runs are orphaned until GC. The
+  `level` field is omitted from JSON when 0, so old manifests/goldens are stable.
 - Orphaned SSTs from superseded generations are not GC'd (need an
   unreferenced-object sweep gated on manifest watermarks).
 - No automatic flush trigger (backpressure on unindexed WAL bytes) — flush is

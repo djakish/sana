@@ -67,11 +67,12 @@ fn manifest_rejects_unknown_format_version() {
 fn manifest_round_trips_doc_sst_metadata() {
     let mut m = sample_manifest();
     m.doc_ssts.push(SstMeta {
-        key: "namespaces/docs/index/g/7/doc/flush-12.sst".into(),
+        key: "namespaces/docs/index/g/7/doc/tier-1-12-0.sst".into(),
         size_bytes: 4096,
         row_count: 2,
         min_id: Some(Id::U64(1)),
         max_id: Some(Id::U64(9)),
+        level: 1,
     });
     m.attr_ssts.push(SstMeta {
         key: "namespaces/docs/index/g/7/attr/full-12.sst".into(),
@@ -79,6 +80,7 @@ fn manifest_round_trips_doc_sst_metadata() {
         row_count: 8,
         min_id: None,
         max_id: None,
+        level: 0,
     });
     m.vector_index_generations.insert("embedding".into(), 7);
     m.vector_indexes.insert(
