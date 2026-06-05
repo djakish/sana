@@ -186,6 +186,11 @@ impl VectorIndex {
                 index.format_version
             )));
         }
+        // `build` never emits a centroid-less index, but a corrupt-yet-CRC-valid
+        // object could; guard so `search`'s `clamp(1, centroids.len())` can't panic.
+        if index.centroids.is_empty() {
+            return Err(Error::Corrupt("vector index has no centroids".into()));
+        }
         Ok(index)
     }
 
@@ -247,40 +252,32 @@ impl VectorIndex {
         Ok(hits)
     }
 
-    pub fn row_count(&self) -> usize {
+    /// Per-cluster live-vector counts, indexed by `centroid_id`. Used to size the
+    /// trailing-bit trim of filter bitmaps so unused high bits never match.
+    fn cluster_row_counts(&self) -> Vec<usize> {
         self.postings
             .iter()
             .map(|posting| posting.vectors.len())
-            .sum()
+            .collect()
+    }
+
+    pub fn row_count(&self) -> usize {
+        self.cluster_row_counts().into_iter().sum()
     }
 
     pub fn all_filter_mask(&self) -> VectorFilterMask {
-        VectorFilterMask::all(
-            self.postings
-                .iter()
-                .map(|posting| posting.vectors.len())
-                .collect(),
-        )
+        VectorFilterMask::all(self.cluster_row_counts())
     }
 
     pub fn empty_filter_mask(&self) -> VectorFilterMask {
-        VectorFilterMask::empty(
-            self.postings
-                .iter()
-                .map(|posting| posting.vectors.len())
-                .collect(),
-        )
+        VectorFilterMask::empty(self.cluster_row_counts())
     }
 
     pub fn filter_mask_by_value<F>(&self, column: &str, mut matches: F) -> Option<VectorFilterMask>
     where
         F: FnMut(&Value) -> bool,
     {
-        let row_counts = self
-            .postings
-            .iter()
-            .map(|posting| posting.vectors.len())
-            .collect::<Vec<_>>();
+        let row_counts = self.cluster_row_counts();
         let Some(column) = self.filter_index.columns.get(column) else {
             return Some(VectorFilterMask::empty(row_counts));
         };

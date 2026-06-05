@@ -85,6 +85,21 @@ pub fn all_ids(reader: &SstReader) -> Result<BTreeSet<Id>> {
 }
 
 pub fn ids_for_eq(reader: &SstReader, column: &str, value: &Value) -> Result<Option<BTreeSet<Id>>> {
+    // Candidate generation must be a superset of what the query-path recheck
+    // (`scalar_eq`) accepts. That recheck coerces numerically — Int(5) == Float(5.0),
+    // and +0.0 == -0.0 — but our keys are type-tagged exact bytes (VALUE_INT vs
+    // VALUE_FLOAT, distinct zero bits), so a point lookup would miss those
+    // cross-type matches and silently drop rows. A numeric Eq is therefore an
+    // inclusive degenerate range, decoded and numerically compared like any other
+    // range. Bool/String have no cross-type neighbours, so they keep the exact
+    // point lookup.
+    if matches!(value, Value::Int(_) | Value::Float(_)) {
+        let bound = AttrBound {
+            value,
+            inclusive: true,
+        };
+        return ids_for_range(reader, column, Some(bound), Some(bound));
+    }
     let Some(key) = maybe_attr_key(column, value)? else {
         return Ok(None);
     };

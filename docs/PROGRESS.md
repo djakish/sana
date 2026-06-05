@@ -17,10 +17,10 @@ the next unchecked task under "Current milestone" / "Next up".
 - **Done:** Stage 0 (Skeleton), Stage 1 (Durable Documents), Stage 2 (SST/LSM),
   Stage 3 (Attributes & Exact Search), Stage 4 (ANN v0), Stage 5 (Native
   Filtering).
-- **Tests:** `cargo test` green (75 tests); `cargo clippy --all-targets` clean.
-- **Note:** post-Stage-2 code-review fixes applied (efficiency + stats +
-  dedup + manifest publish safety); remaining findings tracked under
-  "Stage 2 — code review follow-ups".
+- **Tests:** `cargo test` green (77 tests); `cargo clippy --all-targets` clean.
+- **Note:** post-Stage-2 and Stage-3–5 code-review fixes applied; remaining
+  findings tracked under "Stage 2 — code review follow-ups" and "Stages 3–5 —
+  code review follow-ups".
 - **Last updated:** 2026-06-05.
 
 ---
@@ -362,6 +362,60 @@ Stage 5 decisions / notes so far:
   fall back to exact filtered kNN for unsupported filters, preserving
   correctness. The recall endpoint rejects unsupported filters so it cannot
   report perfect recall from an exact fallback path.
+
+---
+
+## Stages 3–5 — code review follow-ups
+
+A high-recall review of the Stage 3–5 diff (`462f44b..HEAD`) ran after it landed.
+
+**Fixed:**
+
+- **Numeric `Eq` cross-type miss (soundness).** `attr::ids_for_eq` built a
+  type-tagged exact key (`VALUE_INT` vs `VALUE_FLOAT`, and distinct +0.0/−0.0
+  bits), but the query-path recheck (`scalar_eq`) coerces numerically. So an
+  indexed `Eq{score, Float(10.0)}` against an Int column returned no candidates
+  while the full-scan path matched — results changed across a flush. Fixed by
+  generating a numeric `Eq` as an inclusive degenerate range (decode + numeric
+  compare, the machinery `ids_for_range` already uses); Bool/String keep the
+  exact point lookup. Regression test `indexed_numeric_eq_matches_cross_type_query_value`.
+- **ANN fast path ignored `query.limit`.** A `limit` smaller than `k` was
+  honored by the exact and order_by/aggregate paths but dropped by the
+  approx-vector early return. Threaded `limit` through `execute_ann_vector` /
+  `exact_vector_fallback` via a shared `keep_count(k, limit)`. Regression test
+  `approx_vector_query_honors_limit_below_k`.
+- **Centroid-less index panic.** `search`'s `clamp(1, centroids.len())` panics on
+  a zero-centroid index. `build` never emits one, but a corrupt-yet-CRC-valid
+  object could; `VectorIndex::decode` now rejects it.
+
+**Simplifications applied (behavior-preserving):**
+
+- Extracted `live_documents(records)` in `indexer.rs` (deduped flush/compact and
+  removed a dead `Deleted` arm).
+- Extracted `finish_exact_vector` in `query.rs` (deduped the exact and
+  approx-fallback scoring arms).
+- Removed `vector_to_f32`/`vector_score` pass-through shims in `query.rs`; call
+  `vector::` directly.
+- Added `VectorIndex::cluster_row_counts()` to collapse five copies of the
+  per-cluster row-count iterator.
+
+**Reviewed and intentionally left as-is (design, not bugs):**
+
+- **Per-query `metric` override on ANN.** Inference always yields `Cosine`, and
+  the ANN/recall tests deliberately query Cosine-clustered indexes with `L2`.
+  Centroid selection under a differing metric can lower recall on large data,
+  but this is the intended "cluster once, rerank at query time" compromise; the
+  recall endpoint exists to measure it. Real fix is column-level metric at
+  create time (future).
+- **Per-id `ns.lookup` in `materialize_candidates` / `execute_ann_vector`.** Each
+  lookup reloads the manifest and re-reads SSTs — O(candidates) round trips.
+  Real efficiency win available (one `sst_records` pass + overlay), but it is a
+  read-path refactor that deserves its own focused change + tests.
+- **`vector_index_generations` and `wal_commit_cursor` are write-only** —
+  derivable/dead. Removing them touches the manifest schema; left with this note.
+- `approx_logical_bytes` over-counts retained doc SSTs after repeated flushes
+  (approximate stat; compact resets it). ANN v0 quality knobs (default probes,
+  empty-cluster centroids) are by design for the full-snapshot index.
 
 ---
 

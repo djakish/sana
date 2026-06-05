@@ -17,7 +17,7 @@ use crate::error::{Error, Result};
 use crate::manifest::NamespaceManifest;
 use crate::namespace::{Namespace, op_id};
 use crate::schema::{ColumnType, DistanceMetric};
-use crate::value::{Document, Id, Value, VectorValue};
+use crate::value::{Document, Id, Value};
 use crate::vector::{self, VectorFilterMask, VectorIndex};
 
 const DEFAULT_RECALL_NUM: usize = 25;
@@ -217,7 +217,8 @@ pub async fn execute(ns: &Namespace, query: Query) -> Result<QueryResult> {
         && query.order_by.is_none()
         && query.aggregates.is_empty()
     {
-        return execute_ann_vector(ns, &manifest, ann_query, query.filter.as_ref()).await;
+        return execute_ann_vector(ns, &manifest, ann_query, query.filter.as_ref(), query.limit)
+            .await;
     }
 
     let mut candidates = materialize_candidates(ns, &manifest, query.filter.as_ref()).await?;
@@ -225,39 +226,16 @@ pub async fn execute(ns: &Namespace, query: Query) -> Result<QueryResult> {
     let aggregates = compute_aggregates(&query.aggregates, &candidates)?;
 
     if let Some(vector_query) = &query.exact_vector {
-        let (dim, default_metric) = vector_schema(&manifest, vector_query)?;
-        if vector_query.vector.len() != dim {
-            return Err(Error::InvalidQuery(format!(
-                "query vector for '{}' has dim {}, expected {dim}",
-                vector_query.column,
-                vector_query.vector.len()
-            )));
-        }
-        let metric = vector_query.metric.unwrap_or(default_metric);
-        score_vectors(&mut candidates, vector_query, metric, dim)?;
-        candidates.retain(|row| row.score.is_some());
-        candidates.sort_by(compare_score_rows);
-        candidates.truncate(vector_query.k);
+        finish_exact_vector(&mut candidates, &manifest, vector_query)?;
     } else if let Some(vector_query) = &query.approx_vector {
+        // Forced off the ANN fast path by an order_by/aggregate; score exactly.
         let exact_query = ExactVectorQuery {
             column: vector_query.column.clone(),
             vector: vector_query.vector.clone(),
             k: vector_query.k,
             metric: vector_query.metric,
         };
-        let (dim, default_metric) = vector_schema(&manifest, &exact_query)?;
-        if exact_query.vector.len() != dim {
-            return Err(Error::InvalidQuery(format!(
-                "query vector for '{}' has dim {}, expected {dim}",
-                exact_query.column,
-                exact_query.vector.len()
-            )));
-        }
-        let metric = exact_query.metric.unwrap_or(default_metric);
-        score_vectors(&mut candidates, &exact_query, metric, dim)?;
-        candidates.retain(|row| row.score.is_some());
-        candidates.sort_by(compare_score_rows);
-        candidates.truncate(exact_query.k);
+        finish_exact_vector(&mut candidates, &manifest, &exact_query)?;
     } else if let Some(order_by) = &query.order_by {
         sort_rows(&mut candidates, order_by)?;
     } else {
@@ -405,6 +383,7 @@ async fn execute_ann_vector(
     manifest: &NamespaceManifest,
     query: &ApproxVectorQuery,
     filter: Option<&FilterExpr>,
+    limit: Option<usize>,
 ) -> Result<QueryResult> {
     let exact_query = ExactVectorQuery {
         column: query.column.clone(),
@@ -423,7 +402,7 @@ async fn execute_ann_vector(
     let metric = query.metric.unwrap_or(default_metric);
 
     let Some(meta) = manifest.vector_indexes.get(&query.column) else {
-        return exact_vector_fallback(ns, manifest, filter, &exact_query, metric, dim).await;
+        return exact_vector_fallback(ns, manifest, filter, &exact_query, metric, dim, limit).await;
     };
 
     let index_bytes = ns.store().get(&meta.key).await?.bytes;
@@ -439,6 +418,7 @@ async fn execute_ann_vector(
                     &exact_query,
                     metric,
                     dim,
+                    limit,
                 )
                 .await;
             }
@@ -504,7 +484,7 @@ async fn execute_ann_vector(
     }
 
     rows.sort_by(compare_score_rows);
-    rows.truncate(query.k);
+    rows.truncate(keep_count(query.k, limit));
     Ok(QueryResult {
         rows,
         aggregates: Vec::new(),
@@ -518,16 +498,46 @@ async fn exact_vector_fallback(
     exact_query: &ExactVectorQuery,
     metric: DistanceMetric,
     dim: usize,
+    limit: Option<usize>,
 ) -> Result<QueryResult> {
     let mut candidates = materialize_candidates(ns, manifest, filter).await?;
     score_vectors(&mut candidates, exact_query, metric, dim)?;
     candidates.retain(|row| row.score.is_some());
     candidates.sort_by(compare_score_rows);
-    candidates.truncate(exact_query.k);
+    candidates.truncate(keep_count(exact_query.k, limit));
     Ok(QueryResult {
         rows: candidates,
         aggregates: Vec::new(),
     })
+}
+
+/// Rows to keep for a vector query: the top `k`, further capped by an explicit
+/// `limit` when the caller asked for fewer than `k`.
+fn keep_count(k: usize, limit: Option<usize>) -> usize {
+    limit.map_or(k, |limit| limit.min(k))
+}
+
+/// Score, prune, sort, and truncate `candidates` for an exact (rerank) vector
+/// query. Shared by the exact arm and the order_by/aggregate-forced approx arm.
+fn finish_exact_vector(
+    candidates: &mut Vec<QueryRow>,
+    manifest: &NamespaceManifest,
+    vector_query: &ExactVectorQuery,
+) -> Result<()> {
+    let (dim, default_metric) = vector_schema(manifest, vector_query)?;
+    if vector_query.vector.len() != dim {
+        return Err(Error::InvalidQuery(format!(
+            "query vector for '{}' has dim {}, expected {dim}",
+            vector_query.column,
+            vector_query.vector.len()
+        )));
+    }
+    let metric = vector_query.metric.unwrap_or(default_metric);
+    score_vectors(candidates, vector_query, metric, dim)?;
+    candidates.retain(|row| row.score.is_some());
+    candidates.sort_by(compare_score_rows);
+    candidates.truncate(vector_query.k);
+    Ok(())
 }
 
 async fn materialize_candidates(
@@ -907,7 +917,7 @@ async fn recall_candidates(
         let Some(vector) = document.vectors.get(column) else {
             continue;
         };
-        let values = vector_to_f32(vector);
+        let values = vector::vector_to_f32(vector);
         if values.len() != dim {
             return Err(Error::Corrupt(format!(
                 "stored vector '{column}' for {:?} has dim {}, expected {dim}",
@@ -1005,7 +1015,7 @@ fn score_vectors(
         let Some(vector) = row.document.vectors.get(&vector_query.column) else {
             continue;
         };
-        let values = vector_to_f32(vector);
+        let values = vector::vector_to_f32(vector);
         if values.len() != dim {
             return Err(Error::Corrupt(format!(
                 "stored vector '{}' for {:?} has dim {}, expected {dim}",
@@ -1014,17 +1024,9 @@ fn score_vectors(
                 values.len()
             )));
         }
-        row.score = Some(vector_score(&vector_query.vector, &values, metric)?);
+        row.score = Some(vector::score(&vector_query.vector, &values, metric)?);
     }
     Ok(())
-}
-
-fn vector_to_f32(vector: &VectorValue) -> Vec<f32> {
-    vector::vector_to_f32(vector)
-}
-
-fn vector_score(query: &[f32], candidate: &[f32], metric: DistanceMetric) -> Result<f32> {
-    vector::score(query, candidate, metric)
 }
 
 fn compare_score_rows(a: &QueryRow, b: &QueryRow) -> Ordering {

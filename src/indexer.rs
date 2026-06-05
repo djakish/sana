@@ -120,6 +120,17 @@ fn object_path_component(value: &str) -> String {
     out
 }
 
+/// The live documents in a resolved record set: present rows, tombstones dropped.
+fn live_documents(records: &BTreeMap<Id, DocRecord>) -> BTreeMap<Id, Document> {
+    records
+        .iter()
+        .filter_map(|(id, rec)| match rec {
+            DocRecord::Present(doc) => Some((id.clone(), doc.clone())),
+            DocRecord::Deleted => None,
+        })
+        .collect()
+}
+
 fn build_sst(records: &BTreeMap<Id, DocRecord>) -> Result<BuiltSst> {
     let mut writer = SstWriter::new();
     let mut built = BuiltSst {
@@ -208,13 +219,7 @@ pub async fn flush(ns: &Namespace) -> Result<bool> {
     for (id, rec) in &records {
         merged.insert(id.clone(), rec.clone());
     }
-    let live_docs: BTreeMap<Id, Document> = merged
-        .iter()
-        .filter_map(|(id, rec)| match rec {
-            DocRecord::Present(doc) => Some((id.clone(), doc.clone())),
-            DocRecord::Deleted => None,
-        })
-        .collect();
+    let live_docs = live_documents(&merged);
     let row_count = live_docs.len() as u64;
     let attr_ssts =
         publish_attr_sst(ns, new_gen, &format!("full-{}", commit.seq), &live_docs).await?;
@@ -274,13 +279,7 @@ pub async fn compact(ns: &Namespace) -> Result<bool> {
         .into_iter()
         .filter(|(_, rec)| matches!(rec, DocRecord::Present(_)))
         .collect();
-    let live_docs: BTreeMap<Id, Document> = live
-        .iter()
-        .filter_map(|(id, rec)| match rec {
-            DocRecord::Present(doc) => Some((id.clone(), doc.clone())),
-            DocRecord::Deleted => None,
-        })
-        .collect();
+    let live_docs = live_documents(&live);
 
     let built = build_sst(&live)?;
     let new_gen = snapshot.pointer.generation + 1;

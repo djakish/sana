@@ -270,6 +270,74 @@ async fn indexed_attribute_filter_rechecks_wal_overlay() {
 }
 
 #[tokio::test]
+async fn indexed_numeric_eq_matches_cross_type_query_value() {
+    // `score` is inferred Int; after a flush the postings live only in the attr
+    // SST. A Float query value that is numerically equal must still match, exactly
+    // as the unindexed full-scan path does — the candidate generation may not be
+    // type-strict where the recheck coerces.
+    let dir = tempfile::tempdir().unwrap();
+    let ns = Namespace::create(store(&dir), "docs").await.unwrap();
+    ns.upsert(doc(1, "alpha", 10, &["search"], [1.0, 0.0]))
+        .await
+        .unwrap();
+    ns.upsert(doc(2, "beta", 25, &["search"], [2.0, 0.0]))
+        .await
+        .unwrap();
+    indexer::flush(&ns).await.unwrap();
+
+    let result = ns
+        .query(Query {
+            filter: Some(FilterExpr::Eq {
+                column: "score".into(),
+                value: Value::Float(10.0),
+            }),
+            order_by: None,
+            limit: None,
+            aggregates: vec![Aggregate::Count],
+            exact_vector: None,
+            approx_vector: None,
+        })
+        .await
+        .unwrap();
+
+    let ids: Vec<Id> = result.rows.into_iter().map(|row| row.id).collect();
+    assert_eq!(ids, vec![Id::U64(1)]);
+}
+
+#[tokio::test]
+async fn approx_vector_query_honors_limit_below_k() {
+    let dir = tempfile::tempdir().unwrap();
+    let ns = Namespace::create(store(&dir), "docs").await.unwrap();
+    for (id, x) in [(1, 0.1), (2, 0.2), (3, 1.0), (4, 2.0)] {
+        ns.upsert(doc(id, &format!("doc-{id}"), id as i64, &["v"], [x, 0.0]))
+            .await
+            .unwrap();
+    }
+    indexer::flush(&ns).await.unwrap();
+
+    let ann = ns
+        .query(Query {
+            filter: None,
+            order_by: None,
+            limit: Some(2),
+            aggregates: Vec::new(),
+            exact_vector: None,
+            approx_vector: Some(ApproxVectorQuery {
+                column: "embedding".into(),
+                vector: vec![0.0, 0.0],
+                k: 4,
+                probes: Some(16),
+                metric: Some(DistanceMetric::L2),
+            }),
+        })
+        .await
+        .unwrap();
+
+    let ids: Vec<Id> = ann.rows.iter().map(|row| row.id.clone()).collect();
+    assert_eq!(ids, vec![Id::U64(1), Id::U64(2)]);
+}
+
+#[tokio::test]
 async fn ann_vector_query_matches_exact_with_full_probes() {
     let dir = tempfile::tempdir().unwrap();
     let ns = Namespace::create(store(&dir), "docs").await.unwrap();
