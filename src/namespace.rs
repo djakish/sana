@@ -16,7 +16,7 @@
 //! check. Cross-process append safety needs S3/GCS conditional writes plus
 //! crash-orphan handling, same caveat as the filesystem object store (D4).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -245,6 +245,55 @@ impl Namespace {
             }
         }
         Ok(None)
+    }
+
+    /// Resolve a set of ids against a known manifest snapshot plus an
+    /// already-read WAL overlay, in a single pass: each doc SST object is loaded
+    /// once (not once per id), point-get newest-first, then the overlay is
+    /// applied for the requested ids. Returns only present documents.
+    ///
+    /// This is the batched counterpart to [`lookup`]: a filtered query that
+    /// matched N candidate ids would otherwise call `lookup` N times, and each
+    /// `lookup` re-reads the manifest, the commit cursor, every doc SST, and the
+    /// overlay — O(N) round trips for data the caller already holds.
+    ///
+    /// [`lookup`]: Self::lookup
+    pub(crate) async fn resolve_ids(
+        &self,
+        manifest: &NamespaceManifest,
+        overlay: &[WalOp],
+        ids: &BTreeSet<Id>,
+    ) -> Result<BTreeMap<Id, Document>> {
+        let mut readers = Vec::with_capacity(manifest.doc_ssts.len());
+        for meta in &manifest.doc_ssts {
+            readers.push((meta, self.load_sst(&meta.key).await?));
+        }
+
+        let mut docs: BTreeMap<Id, Document> = BTreeMap::new();
+        for id in ids {
+            let key = encode_id(id);
+            for (meta, reader) in &readers {
+                if let (Some(min), Some(max)) = (&meta.min_id, &meta.max_id)
+                    && (id < min || id > max)
+                {
+                    continue;
+                }
+                if let Some(value) = reader.get(&key)? {
+                    // Newest-first wins; a tombstone resolves to "absent".
+                    if let DocRecord::Present(doc) = DocRecord::decode(&value)? {
+                        docs.insert(id.clone(), doc);
+                    }
+                    break;
+                }
+            }
+        }
+
+        for op in overlay {
+            if ids.contains(op_id(op)) {
+                apply_op(&mut docs, op.clone());
+            }
+        }
+        Ok(docs)
     }
 
     /// Load the current manifest body via the pointer.

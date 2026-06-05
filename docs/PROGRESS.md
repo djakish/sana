@@ -16,7 +16,7 @@ the next unchecked task under "Current milestone" / "Next up".
 - **Done:** Stage 0 (Skeleton), Stage 1 (Durable Documents), Stage 2 (SST/LSM),
   Stage 3 (Attributes & Exact Search), Stage 4 (ANN v0), Stage 5 (Native
   Filtering), Stage 6 (SPFresh local rebuild).
-- **Tests:** `cargo test` green (86 tests); `cargo clippy --all-targets` clean.
+- **Tests:** `cargo test` green (87 tests); `cargo clippy --all-targets` clean.
 - **Note:** post-Stage-2 and Stage-3–5 code-review fixes applied; remaining
   findings tracked under "Stage 2 — code review follow-ups" and "Stages 3–5 —
   code review follow-ups".
@@ -234,6 +234,10 @@ Known limitations to improve later:
 - Query execution still materializes candidate documents for predicate recheck,
   ordering, aggregates, and exact kNN. This is acceptable for Stage 3; later
   stages should push more work into index families and vector postings.
+  (Update: the O(candidates) *round trips* this caused are fixed — candidate
+  resolution now reads each SST once via `Namespace::resolve_ids`; see "Stages
+  3–5 — code review follow-ups". The remaining work is pushing predicate/agg
+  evaluation into the index families themselves.)
 - The CLI query accepts the internal serde JSON shape for `Query`; a polished
   public HTTP/API shape is still future work.
 
@@ -398,6 +402,19 @@ A high-recall review of the Stage 3–5 diff (`462f44b..HEAD`) ran after it land
 - Added `VectorIndex::cluster_row_counts()` to collapse five copies of the
   per-cluster row-count iterator.
 
+**Follow-up fixed later (Stage 3 limitation — query materialization round trips):**
+
+- **Per-id `ns.lookup` in the query path eliminated.** `materialize_candidates`
+  and `execute_ann_vector` resolved each matched id with its own `ns.lookup`,
+  and every `lookup` re-read the manifest pointer + body, the commit cursor,
+  the doc SSTs, and the overlay — O(candidates) round trips for data already in
+  hand. Added `Namespace::resolve_ids(manifest, overlay, ids)`, which loads each
+  doc SST once, point-gets the candidates newest-first, and applies the
+  already-read overlay. A `CountingStore` test asserts the read count no longer
+  scales with candidate count: a 20-row filtered query dropped from **84 object
+  reads to a handful**. Behavior is unchanged (all prior query tests pass);
+  `Namespace::lookup` stays for single-key access.
+
 **Reviewed and intentionally left as-is (design, not bugs):**
 
 - **Per-query `metric` override on ANN.** Inference always yields `Cosine`, and
@@ -406,10 +423,6 @@ A high-recall review of the Stage 3–5 diff (`462f44b..HEAD`) ran after it land
   but this is the intended "cluster once, rerank at query time" compromise; the
   recall endpoint exists to measure it. Real fix is column-level metric at
   create time (future).
-- **Per-id `ns.lookup` in `materialize_candidates` / `execute_ann_vector`.** Each
-  lookup reloads the manifest and re-reads SSTs — O(candidates) round trips.
-  Real efficiency win available (one `sst_records` pass + overlay), but it is a
-  read-path refactor that deserves its own focused change + tests.
 - **`vector_index_generations` and `wal_commit_cursor` are write-only** —
   derivable/dead. Removing them touches the manifest schema; left with this note.
 - `approx_logical_bytes` over-counts retained doc SSTs after repeated flushes

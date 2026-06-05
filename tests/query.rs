@@ -1,9 +1,12 @@
+use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use sana::error::Error;
 use sana::namespace::Namespace;
-use sana::object_store::{FsObjectStore, ObjectStore};
+use sana::object_store::{FsObjectStore, GetResult, ObjectMeta, ObjectStore, ObjectVersion};
 use sana::query::{
     Aggregate, AggregateResult, ApproxVectorQuery, ExactVectorQuery, FilterExpr, OrderBy,
     OrderTarget, Query, RangeBound, RecallRequest, SortDirection,
@@ -17,6 +20,68 @@ use tempfile::TempDir;
 
 fn store(dir: &TempDir) -> Arc<dyn ObjectStore> {
     Arc::new(FsObjectStore::new(dir.path()))
+}
+
+/// Test-only `ObjectStore` decorator that counts object reads (`get`/`get_range`)
+/// so a test can assert the query path's round-trip count, not just its output.
+struct CountingStore {
+    inner: Arc<dyn ObjectStore>,
+    gets: AtomicUsize,
+}
+
+impl CountingStore {
+    fn new(inner: Arc<dyn ObjectStore>) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            gets: AtomicUsize::new(0),
+        })
+    }
+
+    fn gets(&self) -> usize {
+        self.gets.load(AtomicOrdering::Relaxed)
+    }
+
+    fn reset(&self) {
+        self.gets.store(0, AtomicOrdering::Relaxed);
+    }
+}
+
+#[async_trait]
+impl ObjectStore for CountingStore {
+    async fn get(&self, key: &str) -> sana::Result<GetResult> {
+        self.gets.fetch_add(1, AtomicOrdering::Relaxed);
+        self.inner.get(key).await
+    }
+
+    async fn get_range(&self, key: &str, range: Range<u64>) -> sana::Result<Bytes> {
+        self.gets.fetch_add(1, AtomicOrdering::Relaxed);
+        self.inner.get_range(key, range).await
+    }
+
+    async fn put(&self, key: &str, bytes: Bytes) -> sana::Result<ObjectVersion> {
+        self.inner.put(key, bytes).await
+    }
+
+    async fn put_if_absent(&self, key: &str, bytes: Bytes) -> sana::Result<ObjectVersion> {
+        self.inner.put_if_absent(key, bytes).await
+    }
+
+    async fn compare_and_set(
+        &self,
+        key: &str,
+        expected: ObjectVersion,
+        bytes: Bytes,
+    ) -> sana::Result<ObjectVersion> {
+        self.inner.compare_and_set(key, expected, bytes).await
+    }
+
+    async fn list(&self, prefix: &str) -> sana::Result<Vec<ObjectMeta>> {
+        self.inner.list(prefix).await
+    }
+
+    async fn delete(&self, key: &str) -> sana::Result<()> {
+        self.inner.delete(key).await
+    }
 }
 
 fn doc(id: u64, title: &str, score: i64, tags: &[&str], vector: [f32; 2]) -> Document {
@@ -336,6 +401,46 @@ async fn approx_vector_query_honors_limit_below_k() {
 
     let ids: Vec<Id> = ann.rows.iter().map(|row| row.id.clone()).collect();
     assert_eq!(ids, vec![Id::U64(1), Id::U64(2)]);
+}
+
+#[tokio::test]
+async fn filtered_query_resolution_does_not_scale_with_candidate_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let counting = CountingStore::new(store(&dir));
+    let ns = Namespace::create(counting.clone(), "docs").await.unwrap();
+    let n: u64 = 20;
+    for id in 1..=n {
+        ns.upsert(doc(id, &format!("doc-{id}"), id as i64, &["keep"], [id as f32, 0.0]))
+            .await
+            .unwrap();
+    }
+    indexer::flush(&ns).await.unwrap();
+
+    // Measure only the query: candidate resolution should read each SST once,
+    // not run a full lookup (manifest + cursor + SSTs + overlay) per matched id.
+    counting.reset();
+    let result = ns
+        .query(Query {
+            filter: Some(FilterExpr::Eq {
+                column: "tags".into(),
+                value: Value::String("keep".into()),
+            }),
+            order_by: None,
+            limit: None,
+            aggregates: vec![Aggregate::Count],
+            exact_vector: None,
+            approx_vector: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(result.rows.len(), n as usize);
+    assert_eq!(result.aggregates, vec![AggregateResult::Count(n)]);
+    let gets = counting.gets();
+    assert!(
+        gets < n as usize,
+        "resolution issued {gets} object reads for {n} candidates; should not scale with candidate count"
+    );
 }
 
 #[tokio::test]

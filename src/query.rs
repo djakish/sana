@@ -463,40 +463,44 @@ async fn execute_ann_vector(
     }
 
     let commit = ns.commit_cursor().await?;
-    let mut touched = BTreeSet::new();
-    for op in ns.read_overlay_ops(manifest.indexed_cursor, commit).await? {
-        touched.insert(op_id(&op).clone());
-    }
+    let overlay = ns.read_overlay_ops(manifest.indexed_cursor, commit).await?;
+    let touched: BTreeSet<Id> = overlay.iter().map(|op| op_id(op).clone()).collect();
+
+    // The documents we need: live ANN hits (not superseded by the overlay) plus
+    // every overlay-touched id, resolved in one SST pass rather than per id.
+    let live_hits: Vec<_> = ann_hits
+        .into_iter()
+        .filter(|hit| !touched.contains(&hit.id))
+        .filter(|hit| {
+            version_map
+                .as_ref()
+                .is_none_or(|versions| versions.is_live(&hit.id, hit.version))
+        })
+        .collect();
+    let mut needed: BTreeSet<Id> = live_hits.iter().map(|hit| hit.id.clone()).collect();
+    needed.extend(touched.iter().cloned());
+    let resolved = ns.resolve_ids(manifest, &overlay, &needed).await?;
 
     let mut rows = Vec::new();
-    for hit in ann_hits {
-        if touched.contains(&hit.id) {
-            continue;
-        }
-        if version_map
-            .as_ref()
-            .is_some_and(|versions| !versions.is_live(&hit.id, hit.version))
-        {
-            continue;
-        }
-        let Some(document) = ns.lookup(&hit.id).await? else {
+    for hit in live_hits {
+        let Some(document) = resolved.get(&hit.id) else {
             continue;
         };
-        if !matches_filter(filter, &document)? {
+        if !matches_filter(filter, document)? {
             continue;
         }
         rows.push(QueryRow {
             id: hit.id,
-            document,
+            document: document.clone(),
             score: Some(hit.score),
         });
     }
 
     for id in touched {
-        let Some(document) = ns.lookup(&id).await? else {
+        let Some(document) = resolved.get(&id) else {
             continue;
         };
-        if !matches_filter(filter, &document)? {
+        if !matches_filter(filter, document)? {
             continue;
         }
         let Some(vector) = document.vectors.get(&query.column) else {
@@ -513,7 +517,7 @@ async fn execute_ann_vector(
         }
         rows.push(QueryRow {
             id,
-            document,
+            document: document.clone(),
             score: Some(vector::score(&query.vector, &values, metric)?),
         });
     }
@@ -596,19 +600,24 @@ async fn materialize_candidates(
         && let Some(mut ids) = indexed_filter_candidate_ids(ns, manifest, filter).await?
     {
         let commit = ns.commit_cursor().await?;
-        for op in ns.read_overlay_ops(manifest.indexed_cursor, commit).await? {
-            ids.insert(op_id(&op).clone());
+        let overlay = ns.read_overlay_ops(manifest.indexed_cursor, commit).await?;
+        for op in &overlay {
+            ids.insert(op_id(op).clone());
         }
 
+        // Resolve every candidate in one pass (each doc SST read once) instead of
+        // one `ns.lookup` per id, which would re-read the manifest, cursor, SSTs,
+        // and overlay for each candidate.
+        let resolved = ns.resolve_ids(manifest, &overlay, &ids).await?;
         let mut rows = Vec::new();
         for id in ids {
-            let Some(document) = ns.lookup(&id).await? else {
+            let Some(document) = resolved.get(&id) else {
                 continue;
             };
-            if filter_matches(filter, &document)? {
+            if filter_matches(filter, document)? {
                 rows.push(QueryRow {
                     id,
-                    document,
+                    document: document.clone(),
                     score: None,
                 });
             }
