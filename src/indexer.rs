@@ -81,10 +81,11 @@ async fn publish_vector_indexes(
             entries.push(VectorEntry {
                 id: id.clone(),
                 vector: vector_to_f32(vector),
+                local_id: 0,
             });
         }
 
-        let Some(index) = VectorIndex::build(column.clone(), metric, dim, entries)? else {
+        let Some(index) = VectorIndex::build(column.clone(), metric, dim, entries, docs)? else {
             continue;
         };
         let bytes = index.encode()?;

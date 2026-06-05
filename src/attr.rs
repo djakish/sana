@@ -154,7 +154,7 @@ fn attr_column_prefix(column: &str) -> Vec<u8> {
     key
 }
 
-fn indexable_values(value: &Value) -> Result<Vec<&Value>> {
+pub(crate) fn indexable_values(value: &Value) -> Result<Vec<&Value>> {
     match value {
         Value::Null => Ok(Vec::new()),
         Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::String(_) => Ok(vec![value]),
@@ -178,6 +178,15 @@ fn can_encode_scalar(value: &Value) -> bool {
         value,
         Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::String(_)
     )
+}
+
+pub(crate) fn scalar_key(value: &Value) -> Result<Option<Vec<u8>>> {
+    if !can_encode_scalar(value) {
+        return Ok(None);
+    }
+    let mut key = Vec::new();
+    encode_scalar_value(value, &mut key)?;
+    Ok(Some(key))
 }
 
 fn encode_scalar_value(value: &Value, out: &mut Vec<u8>) -> Result<()> {

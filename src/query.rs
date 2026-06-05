@@ -18,7 +18,7 @@ use crate::manifest::NamespaceManifest;
 use crate::namespace::{Namespace, op_id};
 use crate::schema::{ColumnType, DistanceMetric};
 use crate::value::{Document, Id, Value, VectorValue};
-use crate::vector::{self, VectorIndex};
+use crate::vector::{self, VectorFilterMask, VectorIndex};
 
 const DEFAULT_RECALL_NUM: usize = 25;
 const DEFAULT_RECALL_TOP_K: usize = 10;
@@ -214,11 +214,10 @@ pub async fn execute(ns: &Namespace, query: Query) -> Result<QueryResult> {
     }
 
     if let Some(ann_query) = &query.approx_vector
-        && query.filter.is_none()
         && query.order_by.is_none()
         && query.aggregates.is_empty()
     {
-        return execute_ann_vector(ns, &manifest, ann_query).await;
+        return execute_ann_vector(ns, &manifest, ann_query, query.filter.as_ref()).await;
     }
 
     let mut candidates = materialize_candidates(ns, &manifest, query.filter.as_ref()).await?;
@@ -286,12 +285,6 @@ pub async fn recall(ns: &Namespace, request: RecallRequest) -> Result<RecallResu
             "recall top_k must be greater than zero".into(),
         ));
     }
-    if request.filter.is_some() {
-        return Err(Error::InvalidQuery(
-            "filtered recall requires native filtered ANN (Stage 5)".into(),
-        ));
-    }
-
     let manifest = ns.load_manifest().await?;
     let column = match request.column.clone() {
         Some(column) => column,
@@ -314,7 +307,17 @@ pub async fn recall(ns: &Namespace, request: RecallRequest) -> Result<RecallResu
 
     let (dim, default_metric) = vector_column_schema(&manifest, &column)?;
     let metric = request.metric.unwrap_or(default_metric);
-    let mut candidates = recall_candidates(ns, &column, dim).await?;
+    if let Some(filter) = &request.filter {
+        let meta = manifest.vector_indexes.get(&column).expect("checked above");
+        let index = VectorIndex::decode(&ns.store().get(&meta.key).await?.bytes)?;
+        if native_filter_mask(&index, filter)?.is_none() {
+            return Err(Error::InvalidQuery(
+                "filtered recall requires a natively supported scalar filter".into(),
+            ));
+        }
+    }
+
+    let mut candidates = recall_candidates(ns, &column, dim, request.filter.as_ref()).await?;
     if candidates.is_empty() {
         return Err(Error::InvalidQuery(format!(
             "recall column '{column}' has no stored vectors"
@@ -333,7 +336,7 @@ pub async fn recall(ns: &Namespace, request: RecallRequest) -> Result<RecallResu
         let exact = execute(
             ns,
             Query {
-                filter: None,
+                filter: request.filter.clone(),
                 order_by: None,
                 limit: None,
                 aggregates: Vec::new(),
@@ -350,7 +353,7 @@ pub async fn recall(ns: &Namespace, request: RecallRequest) -> Result<RecallResu
         let ann = execute(
             ns,
             Query {
-                filter: None,
+                filter: request.filter.clone(),
                 order_by: None,
                 limit: None,
                 aggregates: Vec::new(),
@@ -401,6 +404,7 @@ async fn execute_ann_vector(
     ns: &Namespace,
     manifest: &NamespaceManifest,
     query: &ApproxVectorQuery,
+    filter: Option<&FilterExpr>,
 ) -> Result<QueryResult> {
     let exact_query = ExactVectorQuery {
         column: query.column.clone(),
@@ -419,20 +423,35 @@ async fn execute_ann_vector(
     let metric = query.metric.unwrap_or(default_metric);
 
     let Some(meta) = manifest.vector_indexes.get(&query.column) else {
-        let mut candidates = materialize_candidates(ns, manifest, None).await?;
-        score_vectors(&mut candidates, &exact_query, metric, dim)?;
-        candidates.retain(|row| row.score.is_some());
-        candidates.sort_by(compare_score_rows);
-        candidates.truncate(query.k);
-        return Ok(QueryResult {
-            rows: candidates,
-            aggregates: Vec::new(),
-        });
+        return exact_vector_fallback(ns, manifest, filter, &exact_query, metric, dim).await;
     };
 
     let index_bytes = ns.store().get(&meta.key).await?.bytes;
     let index = VectorIndex::decode(&index_bytes)?;
-    let ann_hits = index.search(&query.vector, query.k, query.probes, Some(metric))?;
+    let native_filter = match filter {
+        Some(filter) => match native_filter_mask(&index, filter)? {
+            Some(mask) => Some(mask),
+            None => {
+                return exact_vector_fallback(
+                    ns,
+                    manifest,
+                    Some(filter),
+                    &exact_query,
+                    metric,
+                    dim,
+                )
+                .await;
+            }
+        },
+        None => None,
+    };
+    let ann_hits = index.search_with_filter(
+        &query.vector,
+        query.k,
+        query.probes,
+        Some(metric),
+        native_filter.as_ref(),
+    )?;
 
     let commit = ns.commit_cursor().await?;
     let mut touched = BTreeSet::new();
@@ -445,19 +464,26 @@ async fn execute_ann_vector(
         if touched.contains(&hit.id) {
             continue;
         }
-        if let Some(document) = ns.lookup(&hit.id).await? {
-            rows.push(QueryRow {
-                id: hit.id,
-                document,
-                score: Some(hit.score),
-            });
+        let Some(document) = ns.lookup(&hit.id).await? else {
+            continue;
+        };
+        if !matches_filter(filter, &document)? {
+            continue;
         }
+        rows.push(QueryRow {
+            id: hit.id,
+            document,
+            score: Some(hit.score),
+        });
     }
 
     for id in touched {
         let Some(document) = ns.lookup(&id).await? else {
             continue;
         };
+        if !matches_filter(filter, &document)? {
+            continue;
+        }
         let Some(vector) = document.vectors.get(&query.column) else {
             continue;
         };
@@ -481,6 +507,25 @@ async fn execute_ann_vector(
     rows.truncate(query.k);
     Ok(QueryResult {
         rows,
+        aggregates: Vec::new(),
+    })
+}
+
+async fn exact_vector_fallback(
+    ns: &Namespace,
+    manifest: &NamespaceManifest,
+    filter: Option<&FilterExpr>,
+    exact_query: &ExactVectorQuery,
+    metric: DistanceMetric,
+    dim: usize,
+) -> Result<QueryResult> {
+    let mut candidates = materialize_candidates(ns, manifest, filter).await?;
+    score_vectors(&mut candidates, exact_query, metric, dim)?;
+    candidates.retain(|row| row.score.is_some());
+    candidates.sort_by(compare_score_rows);
+    candidates.truncate(exact_query.k);
+    Ok(QueryResult {
+        rows: candidates,
         aggregates: Vec::new(),
     })
 }
@@ -851,10 +896,14 @@ async fn recall_candidates(
     ns: &Namespace,
     column: &str,
     dim: usize,
+    filter: Option<&FilterExpr>,
 ) -> Result<Vec<RecallCandidate>> {
     let docs = ns.replay().await?;
     let mut out = Vec::new();
     for (id, document) in docs {
+        if !matches_filter(filter, &document)? {
+            continue;
+        }
         let Some(vector) = document.vectors.get(column) else {
             continue;
         };
@@ -869,6 +918,64 @@ async fn recall_candidates(
         out.push(RecallCandidate { id, vector: values });
     }
     Ok(out)
+}
+
+fn native_filter_mask(
+    index: &VectorIndex,
+    filter: &FilterExpr,
+) -> Result<Option<VectorFilterMask>> {
+    match filter {
+        FilterExpr::Eq { column, value } => {
+            if matches!(value, Value::Array(_)) {
+                return Ok(None);
+            }
+            Ok(index.filter_mask_by_value(column, |actual| eq_filter_value(actual, value)))
+        }
+        FilterExpr::Range {
+            column,
+            lower,
+            upper,
+        } => {
+            if lower
+                .as_ref()
+                .is_some_and(|bound| !is_sortable_value(bound.value()))
+                || upper
+                    .as_ref()
+                    .is_some_and(|bound| !is_sortable_value(bound.value()))
+            {
+                return Ok(None);
+            }
+            Ok(index.filter_mask_by_value(column, |actual| {
+                range_filter_value(actual, lower.as_ref(), upper.as_ref())
+            }))
+        }
+        FilterExpr::And(filters) => {
+            let mut out = index.all_filter_mask();
+            for filter in filters {
+                let Some(mask) = native_filter_mask(index, filter)? else {
+                    return Ok(None);
+                };
+                out = out.and(&mask);
+            }
+            Ok(Some(out))
+        }
+        FilterExpr::Or(filters) => {
+            let mut out = index.empty_filter_mask();
+            for filter in filters {
+                let Some(mask) = native_filter_mask(index, filter)? else {
+                    return Ok(None);
+                };
+                out = out.or(&mask);
+            }
+            Ok(Some(out))
+        }
+        FilterExpr::Not(filter) => {
+            let Some(mask) = native_filter_mask(index, filter)? else {
+                return Ok(None);
+            };
+            Ok(Some(mask.not()))
+        }
+    }
 }
 
 fn stable_sample_key(id: &Id, column: &str) -> u64 {

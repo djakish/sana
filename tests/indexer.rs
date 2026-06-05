@@ -4,7 +4,9 @@ use std::sync::Arc;
 use sana::indexer;
 use sana::namespace::Namespace;
 use sana::object_store::{FsObjectStore, ObjectStore};
+use sana::schema::DistanceMetric;
 use sana::value::{Document, Id, Value, VectorValue};
+use sana::vector::VectorIndex;
 use sana::wal::WalOp;
 use tempfile::TempDir;
 
@@ -71,7 +73,10 @@ async fn flush_moves_overlay_into_sst() {
 #[tokio::test]
 async fn flush_publishes_vector_indexes() {
     let dir = tempfile::tempdir().unwrap();
-    let ns = Namespace::create(store(&dir), "docs").await.unwrap();
+    let object_store = store(&dir);
+    let ns = Namespace::create(object_store.clone(), "docs")
+        .await
+        .unwrap();
     ns.upsert(doc_with_vector(1, "alpha", 10, [1.0, 0.0]))
         .await
         .unwrap();
@@ -91,6 +96,32 @@ async fn flush_publishes_vector_indexes() {
         manifest.generation
     );
     assert_eq!(manifest.approx_logical_bytes, indexed_bytes(&manifest));
+
+    let index = VectorIndex::decode(&object_store.get(&meta.key).await.unwrap().bytes).unwrap();
+    assert_eq!(index.addresses.len(), 2);
+    assert!(
+        index
+            .addresses
+            .iter()
+            .any(|addr| addr.id == Id::U64(1) && addr.local_id == 0)
+    );
+    assert!(index.filter_index.columns.contains_key("title"));
+    assert!(index.filter_index.columns.contains_key("score"));
+
+    let mask = index
+        .filter_mask_by_value("title", |value| value == &Value::String("alpha".into()))
+        .unwrap();
+    let hits = index
+        .search_with_filter(
+            &[0.0, 0.0],
+            2,
+            Some(16),
+            Some(DistanceMetric::L2),
+            Some(&mask),
+        )
+        .unwrap();
+    let ids: Vec<Id> = hits.into_iter().map(|hit| hit.id).collect();
+    assert_eq!(ids, vec![Id::U64(1)]);
 }
 
 #[tokio::test]

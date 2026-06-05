@@ -11,12 +11,13 @@ the next unchecked task under "Current milestone" / "Next up".
 
 ## Status snapshot
 
-- **Current stage:** Stage 5 (Native Filtering) — **in progress**.
-- **Next up:** Cluster-level attribute summaries, row-level local-ID bitmaps,
-  and filter-aware ANN traversal.
+- **Current stage:** Stage 6 (SPFresh local rebuild) — **in progress**.
+- **Next up:** Mutable vector posting append, version map, and stale-vector
+  handling before split/merge/reassign jobs.
 - **Done:** Stage 0 (Skeleton), Stage 1 (Durable Documents), Stage 2 (SST/LSM),
-  Stage 3 (Attributes & Exact Search), Stage 4 (ANN v0).
-- **Tests:** `cargo test` green (72 tests); `cargo clippy --all-targets` clean.
+  Stage 3 (Attributes & Exact Search), Stage 4 (ANN v0), Stage 5 (Native
+  Filtering).
+- **Tests:** `cargo test` green (75 tests); `cargo clippy --all-targets` clean.
 - **Note:** post-Stage-2 code-review fixes applied (efficiency + stats +
   dedup + manifest publish safety); remaining findings tracked under
   "Stage 2 — code review follow-ups".
@@ -39,7 +40,7 @@ the next unchecked task under "Current milestone" / "Next up".
       exact vector kNN over filtered candidates.
 - [x] **Stage 4 — ANN v0.** KMeans/IVF per column, immutable vector postings,
       probe + scan + rerank, recall endpoint.
-- [ ] **Stage 5 — Native filtering.** Cluster-level summaries, row-level
+- [x] **Stage 5 — Native filtering.** Cluster-level summaries, row-level
       bitmaps, filter-aware ANN traversal, filtered recall.
 - [ ] **Stage 6 — SPFresh local rebuild.** Mutable posting append, version map,
       split/merge/reassign background jobs.
@@ -293,10 +294,9 @@ Known limitations to improve later:
 - IVF files are full-snapshot rebuilds, not incremental vector postings.
 - The current index stores full f32 vectors in postings; f16 storage,
   contiguous vector blocks, quantization, and SIMD kernels are later stages.
-- Filtering with ANN currently falls back to exact filtered kNN, and the recall
-  endpoint rejects filtered recall to avoid reporting a misleading perfect score
-  before native filtering exists. Stage 5 should make attribute filters
-  cluster-aware and then enable filtered recall measurement.
+- Filtering with ANN and filtered recall were intentionally deferred to Stage 5
+  so the first ANN version could land with unfiltered semantics and overlay
+  correctness first.
 
 Stage 4 decisions / notes so far:
 
@@ -317,21 +317,21 @@ Stage 4 decisions / notes so far:
 
 ---
 
-## Current milestone: Stage 5 — Native Filtering
+## Stage 5 — Native Filtering (done)
 
 Goal: make attribute filtering cooperate with vector clustering instead of
 falling back to exact pre-filtered kNN or post-filtering ANN results.
 
 Planned tasks:
 
-- [ ] Persist vector addresses: `{cluster_id, local_id, row_id}` for each
+- [x] Persist vector addresses: `{cluster_id, local_id, row_id}` for each
       indexed vector entry so attribute indexes can point into vector postings.
-- [ ] Add cluster-level attribute summaries for equality/range-friendly
+- [x] Add cluster-level attribute summaries for equality/range-friendly
       filters, first as full-snapshot metadata tied to the current IVF index.
-- [ ] Add row-level local-ID bitmaps per attribute value and cluster.
-- [ ] Compile filters into cluster masks and posting-local row masks.
-- [ ] Make ANN traversal use cluster masks before probing/scanning postings.
-- [ ] Enable filtered recall in `Namespace::recall` and add tests that catch
+- [x] Add row-level local-ID bitmaps per attribute value and cluster.
+- [x] Compile filters into cluster masks and posting-local row masks.
+- [x] Make ANN traversal use cluster masks before probing/scanning postings.
+- [x] Enable filtered recall in `Namespace::recall` and add tests that catch
       pre-filter/post-filter recall failures.
 
 Known limitations to improve later:
@@ -340,6 +340,48 @@ Known limitations to improve later:
   generation; incremental maintenance belongs with Stage 6 SPFresh updates.
 - Bitmap compression can start simple. Roaring/bitpacking and block-level range
   summaries can follow once the semantics are correct.
+- Native filter metadata is embedded in the full-snapshot IVF object for now.
+  That keeps cold reads to one vector object and avoids a separate filter family
+  until vector postings become incremental.
+- Exact array-equality filters remain outside the native mask compiler; normal
+  queries fall back to exact filtered kNN for unsupported filters, and recall
+  requires native support.
+
+Stage 5 decisions / notes so far:
+
+- **D29 — Native filtering rides with the IVF object for v0.** Vector entries
+  now persist `{cluster_id, local_id, row_id}` addresses plus attribute-derived
+  cluster summaries and row bitmaps in the immutable IVF object. This avoids an
+  extra object-store round trip while the vector index is still full-snapshot.
+- **D30 — Query owns filter semantics, vector owns bitmaps.** `query.rs`
+  compiles `FilterExpr` into `VectorFilterMask` using the same Eq/Range/And/Or/
+  Not semantics used for exact filtering. `vector.rs` exposes bitmap union,
+  intersection, complement, and masked posting scans without depending on query
+  types.
+- **D31 — Filtered recall must be native.** Ordinary filtered ANN queries can
+  fall back to exact filtered kNN for unsupported filters, preserving
+  correctness. The recall endpoint rejects unsupported filters so it cannot
+  report perfect recall from an exact fallback path.
+
+---
+
+## Current milestone: Stage 6 — SPFresh Local Rebuild
+
+Goal: move from full-snapshot vector rebuilds to SPFresh-style local updates:
+append new vectors into nearby postings, drop stale versions at query time, and
+rebalance postings with background split/merge/reassign work.
+
+Planned tasks:
+
+- [ ] Add versioned vector entries and a vector version map keyed by document id
+      and vector column.
+- [ ] Add mutable posting append objects for new vectors instead of rebuilding
+      the whole IVF object on every flush.
+- [ ] Make ANN drop stale/deleted vector versions using the version map.
+- [ ] Add posting-level split/merge thresholds and local rebuild planning.
+- [ ] Implement bounded-neighborhood reassignment after split/merge.
+- [ ] Add tests for insert/delete churn preserving recall without global
+      rebuild.
 
 ---
 
@@ -401,8 +443,8 @@ src/
   sst.rs                 generic sorted-string-table writer/reader
   doc.rs                 Id key encoding (order-preserving) + DocRecord
   attr.rs                attribute postings SST encoding/query helpers
-  query.rs               logical query types + exact/ANN execution + recall
-  vector.rs              IVF vector index, distance scoring, recall helper
+  query.rs               logical query types + exact/ANN/native filtering + recall
+  vector.rs              IVF vector index, native filter bitmaps, recall helper
   namespace.rs           Namespace: create/append + SST-aware replay/lookup
   indexer.rs             flush/compaction + attr/vector index publication
 tests/
@@ -415,6 +457,6 @@ tests/
   namespace.rs           namespace lifecycle + durability across reopen
   indexer.rs             flush/compaction + SST+overlay merge semantics
   schema.rs              write-time schema inference/validation
-  query.rs               filters, ordering, aggregation, exact kNN, ANN v0, recall
+  query.rs               filters, ordering, aggregation, exact kNN, ANN, recall
   fixtures/              committed golden snapshots
 ```

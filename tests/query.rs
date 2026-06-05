@@ -368,6 +368,100 @@ async fn ann_vector_query_rechecks_wal_overlay() {
 }
 
 #[tokio::test]
+async fn ann_vector_query_uses_native_filtering_to_probe_matching_clusters() {
+    let dir = tempfile::tempdir().unwrap();
+    let ns = Namespace::create(store(&dir), "docs").await.unwrap();
+    for (id, color, x) in [
+        (1, "blue", 0.1),
+        (2, "blue", 0.2),
+        (3, "blue", 0.3),
+        (4, "red", 10.0),
+        (5, "red", 10.1),
+        (6, "green", 20.0),
+    ] {
+        ns.upsert(doc(
+            id,
+            &format!("{color}-{id}"),
+            id as i64,
+            &[color],
+            [x, 0.0],
+        ))
+        .await
+        .unwrap();
+    }
+    indexer::flush(&ns).await.unwrap();
+
+    let ann = ns
+        .query(Query {
+            filter: Some(FilterExpr::Eq {
+                column: "tags".into(),
+                value: Value::String("red".into()),
+            }),
+            order_by: None,
+            limit: None,
+            aggregates: Vec::new(),
+            exact_vector: None,
+            approx_vector: Some(ApproxVectorQuery {
+                column: "embedding".into(),
+                vector: vec![0.0, 0.0],
+                k: 2,
+                probes: Some(1),
+                metric: Some(DistanceMetric::L2),
+            }),
+        })
+        .await
+        .unwrap();
+
+    let ids: Vec<Id> = ann.rows.iter().map(|row| row.id.clone()).collect();
+    assert_eq!(ids, vec![Id::U64(4), Id::U64(5)]);
+}
+
+#[tokio::test]
+async fn ann_vector_query_applies_filters_to_wal_overlay() {
+    let dir = tempfile::tempdir().unwrap();
+    let ns = Namespace::create(store(&dir), "docs").await.unwrap();
+    ns.upsert(doc(1, "red-old", 10, &["red"], [10.0, 0.0]))
+        .await
+        .unwrap();
+    ns.upsert(doc(2, "blue", 20, &["blue"], [0.1, 0.0]))
+        .await
+        .unwrap();
+    indexer::flush(&ns).await.unwrap();
+
+    ns.delete(Id::U64(1)).await.unwrap();
+    ns.upsert(doc(3, "red-new", 30, &["red"], [0.05, 0.0]))
+        .await
+        .unwrap();
+    ns.upsert(doc(4, "blue-new", 40, &["blue"], [0.01, 0.0]))
+        .await
+        .unwrap();
+
+    let ann = ns
+        .query(Query {
+            filter: Some(FilterExpr::Eq {
+                column: "tags".into(),
+                value: Value::String("red".into()),
+            }),
+            order_by: None,
+            limit: None,
+            aggregates: Vec::new(),
+            exact_vector: None,
+            approx_vector: Some(ApproxVectorQuery {
+                column: "embedding".into(),
+                vector: vec![0.0, 0.0],
+                k: 2,
+                probes: Some(16),
+                metric: Some(DistanceMetric::L2),
+            }),
+        })
+        .await
+        .unwrap();
+
+    let ids: Vec<Id> = ann.rows.iter().map(|row| row.id.clone()).collect();
+    assert_eq!(ids, vec![Id::U64(3)]);
+}
+
+#[tokio::test]
 async fn recall_reports_perfect_recall_with_full_probes() {
     let dir = tempfile::tempdir().unwrap();
     let ns = Namespace::create(store(&dir), "docs").await.unwrap();
@@ -437,6 +531,54 @@ async fn recall_rechecks_wal_overlay() {
     for sample in &result.samples {
         assert_eq!(sample.exhaustive_ids, sample.ann_ids);
         assert!(!sample.ann_ids.contains(&Id::U64(1)));
+    }
+}
+
+#[tokio::test]
+async fn recall_supports_native_filtered_ann() {
+    let dir = tempfile::tempdir().unwrap();
+    let ns = Namespace::create(store(&dir), "docs").await.unwrap();
+    for (id, color, x) in [
+        (1, "blue", 0.1),
+        (2, "blue", 0.2),
+        (3, "red", 10.0),
+        (4, "red", 10.1),
+        (5, "green", 20.0),
+    ] {
+        ns.upsert(doc(
+            id,
+            &format!("{color}-{id}"),
+            id as i64,
+            &[color],
+            [x, 0.0],
+        ))
+        .await
+        .unwrap();
+    }
+    indexer::flush(&ns).await.unwrap();
+
+    let result = ns
+        .recall(RecallRequest {
+            num: 4,
+            top_k: 2,
+            column: Some("embedding".into()),
+            probes: Some(16),
+            metric: Some(DistanceMetric::L2),
+            filter: Some(FilterExpr::Eq {
+                column: "tags".into(),
+                value: Value::String("red".into()),
+            }),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(result.sampled, 2);
+    assert_eq!(result.avg_recall, 1.0);
+    assert_eq!(result.avg_exhaustive_count, 2.0);
+    assert_eq!(result.avg_ann_count, 2.0);
+    for sample in &result.samples {
+        assert_eq!(sample.exhaustive_ids, sample.ann_ids);
+        assert_eq!(sample.exhaustive_count, 2);
     }
 }
 

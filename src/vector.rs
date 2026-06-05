@@ -5,11 +5,14 @@
 //! as one immutable object, then probe centroids and exact-rerank vectors in the
 //! selected postings at query time.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
+use crate::attr;
 use crate::error::{Error, Result};
 use crate::schema::DistanceMetric;
-use crate::value::{Id, VectorValue};
+use crate::value::{Document, Id, Value, VectorValue};
 
 const VECTOR_MAGIC: &[u8; 8] = b"SANAVEC1";
 const VECTOR_FORMAT_VERSION: u32 = 1;
@@ -25,6 +28,8 @@ pub struct VectorIndex {
     pub metric: DistanceMetric,
     pub centroids: Vec<Vec<f32>>,
     pub postings: Vec<VectorPosting>,
+    pub addresses: Vec<VectorAddress>,
+    pub filter_index: VectorFilterIndex,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -37,6 +42,37 @@ pub struct VectorPosting {
 pub struct VectorEntry {
     pub id: Id,
     pub vector: Vec<f32>,
+    pub local_id: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VectorAddress {
+    pub id: Id,
+    pub cluster_id: u32,
+    pub local_id: u32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct VectorFilterIndex {
+    pub columns: BTreeMap<String, VectorFilterColumn>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct VectorFilterColumn {
+    pub values: Vec<VectorFilterValue>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct VectorFilterValue {
+    pub value: Value,
+    pub clusters: Vec<u32>,
+    pub rows: Vec<VectorFilterRows>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VectorFilterRows {
+    pub cluster_id: u32,
+    pub words: Vec<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -45,12 +81,19 @@ pub struct VectorHit {
     pub score: f32,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VectorFilterMask {
+    row_counts: Vec<usize>,
+    rows: Vec<Vec<u64>>,
+}
+
 impl VectorIndex {
     pub fn build(
         column: impl Into<String>,
         metric: DistanceMetric,
         dim: usize,
         mut entries: Vec<VectorEntry>,
+        docs: &BTreeMap<Id, Document>,
     ) -> Result<Option<Self>> {
         if entries.is_empty() {
             return Ok(None);
@@ -76,9 +119,18 @@ impl VectorIndex {
                 vectors: Vec::new(),
             })
             .collect::<Vec<_>>();
-        for (entry, centroid_id) in entries.into_iter().zip(assignments) {
+        let mut addresses = Vec::new();
+        for (mut entry, centroid_id) in entries.into_iter().zip(assignments) {
+            entry.local_id = postings[centroid_id].vectors.len() as u32;
+            addresses.push(VectorAddress {
+                id: entry.id.clone(),
+                cluster_id: centroid_id as u32,
+                local_id: entry.local_id,
+            });
             postings[centroid_id].vectors.push(entry);
         }
+        addresses.sort_by(|a, b| a.id.cmp(&b.id));
+        let filter_index = VectorFilterIndex::build(&postings, docs)?;
 
         Ok(Some(Self {
             format_version: VECTOR_FORMAT_VERSION,
@@ -87,6 +139,8 @@ impl VectorIndex {
             metric,
             centroids,
             postings,
+            addresses,
+            filter_index,
         }))
     }
 
@@ -142,6 +196,17 @@ impl VectorIndex {
         probes: Option<usize>,
         metric: Option<DistanceMetric>,
     ) -> Result<Vec<VectorHit>> {
+        self.search_with_filter(query, k, probes, metric, None)
+    }
+
+    pub fn search_with_filter(
+        &self,
+        query: &[f32],
+        k: usize,
+        probes: Option<usize>,
+        metric: Option<DistanceMetric>,
+        filter: Option<&VectorFilterMask>,
+    ) -> Result<Vec<VectorHit>> {
         if k == 0 {
             return Err(Error::InvalidQuery(
                 "ANN query k must be greater than zero".into(),
@@ -157,6 +222,7 @@ impl VectorIndex {
             .centroids
             .iter()
             .enumerate()
+            .filter(|(idx, _)| filter.is_none_or(|mask| mask.cluster_has_any(*idx)))
             .map(|(idx, centroid)| Ok((idx, score(query, centroid, metric)?)))
             .collect::<Result<Vec<_>>>()?;
         centroid_scores.sort_by(|a, b| compare_scores(a.1, b.1).then_with(|| a.0.cmp(&b.0)));
@@ -167,6 +233,9 @@ impl VectorIndex {
                 return Err(Error::Corrupt("vector posting id out of bounds".into()));
             };
             for entry in &posting.vectors {
+                if filter.is_some_and(|mask| !mask.allows(centroid_id, entry.local_id as usize)) {
+                    continue;
+                }
                 hits.push(VectorHit {
                     id: entry.id.clone(),
                     score: score(query, &entry.vector, metric)?,
@@ -184,6 +253,248 @@ impl VectorIndex {
             .map(|posting| posting.vectors.len())
             .sum()
     }
+
+    pub fn all_filter_mask(&self) -> VectorFilterMask {
+        VectorFilterMask::all(
+            self.postings
+                .iter()
+                .map(|posting| posting.vectors.len())
+                .collect(),
+        )
+    }
+
+    pub fn empty_filter_mask(&self) -> VectorFilterMask {
+        VectorFilterMask::empty(
+            self.postings
+                .iter()
+                .map(|posting| posting.vectors.len())
+                .collect(),
+        )
+    }
+
+    pub fn filter_mask_by_value<F>(&self, column: &str, mut matches: F) -> Option<VectorFilterMask>
+    where
+        F: FnMut(&Value) -> bool,
+    {
+        let row_counts = self
+            .postings
+            .iter()
+            .map(|posting| posting.vectors.len())
+            .collect::<Vec<_>>();
+        let Some(column) = self.filter_index.columns.get(column) else {
+            return Some(VectorFilterMask::empty(row_counts));
+        };
+
+        let mut mask = VectorFilterMask::empty(row_counts);
+        for value in &column.values {
+            if !matches(&value.value) {
+                continue;
+            }
+            mask.union_value(value);
+        }
+        Some(mask)
+    }
+}
+
+impl VectorFilterIndex {
+    fn build(postings: &[VectorPosting], docs: &BTreeMap<Id, Document>) -> Result<Self> {
+        let row_counts = postings
+            .iter()
+            .map(|posting| posting.vectors.len())
+            .collect::<Vec<_>>();
+        let mut builders: BTreeMap<String, BTreeMap<Vec<u8>, VectorFilterValueBuilder>> =
+            BTreeMap::new();
+
+        for posting in postings {
+            let cluster_id = posting.centroid_id as usize;
+            let Some(row_count) = row_counts.get(cluster_id).copied() else {
+                return Err(Error::Corrupt(
+                    "vector filter cluster id out of bounds".into(),
+                ));
+            };
+            for entry in &posting.vectors {
+                let Some(doc) = docs.get(&entry.id) else {
+                    continue;
+                };
+                for (column, value) in &doc.attributes {
+                    for scalar in attr::indexable_values(value)? {
+                        let Some(key) = attr::scalar_key(scalar)? else {
+                            continue;
+                        };
+                        builders
+                            .entry(column.clone())
+                            .or_default()
+                            .entry(key)
+                            .or_insert_with(|| {
+                                VectorFilterValueBuilder::new(scalar.clone(), &row_counts)
+                            })
+                            .set(cluster_id, entry.local_id as usize, row_count);
+                    }
+                }
+            }
+        }
+
+        let columns = builders
+            .into_iter()
+            .map(|(column, values)| {
+                let values = values
+                    .into_values()
+                    .map(VectorFilterValueBuilder::finish)
+                    .collect();
+                (column, VectorFilterColumn { values })
+            })
+            .collect();
+        Ok(Self { columns })
+    }
+}
+
+struct VectorFilterValueBuilder {
+    value: Value,
+    rows: Vec<Vec<u64>>,
+}
+
+impl VectorFilterValueBuilder {
+    fn new(value: Value, row_counts: &[usize]) -> Self {
+        Self {
+            value,
+            rows: row_counts
+                .iter()
+                .map(|count| vec![0u64; words_for_rows(*count)])
+                .collect(),
+        }
+    }
+
+    fn set(&mut self, cluster_id: usize, local_id: usize, row_count: usize) {
+        if local_id >= row_count {
+            return;
+        }
+        let word = local_id / 64;
+        let bit = local_id % 64;
+        self.rows[cluster_id][word] |= 1u64 << bit;
+    }
+
+    fn finish(self) -> VectorFilterValue {
+        let mut clusters = Vec::new();
+        let mut rows = Vec::new();
+        for (cluster_id, words) in self.rows.into_iter().enumerate() {
+            if words.iter().all(|word| *word == 0) {
+                continue;
+            }
+            clusters.push(cluster_id as u32);
+            rows.push(VectorFilterRows {
+                cluster_id: cluster_id as u32,
+                words,
+            });
+        }
+        VectorFilterValue {
+            value: self.value,
+            clusters,
+            rows,
+        }
+    }
+}
+
+impl VectorFilterMask {
+    fn empty(row_counts: Vec<usize>) -> Self {
+        let rows = row_counts
+            .iter()
+            .map(|count| vec![0u64; words_for_rows(*count)])
+            .collect();
+        Self { row_counts, rows }
+    }
+
+    fn all(row_counts: Vec<usize>) -> Self {
+        let mut mask = Self::empty(row_counts);
+        for cluster_id in 0..mask.rows.len() {
+            for word in &mut mask.rows[cluster_id] {
+                *word = u64::MAX;
+            }
+            mask.trim_cluster(cluster_id);
+        }
+        mask
+    }
+
+    pub fn and(&self, other: &Self) -> Self {
+        let mut out = self.clone();
+        for (cluster, rhs) in out.rows.iter_mut().zip(&other.rows) {
+            for (lhs, rhs) in cluster.iter_mut().zip(rhs) {
+                *lhs &= *rhs;
+            }
+        }
+        out
+    }
+
+    pub fn or(&self, other: &Self) -> Self {
+        let mut out = self.clone();
+        for (cluster, rhs) in out.rows.iter_mut().zip(&other.rows) {
+            for (lhs, rhs) in cluster.iter_mut().zip(rhs) {
+                *lhs |= *rhs;
+            }
+        }
+        out
+    }
+
+    pub fn not(&self) -> Self {
+        let mut out = self.clone();
+        for cluster_id in 0..out.rows.len() {
+            for word in &mut out.rows[cluster_id] {
+                *word = !*word;
+            }
+            out.trim_cluster(cluster_id);
+        }
+        out
+    }
+
+    pub fn cluster_has_any(&self, cluster_id: usize) -> bool {
+        self.rows
+            .get(cluster_id)
+            .is_some_and(|words| words.iter().any(|word| *word != 0))
+    }
+
+    pub fn allows(&self, cluster_id: usize, local_id: usize) -> bool {
+        if self
+            .row_counts
+            .get(cluster_id)
+            .is_none_or(|count| local_id >= *count)
+        {
+            return false;
+        }
+        let word = local_id / 64;
+        let bit = local_id % 64;
+        self.rows
+            .get(cluster_id)
+            .and_then(|words| words.get(word))
+            .is_some_and(|word| (word & (1u64 << bit)) != 0)
+    }
+
+    fn union_value(&mut self, value: &VectorFilterValue) {
+        for rows in &value.rows {
+            let cluster_id = rows.cluster_id as usize;
+            let Some(dst) = self.rows.get_mut(cluster_id) else {
+                continue;
+            };
+            for (lhs, rhs) in dst.iter_mut().zip(&rows.words) {
+                *lhs |= *rhs;
+            }
+        }
+    }
+
+    fn trim_cluster(&mut self, cluster_id: usize) {
+        let Some(row_count) = self.row_counts.get(cluster_id).copied() else {
+            return;
+        };
+        let extra = row_count % 64;
+        if extra == 0 {
+            return;
+        }
+        if let Some(last) = self.rows[cluster_id].last_mut() {
+            *last &= (1u64 << extra) - 1;
+        }
+    }
+}
+
+fn words_for_rows(row_count: usize) -> usize {
+    row_count.div_ceil(64)
 }
 
 pub fn vector_to_f32(vector: &VectorValue) -> Vec<f32> {
