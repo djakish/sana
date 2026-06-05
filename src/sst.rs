@@ -228,13 +228,29 @@ impl SstReader {
         if &footer[24..32] != MAGIC {
             return Err(Error::Corrupt("bad sst magic".into()));
         }
-        let version = u32::from_le_bytes(footer[20..24].try_into().unwrap());
+        let version = u32::from_le_bytes(
+            footer[20..24]
+                .try_into()
+                .expect("slice is a fixed-size window"),
+        );
         if version != FORMAT_VERSION {
             return Err(Error::Corrupt(format!("unsupported sst version {version}")));
         }
-        let index_offset = u64::from_le_bytes(footer[0..8].try_into().unwrap()) as usize;
-        let index_size = u64::from_le_bytes(footer[8..16].try_into().unwrap()) as usize;
-        let index_crc = u32::from_le_bytes(footer[16..20].try_into().unwrap());
+        let index_offset = u64::from_le_bytes(
+            footer[0..8]
+                .try_into()
+                .expect("slice is a fixed-size window"),
+        ) as usize;
+        let index_size = u64::from_le_bytes(
+            footer[8..16]
+                .try_into()
+                .expect("slice is a fixed-size window"),
+        ) as usize;
+        let index_crc = u32::from_le_bytes(
+            footer[16..20]
+                .try_into()
+                .expect("slice is a fixed-size window"),
+        );
 
         let idx = data
             .get(index_offset..index_offset + index_size)
@@ -303,7 +319,7 @@ impl SstReader {
             .data
             .get(start + size..start + size + 4)
             .ok_or_else(|| Error::Corrupt("sst block crc out of bounds".into()))?;
-        let crc = u32::from_le_bytes(crc_bytes.try_into().unwrap());
+        let crc = u32::from_le_bytes(crc_bytes.try_into().expect("slice is a fixed-size window"));
         if crc32fast::hash(content) != crc {
             return Err(Error::Corrupt("sst block crc mismatch".into()));
         }
@@ -311,8 +327,11 @@ impl SstReader {
         if content.len() < 4 {
             return Err(Error::Corrupt("sst block too small".into()));
         }
-        let num_restarts =
-            u32::from_le_bytes(content[content.len() - 4..].try_into().unwrap()) as usize;
+        let num_restarts = u32::from_le_bytes(
+            content[content.len() - 4..]
+                .try_into()
+                .expect("slice is a fixed-size window"),
+        ) as usize;
         let entries_end = content
             .len()
             .checked_sub(4 + num_restarts * 4)
@@ -350,7 +369,9 @@ fn read_u32(buf: &[u8], pos: &mut usize) -> Result<u32> {
         .get(*pos..*pos + 4)
         .ok_or_else(|| Error::Corrupt("sst u32 out of bounds".into()))?;
     *pos += 4;
-    Ok(u32::from_le_bytes(b.try_into().unwrap()))
+    Ok(u32::from_le_bytes(
+        b.try_into().expect("slice is a fixed-size window"),
+    ))
 }
 
 fn read_u64(buf: &[u8], pos: &mut usize) -> Result<u64> {
@@ -358,5 +379,7 @@ fn read_u64(buf: &[u8], pos: &mut usize) -> Result<u64> {
         .get(*pos..*pos + 8)
         .ok_or_else(|| Error::Corrupt("sst u64 out of bounds".into()))?;
     *pos += 8;
-    Ok(u64::from_le_bytes(b.try_into().unwrap()))
+    Ok(u64::from_le_bytes(
+        b.try_into().expect("slice is a fixed-size window"),
+    ))
 }

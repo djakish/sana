@@ -165,14 +165,26 @@ impl VectorVersionMap {
         if &bytes[0..8] != VERSION_MAP_MAGIC {
             return Err(Error::Corrupt("bad vector version map magic".into()));
         }
-        let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        let version = u32::from_le_bytes(
+            bytes[8..12]
+                .try_into()
+                .expect("slice is a fixed-size window"),
+        );
         if version != VERSION_MAP_FORMAT_VERSION {
             return Err(Error::Corrupt(format!(
                 "unsupported vector version map version {version}"
             )));
         }
-        let body_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
-        let crc = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
+        let body_len = u32::from_le_bytes(
+            bytes[12..16]
+                .try_into()
+                .expect("slice is a fixed-size window"),
+        ) as usize;
+        let crc = u32::from_le_bytes(
+            bytes[16..20]
+                .try_into()
+                .expect("slice is a fixed-size window"),
+        );
         let body = bytes
             .get(HEADER_LEN..HEADER_LEN + body_len)
             .ok_or_else(|| Error::Corrupt("vector version map body truncated".into()))?;
@@ -347,14 +359,26 @@ impl VectorIndex {
         if &bytes[0..8] != VECTOR_MAGIC {
             return Err(Error::Corrupt("bad vector index magic".into()));
         }
-        let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        let version = u32::from_le_bytes(
+            bytes[8..12]
+                .try_into()
+                .expect("slice is a fixed-size window"),
+        );
         if version != VECTOR_FORMAT_VERSION {
             return Err(Error::Corrupt(format!(
                 "unsupported vector index version {version}"
             )));
         }
-        let body_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
-        let crc = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
+        let body_len = u32::from_le_bytes(
+            bytes[12..16]
+                .try_into()
+                .expect("slice is a fixed-size window"),
+        ) as usize;
+        let crc = u32::from_le_bytes(
+            bytes[16..20]
+                .try_into()
+                .expect("slice is a fixed-size window"),
+        );
         let body = bytes
             .get(HEADER_LEN..HEADER_LEN + body_len)
             .ok_or_else(|| Error::Corrupt("vector index body truncated".into()))?;
@@ -1152,7 +1176,10 @@ fn words_for_rows(row_count: usize) -> usize {
 pub fn vector_to_f32(vector: &VectorValue) -> Vec<f32> {
     match vector {
         VectorValue::F32(values) => values.clone(),
-        VectorValue::F16(values) => values.iter().map(|bits| f16_to_f32(*bits)).collect(),
+        VectorValue::F16(values) => values
+            .iter()
+            .map(|bits| half::f16::from_bits(*bits).to_f32())
+            .collect(),
     }
 }
 
@@ -1290,34 +1317,4 @@ fn normalize(vector: &mut [f32]) {
     for value in vector {
         *value /= norm;
     }
-}
-
-fn f16_to_f32(bits: u16) -> f32 {
-    let sign = ((bits & 0x8000) as u32) << 16;
-    let exp = (bits >> 10) & 0x1f;
-    let frac = (bits & 0x03ff) as u32;
-
-    let f32_bits = match exp {
-        0 => {
-            if frac == 0 {
-                sign
-            } else {
-                let mut frac = frac;
-                let mut exp_shift = -14i32;
-                while (frac & 0x0400) == 0 {
-                    frac <<= 1;
-                    exp_shift -= 1;
-                }
-                frac &= 0x03ff;
-                let exp32 = ((exp_shift + 127) as u32) << 23;
-                sign | exp32 | (frac << 13)
-            }
-        }
-        0x1f => sign | 0x7f80_0000 | (frac << 13),
-        _ => {
-            let exp32 = ((exp as u32) + 112) << 23;
-            sign | exp32 | (frac << 13)
-        }
-    };
-    f32::from_bits(f32_bits)
 }

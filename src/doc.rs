@@ -46,7 +46,7 @@ pub fn decode_id(bytes: &[u8]) -> Result<Id> {
                 .get(1..9)
                 .ok_or_else(|| Error::Corrupt("doc id u64 truncated".into()))?
                 .try_into()
-                .unwrap();
+                .expect("slice is a fixed-size window");
             Ok(Id::U64(u64::from_be_bytes(arr)))
         }
         Some(&TAG_UUID) => {
@@ -54,7 +54,7 @@ pub fn decode_id(bytes: &[u8]) -> Result<Id> {
                 .get(1..17)
                 .ok_or_else(|| Error::Corrupt("doc id uuid truncated".into()))?
                 .try_into()
-                .unwrap();
+                .expect("slice is a fixed-size window");
             Ok(Id::Uuid(arr))
         }
         Some(&TAG_STRING) => {

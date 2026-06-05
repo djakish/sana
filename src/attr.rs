@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::sst::{SstReader, SstWriter};
-use crate::value::{Document, Id, Value};
+use crate::value::{Document, Id, Value, compare_scalars};
 
 const KEY_KIND_ALL_DOCS: u8 = 0;
 const KEY_KIND_ATTR: u8 = 1;
@@ -261,14 +261,14 @@ fn decode_value_from_key(bytes: &[u8]) -> Result<Option<Value>> {
             let raw = bytes
                 .get(1..9)
                 .ok_or_else(|| Error::Corrupt("attribute int key truncated".into()))?;
-            let ordered = u64::from_be_bytes(raw.try_into().unwrap());
+            let ordered = u64::from_be_bytes(raw.try_into().expect("slice is a fixed-size window"));
             Ok(Some(Value::Int((ordered ^ (1u64 << 63)) as i64)))
         }
         Some(VALUE_FLOAT) => {
             let raw = bytes
                 .get(1..9)
                 .ok_or_else(|| Error::Corrupt("attribute float key truncated".into()))?;
-            let ordered = u64::from_be_bytes(raw.try_into().unwrap());
+            let ordered = u64::from_be_bytes(raw.try_into().expect("slice is a fixed-size window"));
             let bits = if ordered & (1u64 << 63) != 0 {
                 ordered ^ (1u64 << 63)
             } else {
@@ -313,36 +313,22 @@ fn range_bound_matches(
     lower: Option<AttrBound<'_>>,
     upper: Option<AttrBound<'_>>,
 ) -> bool {
+    use std::cmp::Ordering;
     if let Some(bound) = lower {
-        let Some(ord) = compare_scalar_values(value, bound.value) else {
+        let Some(ord) = compare_scalars(value, bound.value) else {
             return false;
         };
-        if ord == std::cmp::Ordering::Less || (!bound.inclusive && ord == std::cmp::Ordering::Equal)
-        {
+        if ord == Ordering::Less || (!bound.inclusive && ord == Ordering::Equal) {
             return false;
         }
     }
     if let Some(bound) = upper {
-        let Some(ord) = compare_scalar_values(value, bound.value) else {
+        let Some(ord) = compare_scalars(value, bound.value) else {
             return false;
         };
-        if ord == std::cmp::Ordering::Greater
-            || (!bound.inclusive && ord == std::cmp::Ordering::Equal)
-        {
+        if ord == Ordering::Greater || (!bound.inclusive && ord == Ordering::Equal) {
             return false;
         }
     }
     true
-}
-
-fn compare_scalar_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
-    match (a, b) {
-        (Value::Bool(a), Value::Bool(b)) => Some(a.cmp(b)),
-        (Value::Int(a), Value::Int(b)) => Some(a.cmp(b)),
-        (Value::Float(a), Value::Float(b)) => a.partial_cmp(b),
-        (Value::Int(a), Value::Float(b)) => (*a as f64).partial_cmp(b),
-        (Value::Float(a), Value::Int(b)) => a.partial_cmp(&(*b as f64)),
-        (Value::String(a), Value::String(b)) => Some(a.cmp(b)),
-        _ => None,
-    }
 }

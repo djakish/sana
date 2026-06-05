@@ -85,12 +85,24 @@ impl WalBatch {
         if &bytes[0..8] != WAL_MAGIC {
             return Err(Error::Corrupt("bad wal magic".into()));
         }
-        let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        let version = u32::from_le_bytes(
+            bytes[8..12]
+                .try_into()
+                .expect("slice is a fixed-size window"),
+        );
         if version != WAL_FORMAT_VERSION {
             return Err(Error::Corrupt(format!("unsupported wal version {version}")));
         }
-        let body_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
-        let crc = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
+        let body_len = u32::from_le_bytes(
+            bytes[12..16]
+                .try_into()
+                .expect("slice is a fixed-size window"),
+        ) as usize;
+        let crc = u32::from_le_bytes(
+            bytes[16..20]
+                .try_into()
+                .expect("slice is a fixed-size window"),
+        );
         let body = bytes
             .get(HEADER_LEN..HEADER_LEN + body_len)
             .ok_or_else(|| Error::Corrupt("wal body truncated".into()))?;

@@ -17,7 +17,7 @@ use crate::error::{Error, Result};
 use crate::manifest::{NamespaceManifest, VectorIndexMeta};
 use crate::namespace::{Namespace, op_id};
 use crate::schema::{ColumnType, DistanceMetric};
-use crate::value::{Document, Id, Value};
+use crate::value::{Document, Id, Value, compare_scalars, scalar_eq};
 use crate::vector::{self, VectorFilterMask, VectorIndex, VectorVersionMap};
 
 const DEFAULT_RECALL_NUM: usize = 25;
@@ -277,17 +277,16 @@ pub async fn recall(ns: &Namespace, request: RecallRequest) -> Result<RecallResu
                 )
             })?,
     };
-    if !manifest.vector_indexes.contains_key(&column) {
+    let Some(index_meta) = manifest.vector_indexes.get(&column) else {
         return Err(Error::InvalidQuery(format!(
             "recall requires a published vector index for '{column}'; run flush or compact first"
         )));
-    }
+    };
 
     let (dim, default_metric) = vector_column_schema(&manifest, &column)?;
     let metric = request.metric.unwrap_or(default_metric);
     if let Some(filter) = &request.filter {
-        let meta = manifest.vector_indexes.get(&column).expect("checked above");
-        let index = VectorIndex::decode(&ns.store().get(&meta.key).await?.bytes)?;
+        let index = VectorIndex::decode(&ns.store().get(&index_meta.key).await?.bytes)?;
         if native_filter_mask(&index, filter)?.is_none() {
             return Err(Error::InvalidQuery(
                 "filtered recall requires a natively supported scalar filter".into(),
@@ -770,13 +769,6 @@ fn eq_filter_value(actual: &Value, expected: &Value) -> bool {
     }
 }
 
-fn scalar_eq(actual: &Value, expected: &Value) -> bool {
-    if let (Some(a), Some(b)) = (numeric_value(actual), numeric_value(expected)) {
-        return a == b;
-    }
-    actual == expected
-}
-
 fn range_filter_value(
     actual: &Value,
     lower: Option<&RangeBound>,
@@ -792,7 +784,7 @@ fn range_filter_value(
 
 fn scalar_in_range(value: &Value, lower: Option<&RangeBound>, upper: Option<&RangeBound>) -> bool {
     if let Some(lower) = lower {
-        let Some(ord) = compare_bound_value(value, lower.value()) else {
+        let Some(ord) = compare_scalars(value, lower.value()) else {
             return false;
         };
         match lower {
@@ -802,7 +794,7 @@ fn scalar_in_range(value: &Value, lower: Option<&RangeBound>, upper: Option<&Ran
         }
     }
     if let Some(upper) = upper {
-        let Some(ord) = compare_bound_value(value, upper.value()) else {
+        let Some(ord) = compare_scalars(value, upper.value()) else {
             return false;
         };
         match upper {
@@ -889,10 +881,9 @@ fn compare_optional_values(
     direction: SortDirection,
 ) -> Ordering {
     match (a, b) {
-        (Some(a), Some(b)) => apply_direction(
-            compare_bound_value(a, b).unwrap_or(Ordering::Equal),
-            direction,
-        ),
+        (Some(a), Some(b)) => {
+            apply_direction(compare_scalars(a, b).unwrap_or(Ordering::Equal), direction)
+        }
         (Some(_), None) => Ordering::Less,
         (None, Some(_)) => Ordering::Greater,
         (None, None) => Ordering::Equal,
@@ -1090,17 +1081,6 @@ fn compare_score_rows(a: &QueryRow, b: &QueryRow) -> Ordering {
         .partial_cmp(&a.score)
         .unwrap_or(Ordering::Equal)
         .then_with(|| a.id.cmp(&b.id))
-}
-
-fn compare_bound_value(a: &Value, b: &Value) -> Option<Ordering> {
-    if let (Some(a), Some(b)) = (numeric_value(a), numeric_value(b)) {
-        return a.partial_cmp(&b);
-    }
-    match (a, b) {
-        (Value::Bool(a), Value::Bool(b)) => Some(a.cmp(b)),
-        (Value::String(a), Value::String(b)) => Some(a.cmp(b)),
-        _ => None,
-    }
 }
 
 fn numeric_value(value: &Value) -> Option<f64> {

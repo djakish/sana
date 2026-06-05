@@ -410,9 +410,15 @@ async fn filtered_query_resolution_does_not_scale_with_candidate_count() {
     let ns = Namespace::create(counting.clone(), "docs").await.unwrap();
     let n: u64 = 20;
     for id in 1..=n {
-        ns.upsert(doc(id, &format!("doc-{id}"), id as i64, &["keep"], [id as f32, 0.0]))
-            .await
-            .unwrap();
+        ns.upsert(doc(
+            id,
+            &format!("doc-{id}"),
+            id as i64,
+            &["keep"],
+            [id as f32, 0.0],
+        ))
+        .await
+        .unwrap();
     }
     indexer::flush(&ns).await.unwrap();
 

@@ -332,7 +332,10 @@ fn infer_vector_type(name: &str, vector: &VectorValue) -> Result<ColumnType> {
             })
         }
         VectorValue::F16(values) => {
-            if values.iter().any(|bits| f16_is_non_finite(*bits)) {
+            if values
+                .iter()
+                .any(|bits| !half::f16::from_bits(*bits).is_finite())
+            {
                 return Err(Error::InvalidSchema(format!(
                     "vector column '{name}' contains a non-finite f16"
                 )));
@@ -344,8 +347,4 @@ fn infer_vector_type(name: &str, vector: &VectorValue) -> Result<ColumnType> {
             })
         }
     }
-}
-
-fn f16_is_non_finite(bits: u16) -> bool {
-    (bits & 0x7c00) == 0x7c00
 }

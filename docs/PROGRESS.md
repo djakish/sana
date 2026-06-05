@@ -415,6 +415,21 @@ A high-recall review of the Stage 3–5 diff (`462f44b..HEAD`) ran after it land
   reads to a handful**. Behavior is unchanged (all prior query tests pass);
   `Namespace::lookup` stays for single-key access.
 
+**Code-quality hardening (no behavior change):**
+
+- **One scalar comparator.** Filter equality/range, attribute-index range scans,
+  and order-by previously each had their own value comparison (`scalar_eq` +
+  `compare_bound_value` in `query.rs`, `compare_scalar_values` in `attr.rs`).
+  Unified behind `value::compare_scalars` / `value::scalar_eq` so the three paths
+  can't drift on cross-type cases. Bonus: integers now compare exactly instead of
+  via `f64`, so large `i64` values keep full precision.
+- **No bare `unwrap` in `src`.** The 21 `slice.try_into().unwrap()` codec sites
+  (all infallible after a length check) are now `.expect("slice is a fixed-size
+  window")`, and the `recall` double-lookup `.expect("checked above")` was
+  refactored away with a `let Some(index_meta) = … else`.
+- **`half` crate for f16.** Replaced the hand-rolled `f16_to_f32` bit-twiddling
+  (and `f16_is_non_finite`) with `half::f16`, the canonical vetted crate.
+
 **Reviewed and intentionally left as-is (design, not bugs):**
 
 - **Per-query `metric` override on ANN.** Inference always yields `Cosine`, and
@@ -428,6 +443,14 @@ A high-recall review of the Stage 3–5 diff (`462f44b..HEAD`) ran after it land
 - `approx_logical_bytes` over-counts retained doc SSTs after repeated flushes
   (approximate stat; compact resets it). ANN v0 quality knobs (default probes,
   empty-cluster centroids) are by design for the full-snapshot index.
+- **Content-address hash (`object_store::version_of`) still uses `DefaultHasher`.**
+  Not "hand-rolled," but the wrong tool: std does not guarantee its algorithm is
+  stable across Rust *versions*, so persisted content-addressed keys could shift
+  on a toolchain upgrade. A vetted stable digest (e.g. `blake3`) is the right
+  fix, but it changes on-disk key strings + a golden fixture and lives in the
+  object-store module — left for a deliberate format change rather than folded
+  into this cleanup. (The `splitmix64`/FNV recall sampler is hand-rolled but
+  intentional and isolated; left as-is.)
 
 ---
 
