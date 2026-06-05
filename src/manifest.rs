@@ -42,6 +42,8 @@ pub struct VectorIndexMeta {
     pub version_map_size_bytes: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub append_indexes: Vec<VectorAppendMeta>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintenance_plan: Option<VectorMaintenancePlan>,
     pub row_count: u64,
     pub centroid_count: u64,
     pub dim: usize,
@@ -54,6 +56,40 @@ pub struct VectorAppendMeta {
     pub size_bytes: u64,
     pub row_count: u64,
     pub generation: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct VectorMaintenancePlan {
+    pub thresholds: VectorMaintenanceThresholds,
+    pub tasks: Vec<VectorMaintenanceTask>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VectorMaintenanceThresholds {
+    pub min_posting_rows: u64,
+    pub max_posting_rows: u64,
+    pub reassign_neighborhood: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VectorMaintenanceTask {
+    pub action: VectorMaintenanceAction,
+    pub cluster_id: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partner_cluster_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub neighbor_cluster_ids: Vec<u32>,
+    pub live_rows: u64,
+    pub stale_rows: u64,
+    pub append_rows: u64,
+    pub total_rows: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VectorMaintenanceAction {
+    Split,
+    Merge,
 }
 
 fn is_zero(value: &u64) -> bool {

@@ -11,6 +11,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::attr;
 use crate::error::{Error, Result};
+use crate::manifest::{
+    VectorMaintenanceAction, VectorMaintenancePlan, VectorMaintenanceTask,
+    VectorMaintenanceThresholds,
+};
 use crate::schema::DistanceMetric;
 use crate::value::{Document, Id, Value, VectorValue};
 
@@ -21,6 +25,7 @@ const VERSION_MAP_FORMAT_VERSION: u32 = 1;
 const HEADER_LEN: usize = 8 + 4 + 4 + 4;
 const KMEANS_ITERS: usize = 8;
 const MAX_CLUSTERS: usize = 16;
+const DEFAULT_REASSIGN_NEIGHBORHOOD: usize = 64;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VectorIndex {
@@ -408,6 +413,125 @@ impl VectorIndex {
         self.cluster_row_counts().into_iter().sum()
     }
 
+    pub fn maintenance_thresholds(&self) -> VectorMaintenanceThresholds {
+        let centroid_count = self.centroids.len().max(1);
+        let target_rows = self.row_count().div_ceil(centroid_count).max(1);
+        let min_posting_rows = target_rows.div_ceil(2).max(1);
+        let max_posting_rows = (target_rows * 2).max(min_posting_rows + 1);
+        VectorMaintenanceThresholds {
+            min_posting_rows: min_posting_rows as u64,
+            max_posting_rows: max_posting_rows as u64,
+            reassign_neighborhood: DEFAULT_REASSIGN_NEIGHBORHOOD,
+        }
+    }
+
+    pub fn plan_maintenance(
+        &self,
+        append_indexes: &[VectorIndex],
+        version_map: Option<&VectorVersionMap>,
+        thresholds: VectorMaintenanceThresholds,
+    ) -> Result<VectorMaintenancePlan> {
+        if let Some(version_map) = version_map
+            && version_map.column != self.column
+        {
+            return Err(Error::Corrupt(format!(
+                "vector version map column '{}' does not match index column '{}'",
+                version_map.column, self.column
+            )));
+        }
+
+        let mut stats = (0..self.centroids.len())
+            .map(|cluster_id| VectorPostingMaintenanceStats {
+                cluster_id: cluster_id as u32,
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        accumulate_maintenance_stats(self, false, version_map, &mut stats)?;
+
+        for append in append_indexes {
+            validate_append_segment(self, append)?;
+            accumulate_maintenance_stats(append, true, version_map, &mut stats)?;
+        }
+
+        let mut tasks = Vec::new();
+        let mut split_clusters = std::collections::BTreeSet::new();
+        for stat in &stats {
+            if stat.live_rows > thresholds.max_posting_rows {
+                split_clusters.insert(stat.cluster_id);
+                tasks.push(VectorMaintenanceTask {
+                    action: VectorMaintenanceAction::Split,
+                    cluster_id: stat.cluster_id,
+                    partner_cluster_id: None,
+                    neighbor_cluster_ids: self.nearest_cluster_ids(
+                        stat.cluster_id as usize,
+                        thresholds.reassign_neighborhood,
+                    )?,
+                    live_rows: stat.live_rows,
+                    stale_rows: stat.stale_rows,
+                    append_rows: stat.append_rows,
+                    total_rows: stat.total_rows,
+                });
+            }
+        }
+
+        if self.centroids.len() > 1 {
+            let mut merged_clusters = std::collections::BTreeSet::new();
+            for stat in &stats {
+                if stat.live_rows >= thresholds.min_posting_rows
+                    || split_clusters.contains(&stat.cluster_id)
+                    || merged_clusters.contains(&stat.cluster_id)
+                {
+                    continue;
+                }
+
+                let neighbors = self.nearest_cluster_ids(
+                    stat.cluster_id as usize,
+                    thresholds.reassign_neighborhood,
+                )?;
+                let Some(partner) = neighbors
+                    .iter()
+                    .copied()
+                    .find(|cluster_id| !split_clusters.contains(cluster_id))
+                else {
+                    continue;
+                };
+                merged_clusters.insert(stat.cluster_id);
+                merged_clusters.insert(partner);
+                tasks.push(VectorMaintenanceTask {
+                    action: VectorMaintenanceAction::Merge,
+                    cluster_id: stat.cluster_id,
+                    partner_cluster_id: Some(partner),
+                    neighbor_cluster_ids: neighbors,
+                    live_rows: stat.live_rows,
+                    stale_rows: stat.stale_rows,
+                    append_rows: stat.append_rows,
+                    total_rows: stat.total_rows,
+                });
+            }
+        }
+
+        Ok(VectorMaintenancePlan { thresholds, tasks })
+    }
+
+    fn nearest_cluster_ids(&self, cluster_id: usize, limit: usize) -> Result<Vec<u32>> {
+        let Some(centroid) = self.centroids.get(cluster_id) else {
+            return Err(Error::Corrupt("vector cluster id out of bounds".into()));
+        };
+        let mut scored = self
+            .centroids
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| *idx != cluster_id)
+            .map(|(idx, other)| Ok((idx as u32, score(centroid, other, self.metric)?)))
+            .collect::<Result<Vec<_>>>()?;
+        scored.sort_by(|a, b| compare_scores(a.1, b.1).then_with(|| a.0.cmp(&b.0)));
+        Ok(scored
+            .into_iter()
+            .take(limit)
+            .map(|(cluster_id, _)| cluster_id)
+            .collect())
+    }
+
     pub fn all_filter_mask(&self) -> VectorFilterMask {
         VectorFilterMask::all(self.cluster_row_counts())
     }
@@ -434,6 +558,55 @@ impl VectorIndex {
         }
         Some(mask)
     }
+}
+
+#[derive(Default)]
+struct VectorPostingMaintenanceStats {
+    cluster_id: u32,
+    live_rows: u64,
+    stale_rows: u64,
+    append_rows: u64,
+    total_rows: u64,
+}
+
+fn validate_append_segment(base: &VectorIndex, append: &VectorIndex) -> Result<()> {
+    if append.column != base.column
+        || append.dim != base.dim
+        || append.metric != base.metric
+        || append.centroids != base.centroids
+    {
+        return Err(Error::Corrupt(format!(
+            "vector append segment for '{}' does not match base index",
+            base.column
+        )));
+    }
+    Ok(())
+}
+
+fn accumulate_maintenance_stats(
+    index: &VectorIndex,
+    is_append: bool,
+    version_map: Option<&VectorVersionMap>,
+    stats: &mut [VectorPostingMaintenanceStats],
+) -> Result<()> {
+    for posting in &index.postings {
+        let cluster_id = posting.centroid_id as usize;
+        let Some(stat) = stats.get_mut(cluster_id) else {
+            return Err(Error::Corrupt("vector posting id out of bounds".into()));
+        };
+        for entry in &posting.vectors {
+            stat.total_rows += 1;
+            if is_append {
+                stat.append_rows += 1;
+            }
+            if version_map.is_none_or(|versions| versions.is_live(&entry.id, entry.version)) {
+                stat.live_rows += 1;
+            } else {
+                stat.stale_rows += 1;
+            }
+        }
+    }
+    Ok(())
 }
 
 impl VectorFilterIndex {

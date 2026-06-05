@@ -2,6 +2,8 @@ mod common;
 
 use sana::manifest::{
     ManifestPointer, NamespaceManifest, SstMeta, VectorAppendMeta, VectorIndexMeta,
+    VectorMaintenanceAction, VectorMaintenancePlan, VectorMaintenanceTask,
+    VectorMaintenanceThresholds,
 };
 use sana::schema::{ColumnSpec, ColumnType, DistanceMetric, ScalarType, Schema, VectorEncoding};
 use sana::value::Id;
@@ -94,6 +96,23 @@ fn manifest_round_trips_doc_sst_metadata() {
                 row_count: 1,
                 generation: 8,
             }],
+            maintenance_plan: Some(VectorMaintenancePlan {
+                thresholds: VectorMaintenanceThresholds {
+                    min_posting_rows: 128,
+                    max_posting_rows: 512,
+                    reassign_neighborhood: 64,
+                },
+                tasks: vec![VectorMaintenanceTask {
+                    action: VectorMaintenanceAction::Split,
+                    cluster_id: 7,
+                    partner_cluster_id: None,
+                    neighbor_cluster_ids: vec![8, 9],
+                    live_rows: 700,
+                    stale_rows: 12,
+                    append_rows: 140,
+                    total_rows: 712,
+                }],
+            }),
             row_count: 2,
             centroid_count: 2,
             dim: 768,

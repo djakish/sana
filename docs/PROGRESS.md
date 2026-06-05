@@ -12,11 +12,11 @@ the next unchecked task under "Current milestone" / "Next up".
 ## Status snapshot
 
 - **Current stage:** Stage 6 (SPFresh local rebuild) — **in progress**.
-- **Next up:** Posting split/merge thresholds and local rebuild planning.
+- **Next up:** Bounded-neighborhood reassignment after split/merge planning.
 - **Done:** Stage 0 (Skeleton), Stage 1 (Durable Documents), Stage 2 (SST/LSM),
   Stage 3 (Attributes & Exact Search), Stage 4 (ANN v0), Stage 5 (Native
   Filtering).
-- **Tests:** `cargo test` green (80 tests); `cargo clippy --all-targets` clean.
+- **Tests:** `cargo test` green (82 tests); `cargo clippy --all-targets` clean.
 - **Note:** post-Stage-2 and Stage-3–5 code-review fixes applied; remaining
   findings tracked under "Stage 2 — code review follow-ups" and "Stages 3–5 —
   code review follow-ups".
@@ -431,7 +431,7 @@ Planned tasks:
 - [x] Add mutable posting append objects for new vectors instead of rebuilding
       the whole IVF object on every flush.
 - [x] Make ANN drop stale/deleted vector versions using the version map.
-- [ ] Add posting-level split/merge thresholds and local rebuild planning.
+- [x] Add posting-level split/merge thresholds and local rebuild planning.
 - [ ] Implement bounded-neighborhood reassignment after split/merge.
 - [ ] Add tests for insert/delete churn preserving recall without global
       rebuild.
@@ -442,6 +442,8 @@ Known limitations to improve later:
   compaction still rewrites a full base and clears the append chain. Append
   objects currently reuse the IVF codec and duplicate centroids, so a future
   posting-specific object format should reduce overhead and bound chain length.
+- Maintenance planning is now published in the manifest, but the background
+  worker that executes split/merge plans is still future work.
 - Version numbers are currently index generation numbers. Future append objects
   should use monotonic per-column vector versions or WAL positions so local
   rebuilds can CAS the map without rebuilding unrelated postings.
@@ -464,6 +466,12 @@ Stage 6 decisions / notes so far:
   object, and publish an updated version map. The base IVF key stays stable
   across append flushes, while stale older copies are suppressed by the version
   map. Full compaction rebuilds the base index and clears appends.
+- **D35 — Split/merge planning is catalog state.** The vector planner computes
+  per-cluster live, stale, and appended row counts across the base IVF object
+  plus append segments, then publishes deterministic split/merge tasks in the
+  vector manifest metadata. Thresholds are derived from the last full base
+  posting sizes, and each task carries a bounded nearest-centroid neighborhood
+  for the future reassignment worker.
 
 ---
 

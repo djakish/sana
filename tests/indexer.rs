@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use sana::indexer;
+use sana::manifest::VectorMaintenanceAction;
 use sana::namespace::Namespace;
 use sana::object_store::{FsObjectStore, ObjectStore};
 use sana::schema::DistanceMetric;
@@ -222,6 +223,44 @@ async fn second_flush_publishes_vector_append_delta() {
         version_map.live_version(&Id::U64(3)),
         Some(manifest.generation)
     );
+}
+
+#[tokio::test]
+async fn append_flush_plans_overfull_vector_posting_split() {
+    let dir = tempfile::tempdir().unwrap();
+    let ns = Namespace::create(store(&dir), "docs").await.unwrap();
+    ns.upsert(doc_with_vector(1, "base-a", 10, [1.0, 0.0]))
+        .await
+        .unwrap();
+    ns.upsert(doc_with_vector(2, "base-b", 20, [2.0, 0.0]))
+        .await
+        .unwrap();
+    indexer::flush(&ns).await.unwrap();
+
+    ns.upsert(doc_with_vector(3, "append-a", 30, [3.0, 0.0]))
+        .await
+        .unwrap();
+    ns.upsert(doc_with_vector(4, "append-b", 40, [4.0, 0.0]))
+        .await
+        .unwrap();
+    indexer::flush(&ns).await.unwrap();
+
+    let manifest = ns.load_manifest().await.unwrap();
+    let meta = manifest.vector_indexes.get("embedding").unwrap();
+    assert_eq!(meta.append_indexes.len(), 1);
+
+    let plan = meta
+        .maintenance_plan
+        .as_ref()
+        .expect("overfull posting should publish a maintenance plan");
+    let split = plan
+        .tasks
+        .iter()
+        .find(|task| task.action == VectorMaintenanceAction::Split)
+        .expect("overfull posting should be planned for split");
+    assert!(split.live_rows > plan.thresholds.max_posting_rows);
+    assert_eq!(split.partner_cluster_id, None);
+    assert!(!split.neighbor_cluster_ids.contains(&split.cluster_id));
 }
 
 #[tokio::test]

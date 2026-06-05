@@ -20,7 +20,9 @@ use bytes::Bytes;
 use crate::attr;
 use crate::doc::{DocRecord, encode_id};
 use crate::error::Result;
-use crate::manifest::{NamespaceManifest, SstMeta, VectorAppendMeta, VectorIndexMeta};
+use crate::manifest::{
+    NamespaceManifest, SstMeta, VectorAppendMeta, VectorIndexMeta, VectorMaintenancePlan,
+};
 use crate::namespace::{Namespace, apply_op, now_ms, op_id};
 use crate::schema::{ColumnType, DistanceMetric};
 use crate::sst::SstWriter;
@@ -35,6 +37,10 @@ fn vector_family_bytes(meta: &VectorIndexMeta) -> u64 {
             .iter()
             .map(|append| append.size_bytes)
             .sum::<u64>()
+}
+
+fn maintenance_plan_if_not_empty(plan: VectorMaintenancePlan) -> Option<VectorMaintenancePlan> {
+    (!plan.tasks.is_empty()).then_some(plan)
 }
 
 struct BuiltSst {
@@ -132,6 +138,11 @@ async fn publish_full_vector_index(
     let bytes = index.encode()?;
     let version_map = VectorVersionMap::from_index(&index);
     let version_map_bytes = version_map.encode()?;
+    let maintenance_plan = maintenance_plan_if_not_empty(index.plan_maintenance(
+        &[],
+        Some(&version_map),
+        index.maintenance_thresholds(),
+    )?);
     let component = object_path_component(column.name);
     let key = format!(
         "namespaces/{}/index/g/{}/vector/{}/ivf.bin",
@@ -155,6 +166,7 @@ async fn publish_full_vector_index(
         version_map_key: Some(version_map_key),
         version_map_size_bytes: version_map_bytes.len() as u64,
         append_indexes: Vec::new(),
+        maintenance_plan,
         row_count: index.row_count() as u64,
         centroid_count: index.centroids.len() as u64,
         dim: column.dim,
@@ -175,6 +187,12 @@ async fn publish_vector_append(
     }
 
     let base = VectorIndex::decode(&ns.store().get(&prev.key).await?.bytes)?;
+    let mut append_segments = Vec::with_capacity(prev.append_indexes.len() + 1);
+    for append_meta in &prev.append_indexes {
+        append_segments.push(VectorIndex::decode(
+            &ns.store().get(&append_meta.key).await?.bytes,
+        )?);
+    }
     let mut version_map = match &prev.version_map_key {
         Some(key) => VectorVersionMap::decode(&ns.store().get(key).await?.bytes)?,
         None => VectorVersionMap::from_index(&base),
@@ -227,7 +245,14 @@ async fn publish_vector_append(
             row_count: append.row_count() as u64,
             generation,
         });
+        append_segments.push(append);
     }
+
+    let maintenance_plan = maintenance_plan_if_not_empty(base.plan_maintenance(
+        &append_segments,
+        Some(&version_map),
+        base.maintenance_thresholds(),
+    )?);
 
     let version_map_key = format!(
         "namespaces/{}/index/g/{}/vector/{}/versions.bin",
@@ -246,6 +271,7 @@ async fn publish_vector_append(
         version_map_key: Some(version_map_key),
         version_map_size_bytes: version_map_bytes.len() as u64,
         append_indexes,
+        maintenance_plan,
         row_count: version_map.versions.len() as u64,
         centroid_count: prev.centroid_count,
         dim: column.dim,
