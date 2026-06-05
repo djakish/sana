@@ -12,12 +12,12 @@ the next unchecked task under "Current milestone" / "Next up".
 ## Status snapshot
 
 - **Current stage:** Stage 7 (Full-text search) — **in progress**.
-- **Next up:** Fixed-size text posting blocks with block-max scores, then
-  MAXSCORE.
+- **Next up:** Rank-safe MAXSCORE over text posting blocks, then hybrid
+  multi-query planning.
 - **Done:** Stage 0 (Skeleton), Stage 1 (Durable Documents), Stage 2 (SST/LSM),
   Stage 3 (Attributes & Exact Search), Stage 4 (ANN v0), Stage 5 (Native
   Filtering), Stage 6 (SPFresh local rebuild).
-- **Tests:** `cargo test` green (100 tests); `cargo clippy --all-targets` clean.
+- **Tests:** `cargo test` green (101 tests); `cargo clippy --all-targets` clean.
 - **Note:** post-Stage-2 and Stage-3–5 code-review fixes applied; remaining
   findings tracked under "Stage 2 — code review follow-ups" and "Stages 3–5 —
   code review follow-ups". Recently fixed limitations: Stage 2 ranged
@@ -25,7 +25,7 @@ the next unchecked task under "Current milestone" / "Next up".
   and orphaned-object GC (`indexer::gc`, `sana gc [--apply]`); Stage 3 attribute
   write-amplification via delta + tiered `attr_ssts` (`tier_attr_ssts`); vector
   read path fetches append deltas concurrently; Stage 7 now has tokenizer,
-  simple full-snapshot text postings, and BM25 query support.
+  block-shaped full-snapshot text postings, and BM25 query support.
 - **Last updated:** 2026-06-06.
 
 ---
@@ -593,7 +593,7 @@ Planned tasks:
 - [x] Implement BM25 scoring over text postings.
 - [x] Add text query API/CLI support and hybrid-ready score plumbing.
 - [x] Add tests for tokenization, ranking, filtering, and SST persistence.
-- [ ] Upgrade postings to fixed-size blocks with block-local max scores.
+- [x] Upgrade postings to fixed-size blocks with block-local max scores.
 - [ ] Add rank-safe MAXSCORE over the block postings.
 - [ ] Add hybrid multi-query planning for combined text/vector/attribute ranks.
 
@@ -606,6 +606,12 @@ Stage 7 decisions / notes:
   to scoring the strong replayed snapshot. This keeps read-after-write
   correctness simple while Stage 7 moves toward fixed posting blocks and
   MAXSCORE.
+- **D40 — Text postings are block-shaped before MAXSCORE.** Each term now has a
+  metadata record (`doc_freq`, `block_count`, default-BM25 `max_score`) plus
+  fixed target-256 posting blocks, each with its own local max score. The query
+  path still exhaustively consumes blocks, but the on-disk shape now matches the
+  FTS v2 direction and can support block skipping without another manifest
+  family change.
 
 ---
 

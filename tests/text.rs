@@ -56,3 +56,25 @@ fn text_sst_round_trips_bm25_postings() {
 
     assert_eq!(ids, vec![Id::U64(1), Id::U64(2), Id::U64(3)]);
 }
+
+#[test]
+fn text_sst_splits_large_terms_into_fixed_blocks() {
+    let docs: BTreeMap<Id, Document> = (0..300u64)
+        .map(|id| {
+            (
+                Id::U64(id),
+                text_doc(id, &format!("rust database shard {id}")),
+            )
+        })
+        .collect();
+    let built = text::build_text_sst(&docs).unwrap().unwrap();
+    let reader = SstReader::open(Bytes::from(built.bytes)).unwrap();
+
+    let stats = text::term_stats(&reader, "body", "rust").unwrap().unwrap();
+    assert_eq!(stats.doc_freq, 300);
+    assert_eq!(stats.block_count, 2);
+    assert!(stats.max_score > 0.0);
+
+    let hits = text::search_sst(&reader, "body", "rust", Bm25Params::default()).unwrap();
+    assert_eq!(hits.len(), 300);
+}

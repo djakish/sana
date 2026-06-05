@@ -1,9 +1,10 @@
 //! Full-text analysis, postings, and BM25 scoring.
 //!
 //! The first Stage 7 index is intentionally conservative: each flush publishes
-//! a full immutable text snapshot with term postings and field stats. Querying
-//! can use that SST directly when the WAL is fully indexed; otherwise the query
-//! path falls back to scoring the strong materialized document snapshot.
+//! a full immutable text snapshot with fixed-size term blocks and field stats.
+//! Querying can use that SST directly when the WAL is fully indexed; otherwise
+//! the query path falls back to scoring the strong materialized document
+//! snapshot.
 
 use std::collections::BTreeMap;
 
@@ -14,9 +15,11 @@ use crate::sst::{SstReader, SstWriter};
 use crate::value::{Document, Id, Value};
 
 const KEY_KIND_FIELD_STATS: u8 = 0;
-const KEY_KIND_TERM: u8 = 1;
+const KEY_KIND_TERM_META: u8 = 1;
+const KEY_KIND_TERM_BLOCK: u8 = 2;
 
 const DEFAULT_MAX_TOKEN_LEN: usize = 39;
+const POSTING_BLOCK_TARGET: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenizerConfig {
@@ -96,6 +99,13 @@ pub struct TextHit {
     pub score: f32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextTermStats {
+    pub doc_freq: u64,
+    pub block_count: u32,
+    pub max_score: f32,
+}
+
 #[derive(Clone, Debug, Default)]
 struct TextIndexData {
     field_stats: BTreeMap<String, FieldStats>,
@@ -116,7 +126,15 @@ struct TermPosting {
 }
 
 #[derive(Serialize, Deserialize)]
-struct PostingList {
+struct StoredTermStats {
+    doc_freq: u64,
+    block_count: u32,
+    max_score: f32,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PostingBlock {
+    max_score: f32,
     postings: Vec<TermPosting>,
 }
 
@@ -219,13 +237,55 @@ pub fn build_text_sst(docs: &BTreeMap<Id, Document>) -> Result<Option<BuiltTextS
         );
     }
     for ((column, term), postings) in &data.postings {
+        let field_stats = data.field_stats.get(column).copied().unwrap_or_default();
+        let avg_doc_len = average_doc_len(field_stats);
+        let doc_freq = postings.len() as u64;
+        let block_count = postings.len().div_ceil(POSTING_BLOCK_TARGET) as u32;
+        let term_max_score = postings
+            .iter()
+            .map(|posting| {
+                bm25_term_score(
+                    posting.term_frequency,
+                    posting.doc_len,
+                    avg_doc_len,
+                    field_stats.doc_count,
+                    doc_freq,
+                    Bm25Params::default(),
+                )
+            })
+            .fold(0.0f32, f32::max);
         entries.insert(
-            term_key(column, term),
-            postcard::to_allocvec(&PostingList {
-                postings: postings.clone(),
+            term_meta_key(column, term),
+            postcard::to_allocvec(&StoredTermStats {
+                doc_freq,
+                block_count,
+                max_score: term_max_score,
             })
             .map_err(|e| Error::Codec(e.to_string()))?,
         );
+        for (block_id, block_postings) in postings.chunks(POSTING_BLOCK_TARGET).enumerate() {
+            let block_max_score = block_postings
+                .iter()
+                .map(|posting| {
+                    bm25_term_score(
+                        posting.term_frequency,
+                        posting.doc_len,
+                        avg_doc_len,
+                        field_stats.doc_count,
+                        doc_freq,
+                        Bm25Params::default(),
+                    )
+                })
+                .fold(0.0f32, f32::max);
+            entries.insert(
+                term_block_key(column, term, block_id as u32),
+                postcard::to_allocvec(&PostingBlock {
+                    max_score: block_max_score,
+                    postings: block_postings.to_vec(),
+                })
+                .map_err(|e| Error::Codec(e.to_string()))?,
+            );
+        }
     }
 
     let entry_count = entries.len() as u64;
@@ -257,16 +317,36 @@ pub fn search_sst(
     };
     let field_stats: FieldStats =
         postcard::from_bytes(&stats_bytes).map_err(|e| Error::Codec(e.to_string()))?;
-    score_terms(query_stats.terms, params, field_stats, |term| match reader
-        .get(&term_key(column, term))?
-    {
-        Some(bytes) => {
-            let list: PostingList =
+    score_terms(query_stats.terms, params, field_stats, |term| {
+        let Some(stats) = term_stats(reader, column, term)? else {
+            return Ok((0, Vec::new()));
+        };
+        let mut postings = Vec::with_capacity(stats.doc_freq as usize);
+        for block_id in 0..stats.block_count {
+            let Some(bytes) = reader.get(&term_block_key(column, term, block_id))? else {
+                return Err(Error::Corrupt(format!(
+                    "missing text posting block {block_id} for {column}:{term}"
+                )));
+            };
+            let block: PostingBlock =
                 postcard::from_bytes(&bytes).map_err(|e| Error::Codec(e.to_string()))?;
-            Ok(list.postings)
+            postings.extend(block.postings);
         }
-        None => Ok(Vec::new()),
+        Ok((stats.doc_freq, postings))
     })
+}
+
+pub fn term_stats(reader: &SstReader, column: &str, term: &str) -> Result<Option<TextTermStats>> {
+    let Some(bytes) = reader.get(&term_meta_key(column, term))? else {
+        return Ok(None);
+    };
+    let stats: StoredTermStats =
+        postcard::from_bytes(&bytes).map_err(|e| Error::Codec(e.to_string()))?;
+    Ok(Some(TextTermStats {
+        doc_freq: stats.doc_freq,
+        block_count: stats.block_count,
+        max_score: stats.max_score,
+    }))
 }
 
 pub fn score_documents(
@@ -282,11 +362,12 @@ pub fn score_documents(
     };
     let query_stats = analyze_text(query, TokenizerConfig::default());
     score_terms(query_stats.terms, params, field_stats, |term| {
-        Ok(data
+        let postings = data
             .postings
             .get(&(column.to_string(), term.to_string()))
             .cloned()
-            .unwrap_or_default())
+            .unwrap_or_default();
+        Ok((postings.len() as u64, postings))
     })
 }
 
@@ -326,16 +407,15 @@ fn score_terms(
     query_terms: Vec<TermFrequency>,
     params: Bm25Params,
     field_stats: FieldStats,
-    mut postings_for_term: impl FnMut(&str) -> Result<Vec<TermPosting>>,
+    mut postings_for_term: impl FnMut(&str) -> Result<(u64, Vec<TermPosting>)>,
 ) -> Result<Vec<TextHit>> {
     if query_terms.is_empty() || field_stats.doc_count == 0 || field_stats.total_doc_len == 0 {
         return Ok(Vec::new());
     }
-    let avg_doc_len = field_stats.total_doc_len as f32 / field_stats.doc_count as f32;
+    let avg_doc_len = average_doc_len(field_stats);
     let mut scores: BTreeMap<Id, f32> = BTreeMap::new();
     for query_term in query_terms {
-        let postings = postings_for_term(&query_term.term)?;
-        let doc_freq = postings.len() as u64;
+        let (doc_freq, postings) = postings_for_term(&query_term.term)?;
         if doc_freq == 0 {
             continue;
         }
@@ -361,6 +441,13 @@ fn score_terms(
         .collect();
     sort_hits(&mut hits);
     Ok(hits)
+}
+
+fn average_doc_len(field_stats: FieldStats) -> f32 {
+    if field_stats.doc_count == 0 {
+        return 0.0;
+    }
+    field_stats.total_doc_len as f32 / field_stats.doc_count as f32
 }
 
 fn query_term_frequency_weight(frequency: u32, k3: f32) -> f32 {
@@ -405,11 +492,20 @@ fn field_stats_key(column: &str) -> Vec<u8> {
     key
 }
 
-fn term_key(column: &str, term: &str) -> Vec<u8> {
+fn term_meta_key(column: &str, term: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(1 + 8 + column.len() + term.len());
-    key.push(KEY_KIND_TERM);
+    key.push(KEY_KIND_TERM_META);
     push_len_prefixed(column.as_bytes(), &mut key);
     push_len_prefixed(term.as_bytes(), &mut key);
+    key
+}
+
+fn term_block_key(column: &str, term: &str, block_id: u32) -> Vec<u8> {
+    let mut key = Vec::with_capacity(1 + 12 + column.len() + term.len());
+    key.push(KEY_KIND_TERM_BLOCK);
+    push_len_prefixed(column.as_bytes(), &mut key);
+    push_len_prefixed(term.as_bytes(), &mut key);
+    key.extend_from_slice(&block_id.to_be_bytes());
     key
 }
 
