@@ -46,6 +46,80 @@ fn score_batch_rejects_dimension_mismatch() {
 }
 
 #[test]
+fn rabitq_code_generation_packs_cluster_residual_bits() {
+    let dim = 70usize;
+    let index = VectorIndex {
+        format_version: 1,
+        column: "embedding".into(),
+        dim,
+        metric: DistanceMetric::L2,
+        centroids: vec![vec![0.0; dim]],
+        postings: vec![VectorPosting {
+            centroid_id: 0,
+            vectors: vec![
+                VectorEntry {
+                    id: Id::U64(1),
+                    vector: vec![1.0; dim],
+                    local_id: 0,
+                    version: 7,
+                },
+                VectorEntry {
+                    id: Id::U64(2),
+                    vector: vec![0.0; dim],
+                    local_id: 1,
+                    version: 7,
+                },
+            ],
+        }],
+        addresses: vec![
+            VectorAddress {
+                id: Id::U64(1),
+                cluster_id: 0,
+                local_id: 0,
+                version: 7,
+            },
+            VectorAddress {
+                id: Id::U64(2),
+                cluster_id: 0,
+                local_id: 1,
+                version: 7,
+            },
+        ],
+        filter_index: VectorFilterIndex::default(),
+    };
+
+    let rabitq = index.build_rabitq_codes().unwrap();
+    assert_eq!(rabitq.column, "embedding");
+    assert_eq!(rabitq.dim, dim);
+    assert_eq!(rabitq.clusters.len(), 1);
+
+    let cluster = &rabitq.clusters[0];
+    assert_eq!(cluster.centroid_id, 0);
+    assert_eq!(cluster.codes.len(), 2);
+
+    let non_zero = &cluster.codes[0];
+    assert_eq!(non_zero.id, Id::U64(1));
+    assert_eq!(non_zero.local_id, 0);
+    assert_eq!(non_zero.version, 7);
+    assert_eq!(non_zero.code_words.len(), 2);
+    assert!((non_zero.residual_norm - (dim as f32).sqrt()).abs() < 1e-6);
+    assert_eq!(
+        non_zero.positive_bits,
+        non_zero
+            .code_words
+            .iter()
+            .map(|word| word.count_ones())
+            .sum::<u32>()
+    );
+
+    let zero = &cluster.codes[1];
+    assert_eq!(zero.id, Id::U64(2));
+    assert_eq!(zero.residual_norm, 0.0);
+    assert_eq!(zero.positive_bits, 0);
+    assert!(zero.code_words.iter().all(|word| *word == 0));
+}
+
+#[test]
 fn maintenance_plan_merges_underfull_posting() {
     let docs = [
         doc_with_vector(1, [0.0, 0.0]),

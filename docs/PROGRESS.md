@@ -12,11 +12,11 @@ the next unchecked task under "Current milestone" / "Next up".
 ## Status snapshot
 
 - **Current stage:** Stage 8 (RaBitQ & kernels) — **in progress**.
-- **Next up:** RaBitQ per-cluster quantized codes.
+- **Next up:** Quantized query path and error-bound rerank selection.
 - **Done:** Stage 0 (Skeleton), Stage 1 (Durable Documents), Stage 2 (SST/LSM),
   Stage 3 (Attributes & Exact Search), Stage 4 (ANN v0), Stage 5 (Native
   Filtering), Stage 6 (SPFresh local rebuild), Stage 7 (Full-text search).
-- **Tests:** `cargo test` green (107 tests); `cargo clippy --all-targets` clean.
+- **Tests:** `cargo test` green (108 tests); `cargo clippy --all-targets` clean.
 - **Note:** post-Stage-2 and Stage-3–5 code-review fixes applied; remaining
   findings tracked under "Stage 2 — code review follow-ups" and "Stages 3–5 —
   code review follow-ups". Recently fixed limitations: Stage 2 ranged
@@ -27,7 +27,8 @@ the next unchecked task under "Current milestone" / "Next up".
   block-shaped full-snapshot text postings, BM25 query support, rank-safe
   batched block MAXSCORE top-k, and consistent-snapshot multi-query for hybrid
   retrieval. Stage 8 has started with portable scalar batch distance kernels
-  wired into exact and ANN vector scoring.
+  wired into exact and ANN vector scoring, plus per-cluster RaBitQ residual code
+  generation.
 - **Last updated:** 2026-06-06.
 
 ---
@@ -644,7 +645,7 @@ paths.
 Planned tasks:
 
 - [x] Add portable scalar batch distance kernels for L2, dot, and cosine.
-- [ ] Add per-cluster RaBitQ code generation.
+- [x] Add per-cluster RaBitQ code generation.
 - [ ] Add quantized query path and error-bound rerank selection.
 - [ ] Add portable bitwise RaBitQ estimator, then SIMD kernels with feature
       detection.
@@ -658,6 +659,12 @@ Stage 8 decisions / notes:
   exact query scoring and ANN centroid/posting scans share one batch scoring
   API. RaBitQ can add code-oriented kernels behind this boundary without
   changing query semantics.
+- **D45 — RaBitQ code generation is separate from index persistence.** Stage 8
+  first builds `RabitqIndex` values from an in-memory `VectorIndex`: each vector
+  is encoded as sign bits for its residual from the cluster centroid, with a
+  deterministic per-cluster orthogonal sign transform seed, residual norm,
+  positive-bit count, and live id/local/version metadata. The vector SST format
+  is unchanged until the quantized query path proves the object layout.
 
 ---
 
