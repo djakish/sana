@@ -40,10 +40,20 @@ pub struct VectorIndexMeta {
     pub version_map_key: Option<String>,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub version_map_size_bytes: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub append_indexes: Vec<VectorAppendMeta>,
     pub row_count: u64,
     pub centroid_count: u64,
     pub dim: usize,
     pub metric: DistanceMetric,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct VectorAppendMeta {
+    pub key: String,
+    pub size_bytes: u64,
+    pub row_count: u64,
+    pub generation: u64,
 }
 
 fn is_zero(value: &u64) -> bool {

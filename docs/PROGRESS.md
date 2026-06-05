@@ -12,12 +12,11 @@ the next unchecked task under "Current milestone" / "Next up".
 ## Status snapshot
 
 - **Current stage:** Stage 6 (SPFresh local rebuild) — **in progress**.
-- **Next up:** Mutable vector posting append objects before split/merge/reassign
-  jobs.
+- **Next up:** Posting split/merge thresholds and local rebuild planning.
 - **Done:** Stage 0 (Skeleton), Stage 1 (Durable Documents), Stage 2 (SST/LSM),
   Stage 3 (Attributes & Exact Search), Stage 4 (ANN v0), Stage 5 (Native
   Filtering).
-- **Tests:** `cargo test` green (78 tests); `cargo clippy --all-targets` clean.
+- **Tests:** `cargo test` green (80 tests); `cargo clippy --all-targets` clean.
 - **Note:** post-Stage-2 and Stage-3–5 code-review fixes applied; remaining
   findings tracked under "Stage 2 — code review follow-ups" and "Stages 3–5 —
   code review follow-ups".
@@ -429,7 +428,7 @@ Planned tasks:
 
 - [x] Add versioned vector entries and a vector version map keyed by document id
       and vector column.
-- [ ] Add mutable posting append objects for new vectors instead of rebuilding
+- [x] Add mutable posting append objects for new vectors instead of rebuilding
       the whole IVF object on every flush.
 - [x] Make ANN drop stale/deleted vector versions using the version map.
 - [ ] Add posting-level split/merge thresholds and local rebuild planning.
@@ -439,9 +438,10 @@ Planned tasks:
 
 Known limitations to improve later:
 
-- Stage 6 still rebuilds the IVF object on each flush. The new version map is
-  the correctness layer needed before append-only vector posting deltas can
-  leave old copies behind.
+- Flushes publish append vector delta objects once a base IVF index exists;
+  compaction still rewrites a full base and clears the append chain. Append
+  objects currently reuse the IVF codec and duplicate centroids, so a future
+  posting-specific object format should reduce overhead and bound chain length.
 - Version numbers are currently index generation numbers. Future append objects
   should use monotonic per-column vector versions or WAL positions so local
   rebuilds can CAS the map without rebuilding unrelated postings.
@@ -458,6 +458,12 @@ Stage 6 decisions / notes so far:
   not only the user-visible `k`, because stale/touched entries may be removed
   after the scan. Final truncation still applies after stale filtering and WAL
   overlay merge.
+- **D34 — Flush appends vector deltas; compaction resets the base.** Ordinary
+  flushes with an existing vector index load the base centroids, assign touched
+  live vectors to the nearest existing posting, write a generation-scoped append
+  object, and publish an updated version map. The base IVF key stays stable
+  across append flushes, while stale older copies are suppressed by the version
+  map. Full compaction rebuilds the base index and clears appends.
 
 ---
 

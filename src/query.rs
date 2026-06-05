@@ -426,13 +426,41 @@ async fn execute_ann_vector(
         },
         None => None,
     };
-    let ann_hits = index.search_with_filter(
+    let mut ann_hits = index.search_with_filter(
         &query.vector,
         usize::MAX,
         query.probes,
         Some(metric),
         native_filter.as_ref(),
     )?;
+    for append_meta in &meta.append_indexes {
+        let append_index = VectorIndex::decode(&ns.store().get(&append_meta.key).await?.bytes)?;
+        let append_filter = match filter {
+            Some(filter) => match native_filter_mask(&append_index, filter)? {
+                Some(mask) => Some(mask),
+                None => {
+                    return exact_vector_fallback(
+                        ns,
+                        manifest,
+                        Some(filter),
+                        &exact_query,
+                        metric,
+                        dim,
+                        limit,
+                    )
+                    .await;
+                }
+            },
+            None => None,
+        };
+        ann_hits.extend(append_index.search_with_filter(
+            &query.vector,
+            usize::MAX,
+            query.probes,
+            Some(metric),
+            append_filter.as_ref(),
+        )?);
+    }
 
     let commit = ns.commit_cursor().await?;
     let mut touched = BTreeSet::new();

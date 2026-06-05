@@ -397,6 +397,49 @@ async fn ann_vector_query_matches_exact_with_full_probes() {
 }
 
 #[tokio::test]
+async fn ann_vector_query_reads_flushed_append_postings() {
+    let dir = tempfile::tempdir().unwrap();
+    let ns = Namespace::create(store(&dir), "docs").await.unwrap();
+    ns.upsert(doc(1, "blue-far", 10, &["blue"], [10.0, 0.0]))
+        .await
+        .unwrap();
+    indexer::flush(&ns).await.unwrap();
+
+    ns.upsert(doc(2, "red-near", 20, &["red"], [0.05, 0.0]))
+        .await
+        .unwrap();
+    indexer::flush(&ns).await.unwrap();
+
+    let manifest = ns.load_manifest().await.unwrap();
+    assert_eq!(manifest.vector_indexes["embedding"].append_indexes.len(), 1);
+
+    let ann = ns
+        .query(Query {
+            filter: Some(FilterExpr::Eq {
+                column: "tags".into(),
+                value: Value::String("red".into()),
+            }),
+            order_by: None,
+            limit: None,
+            aggregates: Vec::new(),
+            exact_vector: None,
+            approx_vector: Some(ApproxVectorQuery {
+                column: "embedding".into(),
+                vector: vec![0.0, 0.0],
+                k: 1,
+                probes: Some(16),
+                metric: Some(DistanceMetric::L2),
+            }),
+        })
+        .await
+        .unwrap();
+
+    let ids: Vec<Id> = ann.rows.iter().map(|row| row.id.clone()).collect();
+    assert_eq!(ids, vec![Id::U64(2)]);
+    assert_eq!(ann.rows[0].score, Some(-0.0025000002));
+}
+
+#[tokio::test]
 async fn ann_vector_query_rechecks_wal_overlay() {
     let dir = tempfile::tempdir().unwrap();
     let ns = Namespace::create(store(&dir), "docs").await.unwrap();

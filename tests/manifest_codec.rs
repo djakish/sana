@@ -1,6 +1,8 @@
 mod common;
 
-use sana::manifest::{ManifestPointer, NamespaceManifest, SstMeta, VectorIndexMeta};
+use sana::manifest::{
+    ManifestPointer, NamespaceManifest, SstMeta, VectorAppendMeta, VectorIndexMeta,
+};
 use sana::schema::{ColumnSpec, ColumnType, DistanceMetric, ScalarType, Schema, VectorEncoding};
 use sana::value::Id;
 use sana::wal::WalCursor;
@@ -86,6 +88,12 @@ fn manifest_round_trips_doc_sst_metadata() {
                 "namespaces/docs/index/g/7/vector/656d62656464696e67/versions.bin".into(),
             ),
             version_map_size_bytes: 1024,
+            append_indexes: vec![VectorAppendMeta {
+                key: "namespaces/docs/index/g/8/vector/656d62656464696e67/append-8.ivf.bin".into(),
+                size_bytes: 512,
+                row_count: 1,
+                generation: 8,
+            }],
             row_count: 2,
             centroid_count: 2,
             dim: 768,

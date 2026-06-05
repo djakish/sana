@@ -20,15 +20,21 @@ use bytes::Bytes;
 use crate::attr;
 use crate::doc::{DocRecord, encode_id};
 use crate::error::Result;
-use crate::manifest::{NamespaceManifest, SstMeta, VectorIndexMeta};
+use crate::manifest::{NamespaceManifest, SstMeta, VectorAppendMeta, VectorIndexMeta};
 use crate::namespace::{Namespace, apply_op, now_ms, op_id};
-use crate::schema::ColumnType;
+use crate::schema::{ColumnType, DistanceMetric};
 use crate::sst::SstWriter;
 use crate::value::{Document, Id};
 use crate::vector::{VectorEntry, VectorIndex, VectorVersionMap, vector_to_f32};
 
 fn vector_family_bytes(meta: &VectorIndexMeta) -> u64 {
-    meta.size_bytes + meta.version_map_size_bytes
+    meta.size_bytes
+        + meta.version_map_size_bytes
+        + meta
+            .append_indexes
+            .iter()
+            .map(|append| append.size_bytes)
+            .sum::<u64>()
 }
 
 struct BuiltSst {
@@ -36,6 +42,13 @@ struct BuiltSst {
     row_count: u64,
     min_id: Option<Id>,
     max_id: Option<Id>,
+}
+
+#[derive(Clone, Copy)]
+struct VectorColumnPublish<'a> {
+    name: &'a str,
+    metric: DistanceMetric,
+    dim: usize,
 }
 
 async fn publish_attr_sst(
@@ -70,63 +83,194 @@ async fn publish_vector_indexes(
     generation: u64,
     manifest: &NamespaceManifest,
     docs: &BTreeMap<Id, Document>,
+    touched: Option<&BTreeSet<Id>>,
 ) -> Result<BTreeMap<String, VectorIndexMeta>> {
     let mut out = BTreeMap::new();
     for (column, spec) in &manifest.schema.columns {
         let ColumnType::Vector { dim, metric, .. } = spec.column_type else {
             continue;
         };
+        let vector_column = VectorColumnPublish {
+            name: column,
+            metric,
+            dim,
+        };
 
-        let mut entries = Vec::new();
-        for (id, doc) in docs {
-            let Some(vector) = doc.vectors.get(column) else {
-                continue;
-            };
-            entries.push(VectorEntry {
-                id: id.clone(),
-                vector: vector_to_f32(vector),
-                local_id: 0,
-                version: generation,
-            });
+        if let (Some(prev), Some(touched)) = (manifest.vector_indexes.get(column), touched) {
+            if let Some(meta) =
+                publish_vector_append(ns, generation, vector_column, prev, docs, touched).await?
+            {
+                out.insert(column.clone(), meta);
+            }
+            continue;
         }
 
-        let Some(index) = VectorIndex::build(column.clone(), metric, dim, entries, docs)? else {
-            continue;
-        };
-        let bytes = index.encode()?;
-        let version_map = VectorVersionMap::from_index(&index);
-        let version_map_bytes = version_map.encode()?;
-        let key = format!(
-            "namespaces/{}/index/g/{}/vector/{}/ivf.bin",
-            ns.name(),
-            generation,
-            object_path_component(column)
-        );
-        let version_map_key = format!(
-            "namespaces/{}/index/g/{}/vector/{}/versions.bin",
-            ns.name(),
-            generation,
-            object_path_component(column)
-        );
-        ns.store().put(&key, Bytes::from(bytes.clone())).await?;
-        ns.store()
-            .put(&version_map_key, Bytes::from(version_map_bytes.clone()))
-            .await?;
-        out.insert(
-            column.clone(),
-            VectorIndexMeta {
-                key,
-                size_bytes: bytes.len() as u64,
-                version_map_key: Some(version_map_key),
-                version_map_size_bytes: version_map_bytes.len() as u64,
-                row_count: index.row_count() as u64,
-                centroid_count: index.centroids.len() as u64,
-                dim,
-                metric,
-            },
-        );
+        if let Some(meta) = publish_full_vector_index(ns, generation, vector_column, docs).await? {
+            out.insert(column.clone(), meta);
+        }
     }
     Ok(out)
+}
+
+async fn publish_full_vector_index(
+    ns: &Namespace,
+    generation: u64,
+    column: VectorColumnPublish<'_>,
+    docs: &BTreeMap<Id, Document>,
+) -> Result<Option<VectorIndexMeta>> {
+    let entries = vector_entries_for_docs(column.name, generation, docs.iter())?;
+    let Some(index) = VectorIndex::build(
+        column.name.to_string(),
+        column.metric,
+        column.dim,
+        entries,
+        docs,
+    )?
+    else {
+        return Ok(None);
+    };
+    let bytes = index.encode()?;
+    let version_map = VectorVersionMap::from_index(&index);
+    let version_map_bytes = version_map.encode()?;
+    let component = object_path_component(column.name);
+    let key = format!(
+        "namespaces/{}/index/g/{}/vector/{}/ivf.bin",
+        ns.name(),
+        generation,
+        component
+    );
+    let version_map_key = format!(
+        "namespaces/{}/index/g/{}/vector/{}/versions.bin",
+        ns.name(),
+        generation,
+        component
+    );
+    ns.store().put(&key, Bytes::from(bytes.clone())).await?;
+    ns.store()
+        .put(&version_map_key, Bytes::from(version_map_bytes.clone()))
+        .await?;
+    Ok(Some(VectorIndexMeta {
+        key,
+        size_bytes: bytes.len() as u64,
+        version_map_key: Some(version_map_key),
+        version_map_size_bytes: version_map_bytes.len() as u64,
+        append_indexes: Vec::new(),
+        row_count: index.row_count() as u64,
+        centroid_count: index.centroids.len() as u64,
+        dim: column.dim,
+        metric: column.metric,
+    }))
+}
+
+async fn publish_vector_append(
+    ns: &Namespace,
+    generation: u64,
+    column: VectorColumnPublish<'_>,
+    prev: &VectorIndexMeta,
+    docs: &BTreeMap<Id, Document>,
+    touched: &BTreeSet<Id>,
+) -> Result<Option<VectorIndexMeta>> {
+    if prev.dim != column.dim || prev.metric != column.metric {
+        return publish_full_vector_index(ns, generation, column, docs).await;
+    }
+
+    let base = VectorIndex::decode(&ns.store().get(&prev.key).await?.bytes)?;
+    let mut version_map = match &prev.version_map_key {
+        Some(key) => VectorVersionMap::decode(&ns.store().get(key).await?.bytes)?,
+        None => VectorVersionMap::from_index(&base),
+    };
+
+    let mut touched_docs = Vec::new();
+    for id in touched {
+        if let Some(doc) = docs.get(id)
+            && doc.vectors.contains_key(column.name)
+        {
+            version_map.versions.insert(id.clone(), generation);
+            touched_docs.push((id.clone(), doc.clone()));
+        } else {
+            version_map.versions.remove(id);
+        }
+    }
+
+    if version_map.versions.is_empty() {
+        return Ok(None);
+    }
+
+    let entries = vector_entries_for_docs(
+        column.name,
+        generation,
+        touched_docs.iter().map(|(id, doc)| (id, doc)),
+    )?;
+    let mut append_indexes = prev.append_indexes.clone();
+    let component = object_path_component(column.name);
+    if let Some(append) = VectorIndex::build_append(
+        column.name.to_string(),
+        column.metric,
+        column.dim,
+        base.centroids.clone(),
+        entries,
+        docs,
+    )? {
+        let bytes = append.encode()?;
+        let key = format!(
+            "namespaces/{}/index/g/{}/vector/{}/append-{}.ivf.bin",
+            ns.name(),
+            generation,
+            component,
+            generation
+        );
+        ns.store().put(&key, Bytes::from(bytes.clone())).await?;
+        let size_bytes = bytes.len() as u64;
+        append_indexes.push(VectorAppendMeta {
+            key,
+            size_bytes,
+            row_count: append.row_count() as u64,
+            generation,
+        });
+    }
+
+    let version_map_key = format!(
+        "namespaces/{}/index/g/{}/vector/{}/versions.bin",
+        ns.name(),
+        generation,
+        component
+    );
+    let version_map_bytes = version_map.encode()?;
+    ns.store()
+        .put(&version_map_key, Bytes::from(version_map_bytes.clone()))
+        .await?;
+
+    Ok(Some(VectorIndexMeta {
+        key: prev.key.clone(),
+        size_bytes: prev.size_bytes,
+        version_map_key: Some(version_map_key),
+        version_map_size_bytes: version_map_bytes.len() as u64,
+        append_indexes,
+        row_count: version_map.versions.len() as u64,
+        centroid_count: prev.centroid_count,
+        dim: column.dim,
+        metric: column.metric,
+    }))
+}
+
+fn vector_entries_for_docs<'a>(
+    column: &str,
+    version: u64,
+    docs: impl Iterator<Item = (&'a Id, &'a Document)>,
+) -> Result<Vec<VectorEntry>> {
+    let mut entries = Vec::new();
+    for (id, doc) in docs {
+        let Some(vector) = doc.vectors.get(column) else {
+            continue;
+        };
+        entries.push(VectorEntry {
+            id: id.clone(),
+            vector: vector_to_f32(vector),
+            local_id: 0,
+            version,
+        });
+    }
+    Ok(entries)
 }
 
 fn object_path_component(value: &str) -> String {
@@ -193,6 +337,7 @@ pub async fn flush(ns: &Namespace) -> Result<bool> {
             .await?;
         return Ok(true);
     }
+    let touched_ids = touched.clone();
 
     // Load existing SST records once (not one point-get per touched id), then
     // seed each touched id with its resolved base so a Patch in the delta merges
@@ -241,7 +386,8 @@ pub async fn flush(ns: &Namespace) -> Result<bool> {
     let row_count = live_docs.len() as u64;
     let attr_ssts =
         publish_attr_sst(ns, new_gen, &format!("full-{}", commit.seq), &live_docs).await?;
-    let vector_indexes = publish_vector_indexes(ns, new_gen, &manifest, &live_docs).await?;
+    let vector_indexes =
+        publish_vector_indexes(ns, new_gen, &manifest, &live_docs, Some(&touched_ids)).await?;
 
     manifest.generation = new_gen;
     manifest.updated_at_ms = now_ms();
@@ -315,7 +461,8 @@ pub async fn compact(ns: &Namespace) -> Result<bool> {
     manifest.wal_commit_cursor = Some(ns.commit_cursor().await?);
     manifest.approx_row_count = built.row_count;
     manifest.attr_ssts = publish_attr_sst(ns, new_gen, "full", &live_docs).await?;
-    manifest.vector_indexes = publish_vector_indexes(ns, new_gen, &manifest, &live_docs).await?;
+    manifest.vector_indexes =
+        publish_vector_indexes(ns, new_gen, &manifest, &live_docs, None).await?;
     manifest.vector_index_generations = manifest
         .vector_indexes
         .keys()

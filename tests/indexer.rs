@@ -32,7 +32,14 @@ fn indexed_bytes(manifest: &sana::manifest::NamespaceManifest) -> u64 {
         + manifest
             .vector_indexes
             .values()
-            .map(|m| m.size_bytes + m.version_map_size_bytes)
+            .map(|m| {
+                m.size_bytes
+                    + m.version_map_size_bytes
+                    + m.append_indexes
+                        .iter()
+                        .map(|append| append.size_bytes)
+                        .sum::<u64>()
+            })
             .sum::<u64>()
 }
 
@@ -91,6 +98,7 @@ async fn flush_publishes_vector_indexes() {
     assert_eq!(meta.row_count, 2);
     assert_eq!(meta.dim, 2);
     assert!(meta.centroid_count >= 1);
+    assert!(meta.append_indexes.is_empty());
     assert_eq!(
         manifest.vector_index_generations["embedding"],
         manifest.generation
@@ -143,6 +151,77 @@ async fn flush_publishes_vector_indexes() {
         .unwrap();
     let ids: Vec<Id> = hits.into_iter().map(|hit| hit.id).collect();
     assert_eq!(ids, vec![Id::U64(1)]);
+}
+
+#[tokio::test]
+async fn second_flush_publishes_vector_append_delta() {
+    let dir = tempfile::tempdir().unwrap();
+    let object_store = store(&dir);
+    let ns = Namespace::create(object_store.clone(), "docs")
+        .await
+        .unwrap();
+    ns.upsert(doc_with_vector(1, "base-a", 10, [10.0, 0.0]))
+        .await
+        .unwrap();
+    ns.upsert(doc_with_vector(2, "base-b", 20, [20.0, 0.0]))
+        .await
+        .unwrap();
+    indexer::flush(&ns).await.unwrap();
+
+    let first_manifest = ns.load_manifest().await.unwrap();
+    let first_generation = first_manifest.generation;
+    let first_meta = first_manifest
+        .vector_indexes
+        .get("embedding")
+        .unwrap()
+        .clone();
+
+    ns.upsert(doc_with_vector(3, "append", 30, [0.05, 0.0]))
+        .await
+        .unwrap();
+    indexer::flush(&ns).await.unwrap();
+
+    let manifest = ns.load_manifest().await.unwrap();
+    let meta = manifest.vector_indexes.get("embedding").unwrap();
+    assert_eq!(meta.key, first_meta.key);
+    assert_eq!(meta.size_bytes, first_meta.size_bytes);
+    assert_eq!(meta.row_count, 3);
+    assert_eq!(meta.append_indexes.len(), 1);
+    assert_eq!(
+        manifest.vector_index_generations["embedding"],
+        manifest.generation
+    );
+    assert_eq!(manifest.approx_logical_bytes, indexed_bytes(&manifest));
+
+    let append_meta = &meta.append_indexes[0];
+    assert_eq!(append_meta.generation, manifest.generation);
+    assert_eq!(append_meta.row_count, 1);
+    assert!(append_meta.size_bytes > 0);
+
+    let append =
+        VectorIndex::decode(&object_store.get(&append_meta.key).await.unwrap().bytes).unwrap();
+    assert_eq!(append.row_count(), 1);
+    assert_eq!(append.centroids.len() as u64, first_meta.centroid_count);
+    assert_eq!(append.addresses.len(), 1);
+    assert_eq!(append.addresses[0].id, Id::U64(3));
+    assert_eq!(append.addresses[0].version, manifest.generation);
+
+    let version_map = VectorVersionMap::decode(
+        &object_store
+            .get(meta.version_map_key.as_ref().unwrap())
+            .await
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
+    assert_eq!(
+        version_map.live_version(&Id::U64(1)),
+        Some(first_generation)
+    );
+    assert_eq!(
+        version_map.live_version(&Id::U64(3)),
+        Some(manifest.generation)
+    );
 }
 
 #[tokio::test]

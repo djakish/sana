@@ -227,6 +227,65 @@ impl VectorIndex {
         }))
     }
 
+    pub fn build_append(
+        column: impl Into<String>,
+        metric: DistanceMetric,
+        dim: usize,
+        centroids: Vec<Vec<f32>>,
+        mut entries: Vec<VectorEntry>,
+        docs: &BTreeMap<Id, Document>,
+    ) -> Result<Option<Self>> {
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        if centroids.is_empty() {
+            return Err(Error::Corrupt(
+                "cannot append vectors without base centroids".into(),
+            ));
+        }
+        for centroid in &centroids {
+            validate_query_vector(centroid, dim, "append centroid")?;
+        }
+        entries.sort_by(|a, b| a.id.cmp(&b.id));
+        for entry in &entries {
+            validate_query_vector(&entry.vector, dim, "appended vector")?;
+        }
+
+        let mut assignments = vec![0usize; entries.len()];
+        assign_entries(&entries, &centroids, metric, &mut assignments)?;
+
+        let mut postings = (0..centroids.len())
+            .map(|centroid_id| VectorPosting {
+                centroid_id: centroid_id as u32,
+                vectors: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let mut addresses = Vec::new();
+        for (mut entry, centroid_id) in entries.into_iter().zip(assignments) {
+            entry.local_id = postings[centroid_id].vectors.len() as u32;
+            addresses.push(VectorAddress {
+                id: entry.id.clone(),
+                cluster_id: centroid_id as u32,
+                local_id: entry.local_id,
+                version: entry.version,
+            });
+            postings[centroid_id].vectors.push(entry);
+        }
+        addresses.sort_by(|a, b| a.id.cmp(&b.id));
+        let filter_index = VectorFilterIndex::build(&postings, docs)?;
+
+        Ok(Some(Self {
+            format_version: VECTOR_FORMAT_VERSION,
+            column: column.into(),
+            dim,
+            metric,
+            centroids,
+            postings,
+            addresses,
+            filter_index,
+        }))
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let body = postcard::to_allocvec(self).map_err(|e| Error::Codec(e.to_string()))?;
         let crc = crc32fast::hash(&body);
