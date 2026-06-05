@@ -77,6 +77,38 @@ pub fn build_attr_sst(docs: &BTreeMap<Id, Document>) -> Result<Option<BuiltAttrS
     }))
 }
 
+/// Merge several attribute postings SSTs into one, unioning the id postings for
+/// each key (the all-docs key included). Used by size-tiered attribute
+/// compaction to bound read fan-out. Stale entries are *retained* — a value-keyed
+/// posting cannot know an id's current value — so this only reduces the number of
+/// runs, not their staleness; a full rebuild from live documents (`compact`)
+/// removes stale entries. Returns `None` if every input is empty.
+pub fn merge_attr_ssts(readers: &[SstReader]) -> Result<Option<BuiltAttrSst>> {
+    let mut postings: BTreeMap<Vec<u8>, BTreeSet<Id>> = BTreeMap::new();
+    for reader in readers {
+        for (key, bytes) in reader.entries()? {
+            postings
+                .entry(key)
+                .or_default()
+                .extend(PostingList::decode(&bytes)?);
+        }
+    }
+    if postings.is_empty() {
+        return Ok(None);
+    }
+
+    let mut writer = SstWriter::new();
+    let mut entry_count = 0u64;
+    for (key, ids) in postings {
+        writer.add(&key, &PostingList::encode(ids.into_iter().collect())?)?;
+        entry_count += 1;
+    }
+    Ok(Some(BuiltAttrSst {
+        bytes: writer.finish(),
+        entry_count,
+    }))
+}
+
 pub fn all_ids(reader: &SstReader) -> Result<BTreeSet<Id>> {
     match reader.get(&all_docs_key())? {
         Some(bytes) => PostingList::decode(&bytes),

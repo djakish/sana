@@ -432,8 +432,24 @@ pub async fn flush(ns: &Namespace) -> Result<bool> {
     }
     let live_docs = live_documents(&merged);
     let row_count = live_docs.len() as u64;
-    let attr_ssts =
-        publish_attr_sst(ns, new_gen, &format!("full-{}", commit.seq), &live_docs).await?;
+
+    // Attribute postings as a delta: write only the touched live docs and append
+    // to the prior levels, instead of rewriting every id's postings. Untouched
+    // ids keep their postings in older levels; the query path unions across levels
+    // and rechecks. The first flush touches every id, so its delta is already a
+    // complete snapshot. Then size-tier to bound read fan-out.
+    let touched_live: BTreeMap<Id, Document> = touched_ids
+        .iter()
+        .filter_map(|id| live_docs.get(id).map(|doc| (id.clone(), doc.clone())))
+        .collect();
+    let mut attr_ssts = manifest.attr_ssts.clone();
+    for meta in
+        publish_attr_sst(ns, new_gen, &format!("delta-{}", commit.seq), &touched_live).await?
+    {
+        attr_ssts.insert(0, meta);
+    }
+    tier_attr_ssts(ns, new_gen, &mut attr_ssts, commit.seq).await?;
+
     let vector_indexes =
         publish_vector_indexes(ns, new_gen, &manifest, &live_docs, Some(&touched_ids)).await?;
 
@@ -548,6 +564,63 @@ async fn tier_doc_ssts(
             .position(|meta| meta.level > level)
             .unwrap_or(doc_ssts.len());
         doc_ssts.insert(pos, merged_meta);
+        step += 1;
+    }
+}
+
+/// Size-tiered minor compaction over `attr_ssts`, the analogue of
+/// [`tier_doc_ssts`] for the attribute family. While some level holds at least
+/// [`TIER_TRIGGER`] runs, union its postings into one run at the next level. Order
+/// within `attr_ssts` is irrelevant (the query path unions all levels), so the
+/// merged run is simply prepended. Stale entries are retained — only the full
+/// [`compact`] rebuild from live documents removes them.
+async fn tier_attr_ssts(
+    ns: &Namespace,
+    generation: u64,
+    attr_ssts: &mut Vec<SstMeta>,
+    commit_seq: u64,
+) -> Result<()> {
+    let mut step = 0u32;
+    loop {
+        let mut counts: BTreeMap<u32, usize> = BTreeMap::new();
+        for meta in attr_ssts.iter() {
+            *counts.entry(meta.level).or_default() += 1;
+        }
+        let Some((&level, _)) = counts.iter().find(|&(_, &count)| count >= TIER_TRIGGER) else {
+            return Ok(());
+        };
+
+        let mut readers = Vec::new();
+        for meta in attr_ssts.iter().filter(|meta| meta.level == level) {
+            readers.push(ns.load_sst(&meta.key).await?);
+        }
+        attr_ssts.retain(|meta| meta.level != level);
+        let Some(built) = attr::merge_attr_ssts(&readers)? else {
+            continue;
+        };
+
+        let sst_key = format!(
+            "namespaces/{}/index/g/{}/attr/tier-{}-{}-{}.sst",
+            ns.name(),
+            generation,
+            level + 1,
+            commit_seq,
+            step
+        );
+        ns.store()
+            .put(&sst_key, Bytes::from(built.bytes.clone()))
+            .await?;
+        attr_ssts.insert(
+            0,
+            SstMeta {
+                key: sst_key,
+                size_bytes: built.bytes.len() as u64,
+                row_count: built.entry_count,
+                min_id: None,
+                max_id: None,
+                level: level + 1,
+            },
+        );
         step += 1;
     }
 }

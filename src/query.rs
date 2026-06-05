@@ -671,33 +671,44 @@ async fn indexed_filter_candidate_ids(
     manifest: &NamespaceManifest,
     filter: &FilterExpr,
 ) -> Result<Option<BTreeSet<Id>>> {
-    let Some(meta) = manifest.attr_ssts.first() else {
+    if manifest.attr_ssts.is_empty() {
         return Ok(None);
-    };
-    let reader = ns.load_sst(&meta.key).await?;
-    candidate_ids_from_filter(&reader, filter)
+    }
+    // Attribute postings are delta levels: each flush appends only the touched
+    // ids, so a column's current value for an id may live in any level. Read them
+    // all and union per leaf below; the materialize step rechecks every candidate
+    // against the live document, so stale entries are harmless false positives.
+    let mut readers = Vec::with_capacity(manifest.attr_ssts.len());
+    for meta in &manifest.attr_ssts {
+        readers.push(ns.load_sst(&meta.key).await?);
+    }
+    candidate_ids_from_filter(&readers, filter)
 }
 
 fn candidate_ids_from_filter(
-    reader: &crate::sst::SstReader,
+    readers: &[crate::sst::SstReader],
     filter: &FilterExpr,
 ) -> Result<Option<BTreeSet<Id>>> {
     match filter {
-        FilterExpr::Eq { column, value } => attr::ids_for_eq(reader, column, value),
+        FilterExpr::Eq { column, value } => {
+            union_over_levels(readers, |reader| attr::ids_for_eq(reader, column, value))
+        }
         FilterExpr::Range {
             column,
             lower,
             upper,
-        } => attr::ids_for_range(
-            reader,
-            column,
-            lower.as_ref().map(range_bound_to_attr_bound),
-            upper.as_ref().map(range_bound_to_attr_bound),
-        ),
+        } => union_over_levels(readers, |reader| {
+            attr::ids_for_range(
+                reader,
+                column,
+                lower.as_ref().map(range_bound_to_attr_bound),
+                upper.as_ref().map(range_bound_to_attr_bound),
+            )
+        }),
         FilterExpr::And(filters) => {
             let mut out: Option<BTreeSet<Id>> = None;
             for filter in filters {
-                let Some(ids) = candidate_ids_from_filter(reader, filter)? else {
+                let Some(ids) = candidate_ids_from_filter(readers, filter)? else {
                     return Ok(None);
                 };
                 out = Some(match out {
@@ -707,27 +718,50 @@ fn candidate_ids_from_filter(
             }
             Ok(Some(match out {
                 Some(ids) => ids,
-                None => attr::all_ids(reader)?,
+                None => all_ids_over_levels(readers)?,
             }))
         }
         FilterExpr::Or(filters) => {
             let mut out = BTreeSet::new();
             for filter in filters {
-                let Some(ids) = candidate_ids_from_filter(reader, filter)? else {
+                let Some(ids) = candidate_ids_from_filter(readers, filter)? else {
                     return Ok(None);
                 };
                 out.extend(ids);
             }
             Ok(Some(out))
         }
-        FilterExpr::Not(filter) => {
-            let Some(ids) = candidate_ids_from_filter(reader, filter)? else {
-                return Ok(None);
-            };
-            let all = attr::all_ids(reader)?;
-            Ok(Some(all.difference(&ids).cloned().collect()))
-        }
+        // Complement needs exact current membership, but delta levels carry stale
+        // postings (an id keeps its old value's posting until a full compaction).
+        // Unioning those would drop true matches, so leave `Not` to the full-scan
+        // recheck path rather than serve a wrong candidate set from the index.
+        FilterExpr::Not(_) => Ok(None),
     }
+}
+
+/// Union a per-level leaf lookup across all attribute levels. Returns `None`
+/// (filter not index-serviceable) as soon as any level reports it, since
+/// serviceability depends on the value/column, not the level's contents.
+fn union_over_levels(
+    readers: &[crate::sst::SstReader],
+    mut leaf: impl FnMut(&crate::sst::SstReader) -> Result<Option<BTreeSet<Id>>>,
+) -> Result<Option<BTreeSet<Id>>> {
+    let mut out = BTreeSet::new();
+    for reader in readers {
+        let Some(ids) = leaf(reader)? else {
+            return Ok(None);
+        };
+        out.extend(ids);
+    }
+    Ok(Some(out))
+}
+
+fn all_ids_over_levels(readers: &[crate::sst::SstReader]) -> Result<BTreeSet<Id>> {
+    let mut out = BTreeSet::new();
+    for reader in readers {
+        out.extend(attr::all_ids(reader)?);
+    }
+    Ok(out)
 }
 
 fn range_bound_to_attr_bound(bound: &RangeBound) -> AttrBound<'_> {

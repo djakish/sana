@@ -9,7 +9,7 @@ use sana::manifest::{
 };
 use sana::namespace::Namespace;
 use sana::object_store::{FsObjectStore, ObjectStore};
-use sana::query::{ApproxVectorQuery, Query};
+use sana::query::{ApproxVectorQuery, FilterExpr, Query};
 use sana::schema::DistanceMetric;
 use sana::value::{Document, Id, Value, VectorValue};
 use sana::vector::{VectorIndex, VectorVersionMap};
@@ -642,6 +642,102 @@ async fn size_tiered_compaction_merges_overflowing_level() {
     let m = ns.load_manifest().await.unwrap();
     assert_eq!(m.doc_ssts.len(), 1);
     assert_eq!(m.doc_ssts[0].row_count, 4);
+}
+
+#[tokio::test]
+async fn attr_postings_are_delta_appended_and_tiered() {
+    let dir = tempfile::tempdir().unwrap();
+    let ns = Namespace::create(store(&dir), "docs").await.unwrap();
+
+    let by_score = |score: i64| Query {
+        filter: Some(FilterExpr::Eq {
+            column: "score".into(),
+            value: Value::Int(score),
+        }),
+        order_by: None,
+        limit: None,
+        aggregates: Vec::new(),
+        exact_vector: None,
+        approx_vector: None,
+    };
+    let ids =
+        |r: sana::query::QueryResult| -> Vec<Id> { r.rows.into_iter().map(|row| row.id).collect() };
+
+    // Seed ten docs; the first flush writes one full attr snapshot.
+    for id in 1..=10u64 {
+        ns.upsert(doc_with(id, &format!("t{id}"), 100))
+            .await
+            .unwrap();
+    }
+    indexer::flush(&ns).await.unwrap();
+    let m = ns.load_manifest().await.unwrap();
+    assert_eq!(m.attr_ssts.len(), 1);
+    let snapshot_rows = m.attr_ssts[0].row_count;
+
+    // Change one doc's score; the flush appends a small delta, not a full rewrite.
+    ns.upsert(doc_with(1, "t1", 200)).await.unwrap();
+    indexer::flush(&ns).await.unwrap();
+    let m = ns.load_manifest().await.unwrap();
+    assert_eq!(
+        m.attr_ssts.len(),
+        2,
+        "flush should append a delta, not rewrite"
+    );
+    let delta = m
+        .attr_ssts
+        .iter()
+        .find(|s| s.key.contains("delta-"))
+        .expect("a delta run");
+    assert!(
+        delta.row_count < snapshot_rows,
+        "delta {} should be far smaller than the snapshot {}",
+        delta.row_count,
+        snapshot_rows
+    );
+
+    // The new value is found in the delta; the stale old-value posting for id 1
+    // is rechecked out of score=100.
+    assert_eq!(
+        ids(ns.query(by_score(200)).await.unwrap()),
+        vec![Id::U64(1)]
+    );
+    assert_eq!(
+        ids(ns.query(by_score(100)).await.unwrap()),
+        (2..=10).map(Id::U64).collect::<Vec<_>>()
+    );
+
+    // A delete must not surface across levels.
+    ns.delete(Id::U64(2)).await.unwrap();
+    indexer::flush(&ns).await.unwrap();
+    assert_eq!(
+        ids(ns.query(by_score(100)).await.unwrap()),
+        (3..=10).map(Id::U64).collect::<Vec<_>>()
+    );
+
+    // Enough flushes to trip attr tiering; correctness must hold across the merge.
+    for id in 11..=14u64 {
+        ns.upsert(doc_with(id, &format!("t{id}"), 100))
+            .await
+            .unwrap();
+        indexer::flush(&ns).await.unwrap();
+    }
+    let m = ns.load_manifest().await.unwrap();
+    assert!(
+        m.attr_ssts.iter().any(|s| s.level >= 1),
+        "attribute levels should have tiered"
+    );
+    let mut want: Vec<Id> = (3..=10).map(Id::U64).collect();
+    want.extend((11..=14).map(Id::U64));
+    assert_eq!(ids(ns.query(by_score(100)).await.unwrap()), want);
+
+    // A full compaction rebuilds a single clean snapshot.
+    assert!(indexer::compact(&ns).await.unwrap());
+    let m = ns.load_manifest().await.unwrap();
+    assert_eq!(m.attr_ssts.len(), 1);
+    assert_eq!(m.attr_ssts[0].level, 0);
+    let mut want: Vec<Id> = (3..=10).map(Id::U64).collect();
+    want.extend((11..=14).map(Id::U64));
+    assert_eq!(ids(ns.query(by_score(100)).await.unwrap()), want);
 }
 
 #[tokio::test]

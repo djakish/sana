@@ -16,12 +16,14 @@ the next unchecked task under "Current milestone" / "Next up".
 - **Done:** Stage 0 (Skeleton), Stage 1 (Durable Documents), Stage 2 (SST/LSM),
   Stage 3 (Attributes & Exact Search), Stage 4 (ANN v0), Stage 5 (Native
   Filtering), Stage 6 (SPFresh local rebuild).
-- **Tests:** `cargo test` green (91 tests); `cargo clippy --all-targets` clean.
+- **Tests:** `cargo test` green (92 tests); `cargo clippy --all-targets` clean.
 - **Note:** post-Stage-2 and Stage-3–5 code-review fixes applied; remaining
   findings tracked under "Stage 2 — code review follow-ups" and "Stages 3–5 —
-  code review follow-ups". Stage 2's ranged point-lookup and flat-doc_ssts (no
-  LSM levels) limitations are now fixed (`sst::ranged_get`, size-tiered
-  `tier_doc_ssts`); the vector read path now fetches append deltas concurrently.
+  code review follow-ups". Recently fixed limitations: Stage 2 ranged
+  point-lookup (`sst::ranged_get`) and LSM levels for `doc_ssts`
+  (`tier_doc_ssts`); Stage 3 attribute write-amplification via delta + tiered
+  `attr_ssts` (`tier_attr_ssts`); vector read path fetches append deltas
+  concurrently.
 - **Last updated:** 2026-06-06.
 
 ---
@@ -245,8 +247,16 @@ Planned tasks (refine when started):
 
 Known limitations to improve later:
 
-- Attribute postings are full-snapshot SSTs, not a levelled/delta attribute LSM.
-  This is correct but write-amplifying.
+- ~~Attribute postings are full-snapshot SSTs, not a levelled/delta attribute
+  LSM. This is correct but write-amplifying.~~ **Done (delta + size-tiered).**
+  A flush now appends an attribute delta of only the *touched* live docs
+  (`attr_ssts` carries `level` like `doc_ssts`) instead of rewriting every id's
+  postings, and `tier_attr_ssts` unions overflowing levels. The query path reads
+  all levels and unions per leaf; since every candidate is rechecked against the
+  live document, stale value-keyed postings are harmless false positives.
+  `Eq`/`Range`/`And`/`Or` are served from the index; **`Not` falls back to the
+  full-scan recheck** (complement needs exact membership, which delta levels
+  can't give). The full `compact` still rebuilds one clean, stale-free snapshot.
 - Query execution still materializes candidate documents for predicate recheck,
   ordering, aggregates, and exact kNN. This is acceptable for Stage 3; later
   stages should push more work into index families and vector postings.
@@ -280,6 +290,16 @@ Stage 3 decisions / notes so far:
   predicate after applying the WAL overlay. This favors correctness and simple
   delete/update semantics over write amplification; a proper attribute LSM can
   replace it later.
+- **D24b — Delta + size-tiered attribute postings (supersedes the D24 write
+  path).** A flush now appends a delta of only the touched live docs and tiers
+  overflowing levels (`tier_attr_ssts`), rather than rewriting the whole index.
+  This rests on the always-recheck invariant from D23: the candidate set need
+  only be a *superset*, so unioning value-keyed postings across delta levels is
+  correct for `Eq`/`Range`/`And`/`Or` even though older levels hold stale
+  postings for since-changed/deleted ids — the materialize step rechecks each
+  candidate against the live document and drops the false positives. `Not` is the
+  one exception: complement needs exact membership, so it falls back to the
+  full-scan recheck. The full `compact` still rebuilds one stale-free snapshot.
 
 ---
 
