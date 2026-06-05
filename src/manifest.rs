@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::schema::Schema;
+use crate::value::Id;
 use crate::wal::WalCursor;
 
 pub const MANIFEST_FORMAT_VERSION: u32 = 1;
@@ -16,6 +17,19 @@ pub const MANIFEST_FORMAT_VERSION: u32 = 1;
 pub struct BranchParent {
     pub namespace: String,
     pub generation: u64,
+}
+
+/// One immutable SST file referenced by the manifest. `min_id`/`max_id` bound
+/// the keys so point lookups can skip files that cannot contain a key.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SstMeta {
+    pub key: String,
+    pub size_bytes: u64,
+    pub row_count: u64,
+    #[serde(default)]
+    pub min_id: Option<Id>,
+    #[serde(default)]
+    pub max_id: Option<Id>,
 }
 
 /// The immutable manifest body for one generation. Stored as pretty JSON so it
@@ -33,6 +47,10 @@ pub struct NamespaceManifest {
     /// Last WAL position folded into the index (None until first index build).
     #[serde(default)]
     pub indexed_cursor: Option<WalCursor>,
+    /// Document-family SST files, ordered newest-first: on a read, the first
+    /// file containing a key wins (a tombstone there hides older files).
+    #[serde(default)]
+    pub doc_ssts: Vec<SstMeta>,
     #[serde(default)]
     pub vector_index_generations: BTreeMap<String, u64>,
     #[serde(default)]
@@ -55,6 +73,7 @@ impl NamespaceManifest {
             schema: Schema::default(),
             wal_commit_cursor: None,
             indexed_cursor: None,
+            doc_ssts: Vec::new(),
             vector_index_generations: BTreeMap::new(),
             branch_parent: None,
             approx_logical_bytes: 0,

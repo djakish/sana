@@ -11,10 +11,10 @@ the next unchecked task under "Current milestone" / "Next up".
 
 ## Status snapshot
 
-- **Current stage:** Stage 1 (Durable Documents) — **complete**.
-- **Next stage:** Stage 2 (SST/LSM).
-- **Done:** Stage 0 (Skeleton), Stage 1 (Durable Documents).
-- **Tests:** `cargo test` green (30 tests); `cargo clippy --all-targets` clean.
+- **Current stage:** Stage 2 (SST/LSM) — **complete**.
+- **Next stage:** Stage 3 (Attributes & Exact Search).
+- **Done:** Stage 0 (Skeleton), Stage 1 (Durable Documents), Stage 2 (SST/LSM).
+- **Tests:** `cargo test` green (51 tests); `cargo clippy --all-targets` clean.
 - **Last updated:** 2026-06-05.
 
 ---
@@ -27,8 +27,8 @@ the next unchecked task under "Current milestone" / "Next up".
 - [x] **Stage 1 — Durable documents.** Namespace lifecycle: create, append WAL,
       CAS-advance commit cursor, replay WAL → documents, strong primary-key
       lookup. Small CLI.
-- [ ] **Stage 2 — SST/LSM.** SST writer/reader/range iterator, build doc SSTs
-      from WAL, compaction + tombstones, query from manifest + WAL overlay.
+- [x] **Stage 2 — SST/LSM.** SST writer/reader, build doc SSTs from WAL
+      (flush), compaction + tombstones, query from manifest SSTs + WAL overlay.
 - [ ] **Stage 3 — Attributes & exact search.** Schema inference/checking,
       attribute inverted indexes (eq/range), filters, order-by, count/sum,
       exact vector kNN over filtered candidates.
@@ -86,33 +86,79 @@ Known limitations to fix in later stages:
 
 ---
 
-## Current milestone: Stage 2 — SST / LSM
+## Stage 2 — SST / LSM (done)
 
-Goal: stop replaying the whole WAL. Build immutable sorted document files
-(SSTs), fold committed WAL into them via an indexer step, and serve reads from
-manifest-named SSTs plus a bounded recent-WAL overlay. Add compaction and
-tombstone cleanup.
+Reads no longer replay the whole WAL: documents live in immutable sorted SSTs
+named by the manifest, with a bounded recent-WAL overlay on top. Shipped in
+`src/sst.rs`, `src/doc.rs`, `src/indexer.rs`, manifest `doc_ssts`, and an
+SST-aware read path in `src/namespace.rs`. On-disk:
+
+```
+namespaces/{ns}/index/g/{generation}/doc/flush-{seq}.sst   # one flush
+namespaces/{ns}/index/g/{generation}/doc/compacted.sst     # a compaction
+```
+
+Stage 2 decisions / notes:
+
+- **D15 — Generic byte-keyed SST.** `bytes -> bytes`, sorted keys, prefix-
+  compressed blocks + restart array, per-block CRC, a loaded index block, and a
+  fixed 32-byte footer (index handle + magic + version + index CRC). Backs docs
+  now; reused for attribute/FTS/vector-address families later.
+- **D16 — Whole-object SST load for Stage 2.** Reads pull the whole SST in one
+  round trip and parse in memory. The format already supports ranged reads
+  (footer → index → only needed blocks) as a later optimization with no on-disk
+  change. Block-internal binary search via restarts is also deferred (the reader
+  linearly scans a ≤4 KB block today).
+- **D17 — Order-preserving `Id` keys.** `doc::encode_id` = tag byte (U64 < Uuid
+  < String) then big-endian u64 / raw uuid / utf-8, so lexicographic SST order
+  equals `Id`'s `Ord`. `min_id`/`max_id` in `SstMeta` let point lookups skip
+  files.
+- **D18 — Flush writes complete documents, not deltas.** Each touched id is
+  resolved (base from existing SSTs + delta ops) and written whole, or as a
+  tombstone. So newest-first reads return full documents and merges stay simple.
+- **D19 — SST creation stamped by generation in the path.** SSTs are immutable
+  and shared across manifest generations; the path records the creating
+  generation, keeping names unique without a separate counter (matches the
+  doc's generation-addressed layout). `doc_ssts` is newest-first.
+- **D20 — Full compaction drops tombstones.** Compaction merges *all* doc SSTs
+  into one; since nothing older remains, tombstones are dropped safely.
+
+Known limitations to fix later:
+
+- No LSM levels yet — `doc_ssts` is a flat newest-first list; compaction is
+  all-or-nothing. Introduce levels/size-tiering when flush frequency grows.
+- Orphaned SSTs from superseded generations are not GC'd (need an
+  unreferenced-object sweep gated on manifest watermarks).
+- No automatic flush trigger (backpressure on unindexed WAL bytes) — flush is
+  manual via API/CLI. Wire a trigger when the indexing queue lands (Stage 9).
+- `replay` still loads all SSTs fully; fine until namespaces get large.
+
+---
+
+## Current milestone: Stage 3 — Attributes & Exact Search
+
+Goal: typed schema + filtering + ordering + simple aggregation, then exact
+vector kNN over filtered candidates. This is the first stage that makes Sana a
+*search* engine rather than a key-value log.
 
 Planned tasks (refine when started):
 
-- [ ] `sst.rs`: SST writer/reader with data blocks (prefix-compressed keys),
-      a block index (min/max key + offsets), and a footer (magic, version,
-      checksums, index offset). Batched range iterator (no per-item yield).
-- [ ] Key encoding for the `doc/{id}` family that sorts lexicographically by
-      `Id` (define a canonical byte ordering for U64/Uuid/String).
-- [ ] Indexer step: read WAL `indexed_cursor`..`wal_commit`, merge into a new
-      doc SST, write it, then CAS-advance the manifest (new generation naming
-      the SST + updated `indexed_cursor`).
-- [ ] Read path: load manifest → read SSTs named by it → merge with WAL overlay
-      after `indexed_cursor`. Lookup becomes SST point-read + small overlay.
-- [ ] Compaction: merge SSTs within the doc family, drop overwritten values and
-      tombstones past a retention horizon, update approx stats. Never mutate in
-      place.
-- [ ] Golden SST format test + indexer/compaction integration tests.
+- [ ] Schema inference/checking: infer column types from upserts, validate on
+      write, evolve `Schema.version`. Decide strictness (reject vs. coerce).
+- [ ] Attribute inverted index as a new SST family (`attr/{col}/{value}` →
+      bitmap/posting of ids). Reuse `sst.rs`; design an order-preserving
+      composite key encoding (the `encode_id` note in `doc.rs`).
+- [ ] Filter expressions (Eq, range, And/Or/Not) compiled to id sets, evaluated
+      against attribute SSTs + WAL overlay. Start with equality + range.
+- [ ] Order-by (primary key or one attribute) and count/sum aggregation.
+- [ ] Exact vector kNN: brute-force distance over a filtered candidate set
+      (L2/cosine/dot), top-k heap. Reference scalar kernels (SIMD is Stage 8).
+- [ ] A query entry point (logical query → plan → execute) and a `query` CLI/
+      API verb. Integration tests for filters, order-by, aggregation, kNN.
 
-Open question for Stage 2: levels/manifest representation of SST sets (start
-with a single level / full list of files; introduce levels when compaction
-needs them).
+Open questions for Stage 3: bitmap representation (roaring-style vs. simple
+sorted-id postings — start simple); how filters compose with the WAL overlay
+(re-evaluate overlay docs against the predicate, like patch/delete-by-filter).
 
 ---
 
@@ -162,21 +208,27 @@ Decisions I (the implementer) made; the user delegated architectural calls.
 ```
 src/
   lib.rs                 module exports
-  main.rs                Stage-1 CLI (create/upsert/get/delete/list/demo)
+  main.rs                CLI (create/upsert/get/delete/list/flush/compact/demo)
   error.rs               shared Error / Result
   value.rs               Id, Value, VectorValue, Document
   schema.rs              ScalarType, ColumnType, Schema, ...
   object_store/
     mod.rs               ObjectStore trait, ObjectVersion, version_of
     fs.rs                FsObjectStore (filesystem backend)
-  manifest.rs            NamespaceManifest, ManifestPointer (+ codecs)
+  manifest.rs            NamespaceManifest, ManifestPointer, SstMeta (+ codecs)
   wal.rs                 WalCursor, WalOp, WalBatch (+ binary codec)
-  namespace.rs           Namespace: create/append/replay/lookup
+  sst.rs                 generic sorted-string-table writer/reader
+  doc.rs                 Id key encoding (order-preserving) + DocRecord
+  namespace.rs           Namespace: create/append + SST-aware replay/lookup
+  indexer.rs             flush (WAL -> SST) and compaction
 tests/
   common/mod.rs          assert_golden snapshot helper
   fs_object_store.rs     object store behavior (CAS, ranges, list, ...)
   manifest_codec.rs      manifest/pointer round-trip + golden JSON
   wal_codec.rs           WAL round-trip, corruption detection, golden bytes
+  sst.rs                 SST round-trip, point get, corruption, golden bytes
+  doc_codec.rs           Id key order + record round-trip
   namespace.rs           namespace lifecycle + durability across reopen
+  indexer.rs             flush/compaction + SST+overlay merge semantics
   fixtures/              committed golden snapshots
 ```

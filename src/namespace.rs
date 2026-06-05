@@ -1,17 +1,20 @@
 //! Namespace lifecycle over the object store: create, append WAL batches,
-//! CAS-advance the commit cursor, and replay the WAL into documents.
+//! CAS-advance the commit cursor, and serve reads.
 //!
-//! This realizes Stage 1's "first useful milestone". The write path advances a
-//! lightweight `wal_commit/current` cursor (not the full manifest) on every
-//! commit, keeping write durability separate from indexing freshness
-//! (architecture Principle 2). The manifest only changes when indexing
-//! publishes files (Stage 2+).
+//! The write path advances a lightweight `wal_commit/current` cursor (not the
+//! full manifest) on every commit, keeping write durability separate from
+//! indexing freshness (architecture Principle 2). The manifest changes only
+//! when indexing publishes SST files (see `indexer`).
 //!
-//! Concurrency model (Stage 1): single writer per namespace per process. An
-//! in-process append lock serializes commits, and the cursor CAS is a
-//! belt-and-suspenders check. Cross-process append safety needs S3/GCS
-//! conditional writes plus crash-orphan handling, same caveat as the
-//! filesystem object store (see decision D4 in docs/PROGRESS.md).
+//! Reads merge two layers: document SSTs named by the manifest (newest-first,
+//! tombstone hides older) as a base, then the recent-WAL overlay after the
+//! manifest's `indexed_cursor` applied on top. With no SSTs yet the base is
+//! empty and reads are pure WAL replay (Stage 1 behavior).
+//!
+//! Concurrency model: single writer per namespace per process. An in-process
+//! append lock serializes commits, and the cursor CAS is a belt-and-suspenders
+//! check. Cross-process append safety needs S3/GCS conditional writes plus
+//! crash-orphan handling, same caveat as the filesystem object store (D4).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -19,29 +22,31 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 
+use crate::doc::{DocRecord, encode_id};
 use crate::error::{Error, Result};
 use crate::manifest::{ManifestPointer, NamespaceManifest};
 use crate::object_store::ObjectStore;
+use crate::sst::SstReader;
 use crate::value::{Document, Id, Value};
 use crate::wal::{WalBatch, WalCursor, WalOp};
 
-fn manifest_pointer_key(ns: &str) -> String {
+pub(crate) fn manifest_pointer_key(ns: &str) -> String {
     format!("namespaces/{ns}/manifest/current")
 }
 
-fn manifest_body_key(ns: &str, generation: u64) -> String {
+pub(crate) fn manifest_body_key(ns: &str, generation: u64) -> String {
     format!("namespaces/{ns}/manifest/g/{generation}.json")
 }
 
-fn wal_commit_key(ns: &str) -> String {
+pub(crate) fn wal_commit_key(ns: &str) -> String {
     format!("namespaces/{ns}/wal_commit/current")
 }
 
-fn wal_key(ns: &str, cursor: WalCursor) -> String {
+pub(crate) fn wal_key(ns: &str, cursor: WalCursor) -> String {
     format!("namespaces/{ns}/wal/{}/{}.wal", cursor.epoch, cursor.seq)
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -54,6 +59,12 @@ fn encode_cursor(cursor: &WalCursor) -> Result<Vec<u8>> {
 
 fn decode_cursor(bytes: &[u8]) -> Result<WalCursor> {
     serde_json::from_slice(bytes).map_err(|e| Error::Codec(e.to_string()))
+}
+
+pub(crate) fn op_id(op: &WalOp) -> &Id {
+    match op {
+        WalOp::Upsert { id, .. } | WalOp::Patch { id, .. } | WalOp::Delete { id } => id,
+    }
 }
 
 pub struct Namespace {
@@ -127,6 +138,54 @@ impl Namespace {
         &self.name
     }
 
+    pub(crate) fn store(&self) -> &Arc<dyn ObjectStore> {
+        &self.store
+    }
+
+    pub(crate) async fn load_sst(&self, key: &str) -> Result<SstReader> {
+        SstReader::open(self.store.get(key).await?.bytes)
+    }
+
+    /// Collect WAL operations after `from` (exclusive) up to and including `to`,
+    /// in commit order. This is the recent-write overlay merged on top of SSTs.
+    pub(crate) async fn read_overlay_ops(
+        &self,
+        from: Option<WalCursor>,
+        to: WalCursor,
+    ) -> Result<Vec<WalOp>> {
+        let start = from.map(|c| c.seq + 1).unwrap_or(1);
+        let mut ops = Vec::new();
+        for seq in start..=to.seq {
+            let got = self
+                .store
+                .get(&wal_key(&self.name, WalCursor::new(to.epoch, seq)))
+                .await?;
+            ops.extend(WalBatch::decode(&got.bytes)?.operations);
+        }
+        Ok(ops)
+    }
+
+    /// Resolve the newest SST record for an id (point lookup, newest-first),
+    /// skipping files whose `[min_id, max_id]` cannot contain it.
+    pub(crate) async fn sst_point_get(
+        &self,
+        manifest: &NamespaceManifest,
+        id: &Id,
+    ) -> Result<Option<DocRecord>> {
+        let key = encode_id(id);
+        for meta in &manifest.doc_ssts {
+            if let (Some(min), Some(max)) = (&meta.min_id, &meta.max_id)
+                && (id < min || id > max)
+            {
+                continue;
+            }
+            if let Some(value) = self.load_sst(&meta.key).await?.get(&key)? {
+                return Ok(Some(DocRecord::decode(&value)?));
+            }
+        }
+        Ok(None)
+    }
+
     /// Load the current manifest body via the pointer.
     pub async fn load_manifest(&self) -> Result<NamespaceManifest> {
         let pointer = ManifestPointer::decode(
@@ -193,29 +252,53 @@ impl Namespace {
         self.append(vec![WalOp::Delete { id }], None).await
     }
 
-    /// Replay the committed WAL into a materialized document snapshot. O(WAL):
-    /// Stage 2's SSTs make this efficient; correct and simple for now.
+    /// Materialize the full document snapshot: SST base (newest-first wins,
+    /// tombstones dropped) with the recent-WAL overlay applied on top.
     pub async fn replay(&self) -> Result<BTreeMap<Id, Document>> {
-        let cursor = self.commit_cursor().await?;
-        let mut docs: BTreeMap<Id, Document> = BTreeMap::new();
-        for seq in 1..=cursor.seq {
-            let pos = WalCursor::new(cursor.epoch, seq);
-            let got = self.store.get(&wal_key(&self.name, pos)).await?;
-            let batch = WalBatch::decode(&got.bytes)?;
-            for op in batch.operations {
-                apply_op(&mut docs, op);
+        let manifest = self.load_manifest().await?;
+        let commit = self.commit_cursor().await?;
+
+        let mut seen: BTreeMap<Id, DocRecord> = BTreeMap::new();
+        for meta in &manifest.doc_ssts {
+            let reader = self.load_sst(&meta.key).await?;
+            for (key, value) in reader.entries()? {
+                seen.entry(crate::doc::decode_id(&key)?)
+                    .or_insert(DocRecord::decode(&value)?);
             }
+        }
+        let mut docs: BTreeMap<Id, Document> = seen
+            .into_iter()
+            .filter_map(|(id, rec)| match rec {
+                DocRecord::Present(d) => Some((id, d)),
+                DocRecord::Deleted => None,
+            })
+            .collect();
+
+        for op in self.read_overlay_ops(manifest.indexed_cursor, commit).await? {
+            apply_op(&mut docs, op);
         }
         Ok(docs)
     }
 
-    /// Strong primary-key lookup. Replays the WAL overlay; see `replay`.
+    /// Strong primary-key lookup: SST base for the id with the overlay applied.
     pub async fn lookup(&self, id: &Id) -> Result<Option<Document>> {
-        Ok(self.replay().await?.remove(id))
+        let manifest = self.load_manifest().await?;
+        let commit = self.commit_cursor().await?;
+
+        let mut docs: BTreeMap<Id, Document> = BTreeMap::new();
+        if let Some(DocRecord::Present(doc)) = self.sst_point_get(&manifest, id).await? {
+            docs.insert(id.clone(), doc);
+        }
+        for op in self.read_overlay_ops(manifest.indexed_cursor, commit).await? {
+            if op_id(&op) == id {
+                apply_op(&mut docs, op);
+            }
+        }
+        Ok(docs.remove(id))
     }
 }
 
-fn apply_op(docs: &mut BTreeMap<Id, Document>, op: WalOp) {
+pub(crate) fn apply_op(docs: &mut BTreeMap<Id, Document>, op: WalOp) {
     match op {
         WalOp::Upsert { id, document } => {
             docs.insert(id, document);

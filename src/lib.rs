@@ -2,11 +2,14 @@
 //! attributes. See `docs/wiki/architecture.md` for the full design and
 //! `docs/PROGRESS.md` for the staged build status and decision log.
 
+pub mod doc;
 pub mod error;
+pub mod indexer;
 pub mod manifest;
 pub mod namespace;
 pub mod object_store;
 pub mod schema;
+pub mod sst;
 pub mod value;
 pub mod wal;
 

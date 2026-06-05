@@ -33,6 +33,7 @@
     "epoch": 0,
     "seq": 9
   },
+  "doc_ssts": [],
   "vector_index_generations": {},
   "branch_parent": null,
   "approx_logical_bytes": 4000000,

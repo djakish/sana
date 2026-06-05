@@ -21,6 +21,8 @@ async fn main() -> CliResult {
         Some("get") => get(&args).await,
         Some("delete") => delete(&args).await,
         Some("list") => list(&args).await,
+        Some("flush") => flush(&args).await,
+        Some("compact") => compact(&args).await,
         Some("demo") => demo(&args).await,
         _ => {
             usage();
@@ -39,8 +41,10 @@ fn usage() {
     eprintln!("  sana upsert <dir> <ns> <id> [key=value ...]");
     eprintln!("  sana get    <dir> <ns> <id>");
     eprintln!("  sana delete <dir> <ns> <id>");
-    eprintln!("  sana list   <dir> <ns>");
-    eprintln!("  sana demo   <dir>");
+    eprintln!("  sana list    <dir> <ns>");
+    eprintln!("  sana flush   <dir> <ns>   # fold WAL into a document SST");
+    eprintln!("  sana compact <dir> <ns>   # merge SSTs, drop tombstones");
+    eprintln!("  sana demo    <dir>");
 }
 
 fn store(dir: &str) -> Arc<dyn ObjectStore> {
@@ -117,6 +121,22 @@ async fn list(args: &[String]) -> CliResult {
     for (id, doc) in &docs {
         println!("  {id:?} -> {} attr(s)", doc.attributes.len());
     }
+    Ok(())
+}
+
+async fn flush(args: &[String]) -> CliResult {
+    let (dir, ns) = (arg(args, 2)?, arg(args, 3)?);
+    let namespace = Namespace::open(store(dir), ns).await?;
+    let did = sana::indexer::flush(&namespace).await?;
+    println!("{}", if did { "flushed WAL into a new SST" } else { "nothing to flush" });
+    Ok(())
+}
+
+async fn compact(args: &[String]) -> CliResult {
+    let (dir, ns) = (arg(args, 2)?, arg(args, 3)?);
+    let namespace = Namespace::open(store(dir), ns).await?;
+    let did = sana::indexer::compact(&namespace).await?;
+    println!("{}", if did { "compacted SSTs" } else { "nothing to compact" });
     Ok(())
 }
 
