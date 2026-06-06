@@ -12,12 +12,12 @@ the next unchecked task under "Current milestone" / "Next up".
 ## Status snapshot
 
 - **Current stage:** Stage 9 (Object-store operations) — **in progress**.
-- **Next up:** Warm-cache planning and an explicit prewarm endpoint.
+- **Next up:** Branch/copy/export operations over immutable manifest generations.
 - **Done:** Stage 0 (Skeleton), Stage 1 (Durable Documents), Stage 2 (SST/LSM),
   Stage 3 (Attributes & Exact Search), Stage 4 (ANN v0), Stage 5 (Native
   Filtering), Stage 6 (SPFresh local rebuild), Stage 7 (Full-text search),
   Stage 8 (RaBitQ & kernels).
-- **Tests:** `cargo test` green (130 tests); `cargo clippy --all-targets` clean.
+- **Tests:** `cargo test` green (137 tests); `cargo clippy --all-targets` clean.
 - **Note:** post-Stage-2 and Stage-3–5 code-review fixes applied; remaining
   findings tracked under "Stage 2 — code review follow-ups" and "Stages 3–5 —
   code review follow-ups". Recently fixed limitations: Stage 2 ranged
@@ -35,7 +35,9 @@ the next unchecked task under "Current milestone" / "Next up".
   4-bit stochastic query packing reduces RaBitQ estimation to AND+popcount.
   Stage 9 now has a durable global indexing queue with fenced leases,
   heartbeats, retries, at-least-once workers, brokered group commit, and
-  WAL/manifest reconciliation for missed advisory notifications.
+  WAL/manifest reconciliation for missed advisory notifications. Query nodes
+  can wrap any backend in a byte-bounded immutable-object LRU and warm one
+  manifest generation under an explicit byte/concurrency budget.
 - **Last updated:** 2026-06-06.
 
 ---
@@ -750,7 +752,7 @@ operational primitives needed by an object-store-first service.
 Planned tasks:
 
 - [x] Add a durable brokered indexing queue with bounded worker claims/leases.
-- [ ] Add warm-cache planning and an explicit prewarm endpoint.
+- [x] Add warm-cache planning and an explicit prewarm endpoint.
 - [ ] Add branch/copy/export operations over immutable manifest generations.
 - [ ] Add namespace pinning/read-replica controls after cache behavior is measured.
 
@@ -780,6 +782,22 @@ Stage 9 decisions / notes:
   operations into one CAS; tests prove 32 pushes in one CAS, per-request error
   isolation, replacement-broker recovery, and correctness with overlapping
   brokers.
+- **D55 — Only immutable generation-addressed objects enter the memory cache.**
+  `CachingObjectStore` admits manifest bodies and `index/g/...` objects, keyed
+  by object path with the observed object version and a content checksum.
+  Mutable manifest pointers, WAL commit cursors, queue state, and operation
+  records always bypass. The cache is byte-bounded LRU, rejects individually
+  oversized objects, serves ranged reads from resident full bytes, writes
+  through successful immutable publications, and invalidates before and after
+  deletion to close the concurrent refill race.
+- **D56 — Cache warming is one budgeted manifest-snapshot operation.**
+  `Namespace::hint_cache_warm` captures one generation and deterministically
+  prioritizes its manifest body, vector indexes/version maps/RaBitQ companions,
+  then text, attribute, and document SSTs. It selects exact manifest-named
+  objects under a byte budget and fetches them with bounded concurrency.
+  Backends may treat this as a read hint; `CachingObjectStore` retains the
+  bytes. An end-to-end test removes every warmed immutable backing object and
+  still serves L2 ANN plus document materialization from cache.
 
 ---
 
@@ -836,6 +854,7 @@ src/
   object_store/
     mod.rs               ObjectStore trait, ObjectVersion, version_of
     fs.rs                FsObjectStore (filesystem backend)
+    cache.rs             immutable-object byte-bounded LRU decorator
   manifest.rs            NamespaceManifest, ManifestPointer, SstMeta (+ codecs)
   wal.rs                 WalCursor, WalOp, WalBatch (+ binary codec)
   sst.rs                 generic sorted-string-table writer/reader
@@ -845,6 +864,7 @@ src/
   query.rs               logical query types + exact/ANN/text/native filtering + recall
   vector/                 IVF, SIMD kernels, native filters, maintenance
   namespace.rs           Namespace: create/append + SST-aware replay/lookup
+  cache_warm.rs          manifest-driven warm plan and prefetch report
   index_queue.rs          durable queue, group-commit broker, leased worker
   indexer.rs             flush/compaction + attr/text/vector index publication
 tests/
@@ -858,6 +878,7 @@ tests/
   indexer.rs             flush/compaction + SST+overlay merge semantics
   schema.rs              write-time schema inference/validation
   query.rs               filters, ordering, aggregation, exact kNN, ANN, BM25, recall
+  cache_warm.rs          warm planning + cache-resident ANN integration
   text.rs                tokenization, BM25, text SST round-trip
   fixtures/              committed golden snapshots
 ```

@@ -165,9 +165,14 @@ namespaces/{ns}/
     vector/{column}/tree.bin
     vector/{column}/postings/*.vpost
     vector/{column}/*.rabitq.bin
-  jobs/indexing_queue.json         # brokered queue later
   ops/{token}.json                 # async operation status
   branches/{child}.json            # optional branch metadata
+```
+
+Global service objects live outside namespace prefixes:
+
+```text
+jobs/indexing_queue.json           # durable brokered indexing queue
 ```
 
 The current manifest records:
@@ -543,9 +548,13 @@ Routing should prefer cache locality: route a namespace to the same query node
 when possible, while preserving the invariant that any node can serve any
 namespace after a cold read.
 
-`hint_cache_warm` should load the manifest, file indexes, vector centroid tree,
-and a small sample of hot blocks. For pinned namespaces, a future scheduler can
-reserve query nodes and keep the namespace's working set on their NVMe drives.
+`CachingObjectStore` implements the memory tier for immutable manifest bodies
+and generation-addressed index objects with byte-bounded LRU admission.
+Mutable pointers/cursors always bypass it. `hint_cache_warm` captures one
+manifest generation and, under an explicit byte budget, loads the manifest and
+vector families first, followed by text/attribute/document SSTs. For pinned
+namespaces, a future scheduler can reserve query nodes and keep the namespace's
+working set on their NVMe drives.
 
 ## Indexing Queue
 

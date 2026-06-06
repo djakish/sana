@@ -301,7 +301,11 @@ impl ObjectStore for CachingObjectStore {
 
     async fn delete(&self, key: &str) -> Result<()> {
         self.invalidate(key).await;
-        self.inner.delete(key).await
+        self.inner.delete(key).await?;
+        // A concurrent miss may have fetched the old object while deletion was
+        // in flight, so invalidate once more after the backing delete lands.
+        self.invalidate(key).await;
+        Ok(())
     }
 }
 
@@ -398,5 +402,19 @@ mod tests {
         assert_eq!(stats.entries, 0);
         assert_eq!(stats.misses, 2);
         assert_eq!(stats.admission_rejections, 2);
+    }
+
+    #[tokio::test]
+    async fn delete_through_cache_invalidates_resident_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner: Arc<dyn ObjectStore> = Arc::new(FsObjectStore::new(dir.path()));
+        let key = "namespaces/a/index/g/1/deleted.sst";
+        inner.put(key, Bytes::from_static(b"data")).await.unwrap();
+        let cache = CachingObjectStore::new(inner, 1024);
+        cache.get(key).await.unwrap();
+
+        cache.delete(key).await.unwrap();
+        assert!(matches!(cache.get(key).await, Err(Error::NotFound(_))));
+        assert_eq!(cache.stats().await.entries, 0);
     }
 }
