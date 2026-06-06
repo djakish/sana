@@ -581,23 +581,12 @@ async fn execute_ann_vector(
     let index_bytes = ns.store().get(&meta.key).await?.bytes;
     let index = VectorIndex::decode(&index_bytes)?;
     let version_map = load_vector_version_map(ns, meta).await?;
-    let native_filter = match filter {
-        Some(filter) => match native_filter_mask(&index, filter)? {
-            Some(mask) => Some(mask),
-            None => {
-                return exact_vector_fallback(
-                    ns,
-                    manifest,
-                    commit,
-                    Some(filter),
-                    &exact_query,
-                    plan,
-                    limit,
-                )
+    let native_filter = match plan_native_filter(&index, filter)? {
+        NativeFilter::Mask(mask) => mask,
+        NativeFilter::Fallback => {
+            return exact_vector_fallback(ns, manifest, commit, filter, &exact_query, plan, limit)
                 .await;
-            }
-        },
-        None => None,
+        }
     };
     let mut ann_hits = index.search_with_filter(
         &query.vector,
@@ -611,23 +600,20 @@ async fn execute_ann_vector(
     // round trip per delta; decode + search stays sequential and in order.
     for bytes in fetch_append_indexes(ns, meta).await? {
         let append_index = VectorIndex::decode(&bytes)?;
-        let append_filter = match filter {
-            Some(filter) => match native_filter_mask(&append_index, filter)? {
-                Some(mask) => Some(mask),
-                None => {
-                    return exact_vector_fallback(
-                        ns,
-                        manifest,
-                        commit,
-                        Some(filter),
-                        &exact_query,
-                        plan,
-                        limit,
-                    )
-                    .await;
-                }
-            },
-            None => None,
+        let append_filter = match plan_native_filter(&append_index, filter)? {
+            NativeFilter::Mask(mask) => mask,
+            NativeFilter::Fallback => {
+                return exact_vector_fallback(
+                    ns,
+                    manifest,
+                    commit,
+                    filter,
+                    &exact_query,
+                    plan,
+                    limit,
+                )
+                .await;
+            }
         };
         ann_hits.extend(append_index.search_with_filter(
             &query.vector,
@@ -1239,6 +1225,24 @@ async fn recall_candidates(
         out.push(RecallCandidate { id, vector: values });
     }
     Ok(out)
+}
+
+/// Whether a query filter can be answered over the IVF index, or forces the
+/// exact scan. `Mask(None)` means "no filter"; `Mask(Some(_))` means "apply this
+/// mask"; `Fallback` means the filter is inexpressible natively.
+enum NativeFilter {
+    Mask(Option<VectorFilterMask>),
+    Fallback,
+}
+
+fn plan_native_filter(index: &VectorIndex, filter: Option<&FilterExpr>) -> Result<NativeFilter> {
+    let Some(filter) = filter else {
+        return Ok(NativeFilter::Mask(None));
+    };
+    Ok(match native_filter_mask(index, filter)? {
+        Some(mask) => NativeFilter::Mask(Some(mask)),
+        None => NativeFilter::Fallback,
+    })
 }
 
 fn native_filter_mask(
