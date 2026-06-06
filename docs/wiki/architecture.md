@@ -247,10 +247,14 @@ cursor. Unindexed rows are searched exhaustively and merged with indexed
 results. Eventual reads may use a cached manifest and only include a bounded
 recent-write overlay.
 
-Backpressure is based on unindexed WAL bytes. Once the outstanding WAL exceeds a
-limit, normal writes return `429` unless the caller explicitly disables
-backpressure for bulk ingest. Strong reads may reject queries if the overlay is
-too large.
+Backpressure is based on exact unindexed WAL bytes. The commit state carries
+cumulative committed WAL bytes and each indexed manifest carries the cumulative
+watermark it absorbed, so the outstanding size is their checked difference
+without listing WAL objects. Writers enforce the projected post-commit size in
+the commit-state CAS loop. The default limit is 2 GiB and is configurable per
+call. Bulk ingest may bypass it only for unconditional upserts and deletes;
+patches and read-dependent writes still enforce it. Strong query, multi-query,
+and recall snapshots reject overlays above their configured limit.
 
 ## LSM Storage Engine
 
@@ -763,7 +767,9 @@ batch, CAS-advance the manifest, and replay the namespace into documents.
 
 - Checksum and bounds-check every SST metadata field.
 - Add durable write idempotency and conditional/filter mutations.
-- Enforce bounded unindexed-WAL backpressure.
+- Enforce bounded unindexed-WAL backpressure. **Done:** paired cumulative byte
+  watermarks avoid hot-path listings; projected writes and strong reads enforce
+  a configurable 2 GiB default.
 - Expose write, query, metadata, recall, and cache-warm operations through HTTP.
 
 ## Risks

@@ -13,13 +13,13 @@ the next unchecked task under "Current milestone" / "Next up".
 
 - **Current stage:** Stage 10 (Durability hardening and write semantics) —
   **in progress**.
-- **Next up:** Add unindexed-WAL byte accounting and configurable write/query
-  backpressure.
+- **Next up:** Add HTTP write/query/metadata/recall/warm-cache endpoints over
+  the existing library contracts.
 - **Done:** Stage 0 (Skeleton), Stage 1 (Durable Documents), Stage 2 (SST/LSM),
   Stage 3 (Attributes & Exact Search), Stage 4 (ANN v0), Stage 5 (Native
   Filtering), Stage 6 (SPFresh local rebuild), Stage 7 (Full-text search),
   Stage 8 (RaBitQ & kernels), Stage 9 (Object-store operations).
-- **Tests:** `cargo test` green (176 tests); `cargo clippy --all-targets` clean.
+- **Tests:** `cargo test` green (182 tests); `cargo clippy --all-targets` clean.
 - **Note:** post-Stage-2 and Stage-3–5 code-review fixes applied; remaining
   findings tracked under "Stage 2 — code review follow-ups" and "Stages 3–5 —
   code review follow-ups". Recently fixed limitations: Stage 2 ranged
@@ -49,7 +49,11 @@ the next unchecked task under "Current milestone" / "Next up".
   per-key records make exact retries return the original cursor while rejecting
   conflicting payloads. Per-ID conditional writes are serializable against the
   WAL cursor; patch/delete-by-filter use a candidate snapshot followed by an
-  atomic recheck for Read Committed behavior.
+  atomic recheck for Read Committed behavior. WAL commit state now maintains a
+  cumulative byte counter and indexed manifests publish the matching absorbed
+  watermark, giving exact unindexed-byte metadata without object listings.
+  Projected writes and strong query/recall snapshots enforce a configurable
+  2 GiB default limit; bulk bypass is limited to unconditional upsert/delete.
 - **Last updated:** 2026-06-06.
 
 ---
@@ -868,7 +872,8 @@ Planned tasks:
 - [x] Make WAL idempotency keys durable and reject conflicting retries.
 - [x] Add compare-and-set conditional writes and patch/delete-by-filter against
       one validated snapshot.
-- [ ] Add unindexed-WAL byte accounting and configurable write backpressure.
+- [x] Add unindexed-WAL byte accounting and configurable write/query
+      backpressure.
 - [ ] Add HTTP write/query/metadata/recall/warm-cache endpoints over the same
       library contracts used by the CLI.
 
@@ -921,6 +926,23 @@ Stage 10 decisions / notes:
   after matches or limits change. Patch payloads are schema-validated even when
   phase one finds no rows. Literal query filters are shared directly; `$ref_new`
   operands remain future work.
+- **D64 — Backpressure uses paired cumulative byte watermarks.** Every committed
+  WAL reservation records its encoded size and advances a cumulative byte
+  counter in `wal_commit/current`; each flush publishes the cumulative value it
+  absorbed as `manifest.indexed_wal_bytes`. Their checked difference is the
+  exact outstanding overlay size using two small reads, with no WAL listing on
+  normal writes, queries, or metadata. Legacy commit states migrate once by
+  using the manifest watermark as a baseline and listing only the canonical
+  unindexed WAL range; mixed-version states with an existing watermark remain
+  exact. New writes check projected post-commit bytes inside the same CAS
+  reservation loop, so concurrent handles share one namespace budget. The
+  default is 2 GiB and is configurable per call. `disable_backpressure` bypasses
+  only unconditional upsert/delete batches; patches, conditional writes, and
+  filter mutations still enforce the limit because they read strong state.
+  Exact idempotent retries resolve before the limit check. Strong query,
+  multi-query, and recall snapshots reject oversized overlays, and recall now
+  evaluates candidates plus exact/ANN comparisons against one captured
+  manifest and commit cursor.
 
 ---
 
