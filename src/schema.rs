@@ -3,8 +3,14 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::value::{Document, Value, VectorValue};
+use crate::value::{Document, Id, Value, VectorValue};
 use crate::wal::WalOp;
+
+pub const MAX_STRING_ID_BYTES: usize = 64;
+pub const MAX_COLUMN_NAME_BYTES: usize = 128;
+pub const MAX_COLUMNS: usize = 1_024;
+pub const MAX_VECTOR_COLUMNS: usize = 2;
+pub const MAX_VECTOR_DIMENSIONS: usize = 10_752;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ScalarType {
@@ -70,6 +76,7 @@ impl Schema {
         for op in ops {
             match op {
                 WalOp::Upsert { id, document } => {
+                    validate_id(id)?;
                     if &document.id != id {
                         return Err(Error::InvalidWrite(
                             "upsert id does not match document id".into(),
@@ -78,10 +85,11 @@ impl Schema {
                     changed |= self.infer_and_validate_document(document)?;
                 }
                 WalOp::Patch {
+                    id,
                     attributes,
                     vectors,
-                    ..
                 } => {
+                    validate_id(id)?;
                     for (name, value) in attributes {
                         changed |=
                             self.infer_and_validate_attribute(name, value, WriteMode::Patch)?;
@@ -90,7 +98,7 @@ impl Schema {
                         changed |= self.infer_and_validate_vector(name, vector)?;
                     }
                 }
-                WalOp::Delete { .. } => {}
+                WalOp::Delete { id } => validate_id(id)?,
             }
         }
 
@@ -134,6 +142,7 @@ impl Schema {
             validate_attribute_value(name, value, &spec.column_type)?;
             Ok(false)
         } else {
+            self.validate_new_column(false)?;
             let inferred = infer_attribute_type(name, value)?;
             self.columns.insert(
                 name.to_string(),
@@ -161,6 +170,7 @@ impl Schema {
                 Ok(false)
             }
             None => {
+                self.validate_new_column(true)?;
                 self.columns.insert(
                     name.to_string(),
                     ColumnSpec {
@@ -173,6 +183,27 @@ impl Schema {
             }
         }
     }
+
+    fn validate_new_column(&self, vector: bool) -> Result<()> {
+        if self.columns.len() >= MAX_COLUMNS {
+            return Err(Error::InvalidSchema(format!(
+                "schema cannot exceed {MAX_COLUMNS} columns"
+            )));
+        }
+        if vector
+            && self
+                .columns
+                .values()
+                .filter(|spec| matches!(spec.column_type, ColumnType::Vector { .. }))
+                .count()
+                >= MAX_VECTOR_COLUMNS
+        {
+            return Err(Error::InvalidSchema(format!(
+                "schema cannot exceed {MAX_VECTOR_COLUMNS} vector columns"
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -182,8 +213,21 @@ enum WriteMode {
 }
 
 fn validate_column_name(name: &str) -> Result<()> {
-    if name.is_empty() {
-        return Err(Error::InvalidSchema("column name cannot be empty".into()));
+    if name.is_empty() || name.len() > MAX_COLUMN_NAME_BYTES || name.starts_with('$') {
+        return Err(Error::InvalidSchema(format!(
+            "column name must contain 1..={MAX_COLUMN_NAME_BYTES} UTF-8 bytes and cannot start with '$'"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_id(id: &Id) -> Result<()> {
+    if let Id::String(value) = id
+        && (value.is_empty() || value.len() > MAX_STRING_ID_BYTES)
+    {
+        return Err(Error::InvalidWrite(format!(
+            "string id must contain 1..={MAX_STRING_ID_BYTES} UTF-8 bytes"
+        )));
     }
     Ok(())
 }
@@ -331,6 +375,11 @@ fn infer_vector_type(name: &str, vector: &VectorValue) -> Result<ColumnType> {
     if dim == 0 {
         return Err(Error::InvalidSchema(format!(
             "vector column '{name}' cannot be empty"
+        )));
+    }
+    if dim > MAX_VECTOR_DIMENSIONS {
+        return Err(Error::InvalidSchema(format!(
+            "vector column '{name}' exceeds maximum dimension {MAX_VECTOR_DIMENSIONS}"
         )));
     }
     match vector {

@@ -120,6 +120,44 @@ async fn type_mismatch_is_rejected_without_advancing_wal() {
 }
 
 #[tokio::test]
+async fn ids_columns_and_vectors_enforce_schema_limits_before_wal_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let ns = Namespace::create(store(&dir), "docs").await.unwrap();
+
+    for id in [Id::String(String::new()), Id::String("x".repeat(65))] {
+        let error = ns.upsert(Document::new(id)).await.unwrap_err();
+        assert!(matches!(error, Error::InvalidWrite(_)));
+    }
+
+    for name in ["$reserved".to_string(), "x".repeat(129)] {
+        let mut document = Document::new(Id::U64(1));
+        document.attributes.insert(name, Value::Int(1));
+        let error = ns.upsert(document).await.unwrap_err();
+        assert!(matches!(error, Error::InvalidSchema(_)));
+    }
+
+    let mut oversized = Document::new(Id::U64(1));
+    oversized.vectors.insert(
+        "embedding".into(),
+        VectorValue::F32(vec![0.0; 10_753]),
+    );
+    let error = ns.upsert(oversized).await.unwrap_err();
+    assert!(matches!(error, Error::InvalidSchema(_)));
+
+    let mut too_many_vectors = Document::new(Id::U64(1));
+    for name in ["a", "b", "c"] {
+        too_many_vectors
+            .vectors
+            .insert(name.into(), VectorValue::F32(vec![0.0]));
+    }
+    let error = ns.upsert(too_many_vectors).await.unwrap_err();
+    assert!(matches!(error, Error::InvalidSchema(_)));
+
+    assert_eq!(ns.commit_cursor().await.unwrap().seq, 0);
+    assert!(ns.load_manifest().await.unwrap().schema.columns.is_empty());
+}
+
+#[tokio::test]
 async fn patch_infers_new_columns_but_null_only_clears() {
     let dir = tempfile::tempdir().unwrap();
     let ns = Namespace::create(store(&dir), "docs").await.unwrap();

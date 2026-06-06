@@ -611,6 +611,16 @@ async fn query_cardinality_limits_are_enforced() {
     query.limit = Some(10_001);
     let error = ns.query(query).await.unwrap_err();
     assert!(matches!(error, Error::InvalidQuery(_)));
+
+    let mut text = Query::all();
+    text.text = Some(TextQuery {
+        column: "body".into(),
+        query: "x".repeat(1_025),
+        k: 1,
+        params: Bm25Params::default(),
+    });
+    let error = ns.query(text).await.unwrap_err();
+    assert!(matches!(error, Error::InvalidQuery(_)));
 }
 
 #[tokio::test]

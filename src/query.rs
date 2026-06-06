@@ -30,6 +30,7 @@ const DEFAULT_RECALL_NUM: usize = 25;
 const DEFAULT_RECALL_TOP_K: usize = 10;
 pub const MAX_MULTI_QUERIES: usize = 16;
 pub const MAX_QUERY_RESULTS: usize = 10_000;
+pub const MAX_FULL_TEXT_QUERY_BYTES: usize = 1_024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueryOptions {
@@ -1278,6 +1279,11 @@ fn validate_text_query(manifest: &NamespaceManifest, text_query: &TextQuery) -> 
     if text_query.k > MAX_QUERY_RESULTS {
         return Err(Error::InvalidQuery(format!(
             "text query k cannot exceed {MAX_QUERY_RESULTS}"
+        )));
+    }
+    if text_query.query.len() > MAX_FULL_TEXT_QUERY_BYTES {
+        return Err(Error::InvalidQuery(format!(
+            "text query cannot exceed {MAX_FULL_TEXT_QUERY_BYTES} UTF-8 bytes"
         )));
     }
     text_query.params.validate()?;
