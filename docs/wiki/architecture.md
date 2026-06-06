@@ -158,6 +158,7 @@ namespaces/{ns}/
   manifest/g/{generation}.json     # immutable manifest body
   wal/{epoch}/{seq}.wal            # durable write batches
   wal_commit/current               # CAS commit cursor for grouped WAL entries
+  routing/pinning.json             # leased pinned-replica assignments
   index/g/{generation}/
     doc/*.sst
     attr/*.sst
@@ -553,8 +554,11 @@ and generation-addressed index objects with byte-bounded LRU admission.
 Mutable pointers/cursors always bypass it. `hint_cache_warm` captures one
 manifest generation and, under an explicit byte budget, loads the manifest and
 vector families first, followed by text/attribute/document SSTs. For pinned
-namespaces, a future scheduler can reserve query nodes and keep the namespace's
-working set on their NVMe drives.
+namespaces, `PinningController` stores configured replica slots in
+`routing/pinning.json`. Query nodes hold fenced leases, warm an exact manifest
+generation before becoming ready, heartbeat utilization, and are selected by a
+deterministic request-key hash. Expired leases are replaceable and stale
+owners cannot update the replacement assignment.
 
 ## Indexing Queue
 
@@ -736,6 +740,13 @@ batch, CAS-advance the manifest, and replay the namespace into documents.
 - Add warm-cache endpoint and cache admission/eviction policies.
 - Add branch/copy/export operations.
 - Add pinning/read replicas only after single-node efficiency is proven.
+
+### Stage 10: Durability Hardening And Write Semantics
+
+- Checksum and bounds-check every SST metadata field.
+- Add durable write idempotency and conditional/filter mutations.
+- Enforce bounded unindexed-WAL backpressure.
+- Expose write, query, metadata, recall, and cache-warm operations through HTTP.
 
 ## Risks
 

@@ -11,13 +11,15 @@ the next unchecked task under "Current milestone" / "Next up".
 
 ## Status snapshot
 
-- **Current stage:** Stage 9 (Object-store operations) — **in progress**.
-- **Next up:** Namespace pinning and read-replica controls.
+- **Current stage:** Stage 10 (Durability hardening and write semantics) —
+  **in progress**.
+- **Next up:** Checksum and bounds-check the SST footer, then make oversized
+  SST fields fail explicitly instead of truncating.
 - **Done:** Stage 0 (Skeleton), Stage 1 (Durable Documents), Stage 2 (SST/LSM),
   Stage 3 (Attributes & Exact Search), Stage 4 (ANN v0), Stage 5 (Native
   Filtering), Stage 6 (SPFresh local rebuild), Stage 7 (Full-text search),
-  Stage 8 (RaBitQ & kernels).
-- **Tests:** `cargo test` green (143 tests); `cargo clippy --all-targets` clean.
+  Stage 8 (RaBitQ & kernels), Stage 9 (Object-store operations).
+- **Tests:** `cargo test` green (149 tests); `cargo clippy --all-targets` clean.
 - **Note:** post-Stage-2 and Stage-3–5 code-review fixes applied; remaining
   findings tracked under "Stage 2 — code review follow-ups" and "Stages 3–5 —
   code review follow-ups". Recently fixed limitations: Stage 2 ranged
@@ -39,7 +41,9 @@ the next unchecked task under "Current milestone" / "Next up".
   can wrap any backend in a byte-bounded immutable-object LRU and warm one
   manifest generation under an explicit byte/concurrency budget. Fully indexed
   generations support zero-copy branches, independent cross-store copies, and
-  deterministic catalog-last exports.
+  deterministic catalog-last exports. Namespace pinning now uses durable,
+  leased replica slots with fenced claims, exact-generation warm readiness,
+  deterministic routing, and utilization metadata.
 - **Last updated:** 2026-06-06.
 
 ---
@@ -67,8 +71,11 @@ the next unchecked task under "Current milestone" / "Next up".
       vectorized MAXSCORE, hybrid multi-query.
 - [x] **Stage 8 — RaBitQ & kernels.** Per-cluster codes, quantized query path,
       portable then SIMD kernels.
-- [ ] **Stage 9 — Object-store operations.** Brokered indexing queue, warm-cache
+- [x] **Stage 9 — Object-store operations.** Brokered indexing queue, warm-cache
       endpoint, branch/copy/export, pinning.
+- [ ] **Stage 10 — Durability hardening and write semantics.** Corruption-safe
+      SST metadata, idempotent/conditional writes, bounded write backpressure,
+      and a service-facing HTTP/metadata surface.
 
 ---
 
@@ -746,7 +753,7 @@ Stage 8 decisions / notes:
 
 ---
 
-## Current milestone: Stage 9 — Object-Store Operations
+## Stage 9 — Object-Store Operations (done)
 
 Goal: move expensive maintenance off the write/query path and add the
 operational primitives needed by an object-store-first service.
@@ -756,7 +763,7 @@ Planned tasks:
 - [x] Add a durable brokered indexing queue with bounded worker claims/leases.
 - [x] Add warm-cache planning and an explicit prewarm endpoint.
 - [x] Add branch/copy/export operations over immutable manifest generations.
-- [ ] Add namespace pinning/read-replica controls after cache behavior is measured.
+- [x] Add namespace pinning/read-replica controls after cache behavior is measured.
 
 Stage 9 decisions / notes:
 
@@ -817,6 +824,34 @@ Stage 9 decisions / notes:
   concurrency, and verify existing bytes for idempotent retries. Tests remove
   every source object after a cross-store copy and verify the destination is
   still readable and writable.
+- **D59 — Pinning state is a leased, generation-aware routing control file.**
+  `namespaces/{ns}/routing/pinning.json` is updated with versioned CAS and
+  contains a configured replica count plus one fenced assignment per slot.
+  Query nodes claim, heartbeat, warm, and release slots; expired leases can be
+  reassigned without allowing stale owners to mutate the replacement claim.
+  A replica becomes routable only after warming the exact current manifest
+  generation. Routing hashes namespace plus request key over live ready
+  replicas, while metadata reports configured, assigned, ready, and average
+  utilization. Scaling down removes excess slots, unpinning clears all
+  assignments, and namespace GC preserves the control file.
+
+---
+
+## Current milestone: Stage 10 — Durability Hardening And Write Semantics
+
+Goal: close correctness gaps in durable formats and writes, then expose the
+engine through a small service API without weakening the object-store model.
+
+Planned tasks:
+
+- [ ] Add an SST footer checksum, checked offset arithmetic, and explicit size
+      bounds with corruption/oversize regression tests.
+- [ ] Make WAL idempotency keys durable and reject conflicting retries.
+- [ ] Add compare-and-set conditional writes and patch/delete-by-filter against
+      one validated snapshot.
+- [ ] Add unindexed-WAL byte accounting and configurable write backpressure.
+- [ ] Add HTTP write/query/metadata/recall/warm-cache endpoints over the same
+      library contracts used by the CLI.
 
 ---
 
@@ -887,6 +922,7 @@ src/
   index_queue.rs          durable queue, group-commit broker, leased worker
   indexer.rs             flush/compaction + attr/text/vector index publication
   operations.rs          branch, physical copy, snapshot export
+  pinning.rs             leased pinned-replica control, warming, and routing
 tests/
   common/mod.rs          assert_golden snapshot helper
   fs_object_store.rs     object store behavior (CAS, ranges, list, ...)
@@ -900,6 +936,7 @@ tests/
   query.rs               filters, ordering, aggregation, exact kNN, ANN, BM25, recall
   cache_warm.rs          warm planning + cache-resident ANN integration
   operations.rs          branch isolation/GC and cross-store copy/export
+  pinning tests live beside the control implementation in src/pinning.rs
   text.rs                tokenization, BM25, text SST round-trip
   fixtures/              committed golden snapshots
 ```
