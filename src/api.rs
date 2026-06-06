@@ -1,5 +1,6 @@
 //! Thin Axum service over the library contracts.
 
+use std::future::{Future, IntoFuture};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -198,12 +199,35 @@ pub fn router(store: Arc<dyn ObjectStore>) -> Router {
 }
 
 pub async fn serve(store: Arc<dyn ObjectStore>, address: SocketAddr) -> std::io::Result<()> {
-    let listener = tokio::net::TcpListener::bind(address).await?;
-    spawn_index_worker(store.clone());
-    axum::serve(listener, router(store)).await
+    serve_with_shutdown(store, address, std::future::pending()).await
 }
 
-fn spawn_index_worker(store: Arc<dyn ObjectStore>) {
+pub async fn serve_with_shutdown(
+    store: Arc<dyn ObjectStore>,
+    address: SocketAddr,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
+    let listener = tokio::net::TcpListener::bind(address).await?;
+    let server = axum::serve(listener, router(store.clone()))
+        .with_graceful_shutdown(shutdown)
+        .into_future();
+    let worker = run_index_worker(store);
+    run_server_and_worker(server, worker).await
+}
+
+async fn run_server_and_worker(
+    server: impl Future<Output = std::io::Result<()>>,
+    worker: impl Future<Output = ()>,
+) -> std::io::Result<()> {
+    tokio::pin!(server);
+    tokio::pin!(worker);
+    tokio::select! {
+        result = &mut server => result,
+        () = &mut worker => unreachable!("index worker loop returned"),
+    }
+}
+
+async fn run_index_worker(store: Arc<dyn ObjectStore>) {
     const LEASE_MS: u64 = 30_000;
     const HEARTBEAT_MS: u64 = 1_000;
     const IDLE_POLL_MS: u64 = 100;
@@ -211,36 +235,34 @@ fn spawn_index_worker(store: Arc<dyn ObjectStore>) {
     const RECONCILE_INTERVAL_MS: u64 = 30_000;
 
     let worker_id = format!("serve-{}", std::process::id());
-    tokio::spawn(async move {
-        let mut next_reconcile = tokio::time::Instant::now();
-        loop {
-            if tokio::time::Instant::now() >= next_reconcile {
-                if let Err(error) = crate::index_queue::reconcile_unindexed(store.clone()).await {
-                    eprintln!("index reconciliation failed: {error}");
-                }
-                next_reconcile = tokio::time::Instant::now()
-                    + std::time::Duration::from_millis(RECONCILE_INTERVAL_MS);
+    let mut next_reconcile = tokio::time::Instant::now();
+    loop {
+        if tokio::time::Instant::now() >= next_reconcile {
+            if let Err(error) = crate::index_queue::reconcile_unindexed(store.clone()).await {
+                eprintln!("index reconciliation failed: {error}");
             }
+            next_reconcile = tokio::time::Instant::now()
+                + std::time::Duration::from_millis(RECONCILE_INTERVAL_MS);
+        }
 
-            match crate::index_queue::run_worker_once(
-                store.clone(),
-                &worker_id,
-                LEASE_MS,
-                HEARTBEAT_MS,
-            )
-            .await
-            {
-                Ok(Some(_)) => {}
-                Ok(None) => {
-                    tokio::time::sleep(std::time::Duration::from_millis(IDLE_POLL_MS)).await;
-                }
-                Err(error) => {
-                    eprintln!("index worker failed: {error}");
-                    tokio::time::sleep(std::time::Duration::from_millis(ERROR_RETRY_MS)).await;
-                }
+        match crate::index_queue::run_worker_once(
+            store.clone(),
+            &worker_id,
+            LEASE_MS,
+            HEARTBEAT_MS,
+        )
+        .await
+        {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                tokio::time::sleep(std::time::Duration::from_millis(IDLE_POLL_MS)).await;
+            }
+            Err(error) => {
+                eprintln!("index worker failed: {error}");
+                tokio::time::sleep(std::time::Duration::from_millis(ERROR_RETRY_MS)).await;
             }
         }
-    });
+    }
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -386,5 +408,33 @@ fn query_rejection(rejection: QueryRejection) -> ApiError {
         status: rejection.status(),
         code: "invalid_query_parameters",
         message: rejection.body_text(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn server_completion_cancels_worker_future() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let worker_polls = polls.clone();
+        let worker = async move {
+            loop {
+                worker_polls.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        let server = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok(())
+        };
+
+        super::run_server_and_worker(server, worker).await.unwrap();
+        let polls_after_shutdown = polls.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(polls.load(Ordering::SeqCst), polls_after_shutdown);
     }
 }

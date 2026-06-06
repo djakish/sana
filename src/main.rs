@@ -407,8 +407,18 @@ async fn serve(args: &[String]) -> CliResult {
     let backing: Arc<dyn ObjectStore> = Arc::new(FsObjectStore::new(dir));
     let cached: Arc<dyn ObjectStore> = Arc::new(CachingObjectStore::new(backing, cache_bytes));
     println!("serving Sana on http://{address} with {cache_bytes} cache bytes");
-    sana::api::serve(cached, address).await?;
+    sana::api::serve_with_shutdown(cached, address, shutdown_signal()).await?;
     Ok(())
+}
+
+async fn shutdown_signal() {
+    match tokio::signal::ctrl_c().await {
+        Ok(()) => println!("shutting down"),
+        Err(error) => {
+            eprintln!("failed to install Ctrl-C handler: {error}");
+            std::future::pending::<()>().await;
+        }
+    }
 }
 
 async fn demo(args: &[String]) -> CliResult {
