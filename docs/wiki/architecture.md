@@ -415,7 +415,8 @@ For each vector cluster:
 At query time:
 
 - normalize and transform the query for each probed cluster;
-- quantize transformed query coordinates to small unsigned integers;
+- stochastically quantize transformed query coordinates to 4-bit unsigned
+  integers and decompose them into four bit planes;
 - estimate inner products using bitwise AND and popcount;
 - convert estimated inner products back to raw squared distances;
 - use the error bound to decide which candidates require exact reranking.
@@ -424,7 +425,9 @@ Sana loads IVF/companion pairs concurrently only for L2 queries. It applies
 native filter masks, version-map liveness, and WAL shadowing before segment
 top-k pruning. A candidate is exact-reranked unless its confidence lower bound
 is already worse than the current exact kth distance. Cosine and dot queries do
-not fetch the companion.
+not fetch the companion. The confidence radius includes both the original
+RaBitQ estimator bound and the Hoeffding term introduced by 4-bit query
+quantization.
 
 The key engineering payoff is that quantized vectors are 16-32x smaller than
 full `f16`/`f32` vectors, moving scans higher in the memory hierarchy. The
@@ -442,8 +445,10 @@ trait DistanceKernel {
 
 The f32 kernels use cached runtime dispatch to scalar, AArch64 NEON, or x86_64
 AVX2 implementations, with randomized parity tests and a dependency-free
-release benchmark. RaBitQ's packed estimator remains the next SIMD target;
-AVX-512/VPOPCNT should only be added when benchmarks justify a separate path.
+release benchmark. RaBitQ uses four AND+popcount passes; AArch64 batches two
+`u64` words with NEON byte popcount and other targets use portable
+`u64::count_ones`. AVX-512/VPOPCNT should only be added when x86 benchmarks
+justify a separate path.
 
 ## Native Filtering
 

@@ -28,6 +28,10 @@ use crate::schema::DistanceMetric;
 use crate::value::Id;
 use crate::vector::{VectorFilterMask, VectorHit, VectorIndex, score, sort_hits};
 
+mod packed;
+
+use packed::PackedQuery;
+
 const RABITQ_MAGIC: &[u8; 8] = b"SANARBT1";
 const RABITQ_FORMAT_VERSION: u32 = 1;
 const DEFAULT_EPSILON: f32 = 1.9;
@@ -67,6 +71,7 @@ pub struct RabitqCode {
 #[derive(Clone, Debug)]
 pub struct RotatedQuery {
     rotated: Vec<f32>,
+    packed: PackedQuery,
     residual_norm_sq: f32,
 }
 
@@ -220,7 +225,7 @@ impl RabitqIndex {
                 .zip(centroid)
                 .map(|(q, c)| q - c)
                 .collect::<Vec<_>>();
-            let rotated = cluster.rotate_query(&residual, self.padded_dim);
+            let rotated = cluster.rotate_query(&residual, self.padded_dim)?;
 
             for (entry, code) in posting.vectors.iter().zip(&cluster.codes) {
                 if code.id != entry.id
@@ -236,8 +241,11 @@ impl RabitqIndex {
                 {
                     continue;
                 }
-                let (estimate, radius) =
-                    code.estimate_l2_sq_with_error(&rotated, self.padded_dim, DEFAULT_EPSILON);
+                let (estimate, radius) = code.estimate_l2_sq_packed_with_error(
+                    &rotated,
+                    self.padded_dim,
+                    DEFAULT_EPSILON,
+                );
                 candidates.push(EstimatedCandidate {
                     entry,
                     estimate,
@@ -284,15 +292,23 @@ struct EstimatedCandidate<'a> {
 
 impl RabitqCluster {
     /// Rotate a raw query residual `q − c` into this cluster's transformed space.
-    pub fn rotate_query(&self, query_residual: &[f32], padded_dim: usize) -> RotatedQuery {
+    pub fn rotate_query(&self, query_residual: &[f32], padded_dim: usize) -> Result<RotatedQuery> {
+        if padded_dim < query_residual.len() || !padded_dim.is_power_of_two() {
+            return Err(Error::InvalidQuery(
+                "RaBitQ padded query dimension must be a power of two large enough for the query"
+                    .into(),
+            ));
+        }
         let residual_norm_sq = query_residual.iter().map(|v| v * v).sum();
         let mut rotated = vec![0.0f32; padded_dim];
         rotated[..query_residual.len()].copy_from_slice(query_residual);
         rotate(&mut rotated, self.transform_seed);
-        RotatedQuery {
+        let packed = PackedQuery::new(&rotated, self.transform_seed ^ 0x7175_6572_795f_3471);
+        Ok(RotatedQuery {
             rotated,
+            packed,
             residual_norm_sq,
-        }
+        })
     }
 }
 
@@ -309,6 +325,19 @@ impl RabitqCode {
         let est = self.residual_norm * self.residual_norm + query.residual_norm_sq
             - 2.0 * self.residual_norm * inner;
         est.max(0.0)
+    }
+
+    /// RaBitQ estimate using the paper's 4-bit stochastic query quantization
+    /// and four AND+popcount passes over the binary data code.
+    pub fn estimate_l2_sq_packed(&self, query: &RotatedQuery) -> f32 {
+        if self.residual_norm == 0.0 || self.dot_code == 0.0 {
+            return query.residual_norm_sq;
+        }
+        let code_dot = query.packed.code_dot(&self.code_words);
+        let inner = code_dot / self.dot_code;
+        let estimate = self.residual_norm * self.residual_norm + query.residual_norm_sq
+            - 2.0 * self.residual_norm * inner;
+        estimate.max(0.0)
     }
 
     /// Return the squared-distance estimate and its high-probability absolute
@@ -332,6 +361,31 @@ impl RabitqCode {
         let inner_radius =
             query.residual_norm_sq.sqrt() * ratio * epsilon / ((padded_dim - 1) as f32).sqrt();
         (estimate, 2.0 * self.residual_norm * inner_radius)
+    }
+
+    fn estimate_l2_sq_packed_with_error(
+        &self,
+        query: &RotatedQuery,
+        padded_dim: usize,
+        epsilon: f32,
+    ) -> (f32, f32) {
+        let estimate = self.estimate_l2_sq_packed(query);
+        if self.residual_norm == 0.0
+            || self.dot_code == 0.0
+            || padded_dim <= 1
+            || query.residual_norm_sq == 0.0
+        {
+            return (estimate, 0.0);
+        }
+        let dot_sq = self.dot_code * self.dot_code;
+        let ratio = ((1.0 - dot_sq).max(0.0) / dot_sq).sqrt();
+        let estimator_radius =
+            query.residual_norm_sq.sqrt() * ratio * epsilon / ((padded_dim - 1) as f32).sqrt();
+        let query_quantization_radius = query.packed.error_radius(epsilon) / self.dot_code;
+        (
+            estimate,
+            2.0 * self.residual_norm * (estimator_radius + query_quantization_radius),
+        )
     }
 
     /// `⟨ō_q, q'⟩ = (1/√n) Σ sign(ō'ᵢ)·q'ᵢ`, read straight off the sign bits.

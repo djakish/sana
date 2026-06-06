@@ -11,12 +11,13 @@ the next unchecked task under "Current milestone" / "Next up".
 
 ## Status snapshot
 
-- **Current stage:** Stage 8 (RaBitQ & kernels) — **in progress**.
-- **Next up:** Packed/SIMD RaBitQ estimation and query quantization.
+- **Current stage:** Stage 9 (Object-store operations) — **in progress**.
+- **Next up:** Durable brokered indexing queue and worker claim protocol.
 - **Done:** Stage 0 (Skeleton), Stage 1 (Durable Documents), Stage 2 (SST/LSM),
   Stage 3 (Attributes & Exact Search), Stage 4 (ANN v0), Stage 5 (Native
-  Filtering), Stage 6 (SPFresh local rebuild), Stage 7 (Full-text search).
-- **Tests:** `cargo test` green (111 tests); `cargo clippy --all-targets` clean.
+  Filtering), Stage 6 (SPFresh local rebuild), Stage 7 (Full-text search),
+  Stage 8 (RaBitQ & kernels).
+- **Tests:** `cargo test` green (114 tests); `cargo clippy --all-targets` clean.
 - **Note:** post-Stage-2 and Stage-3–5 code-review fixes applied; remaining
   findings tracked under "Stage 2 — code review follow-ups" and "Stages 3–5 —
   code review follow-ups". Recently fixed limitations: Stage 2 ranged
@@ -30,7 +31,8 @@ the next unchecked task under "Current milestone" / "Next up".
   faithful, persisted RaBitQ companion per vector segment; L2 ANN scans codes,
   applies the paper's confidence bound, and exact-reranks only candidates that
   can still enter top-k. Runtime-selected NEON/AVX2 f32 distance kernels now
-  accelerate full-precision scoring while preserving the scalar reference.
+  accelerate full-precision scoring while preserving the scalar reference;
+  4-bit stochastic query packing reduces RaBitQ estimation to AND+popcount.
 - **Last updated:** 2026-06-06.
 
 ---
@@ -56,7 +58,7 @@ the next unchecked task under "Current milestone" / "Next up".
       split/merge/reassign background jobs.
 - [x] **Stage 7 — Full-text search.** Tokenizer, BM25, block postings,
       vectorized MAXSCORE, hybrid multi-query.
-- [ ] **Stage 8 — RaBitQ & kernels.** Per-cluster codes, quantized query path,
+- [x] **Stage 8 — RaBitQ & kernels.** Per-cluster codes, quantized query path,
       portable then SIMD kernels.
 - [ ] **Stage 9 — Object-store operations.** Brokered indexing queue, warm-cache
       endpoint, branch/copy/export, pinning.
@@ -638,7 +640,7 @@ Stage 7 decisions / notes:
 
 ---
 
-## Current milestone: Stage 8 — RaBitQ & Kernels
+## Stage 8 — RaBitQ & Kernels (done)
 
 Goal: add a compressed vector distance-estimation layer and isolate CPU kernels
 behind a portable reference implementation before adding SIMD-specialized
@@ -651,7 +653,7 @@ Planned tasks:
 - [x] Add portable bitwise RaBitQ L2 estimator (unbiased, recall-tested).
 - [x] Persist a RaBitQ object and wire the quantized query path + rerank.
 - [x] Add SIMD f32 kernels with feature detection.
-- [ ] Add packed/SIMD RaBitQ estimation.
+- [x] Add packed/SIMD RaBitQ estimation.
 - [x] Benchmark f32 cache/memory/CPU bottlenecks.
 
 Stage 8 decisions / notes:
@@ -717,8 +719,33 @@ Stage 8 decisions / notes:
   ARM64 development host measured 1.63–2.25x for hot-cache L2/dot and
   2.26–3.37x for cosine across 128/768/1536 dimensions. A 64 MiB working set at
   768 dimensions stayed near the same ~6 GiB/s runtime throughput, so this API
-  is not saturating DRAM yet; validation, per-vector allocation/layout, and the
-  remaining scalar RaBitQ estimator are the next profiling targets.
+  is not saturating DRAM yet; validation and per-vector allocation/layout remain
+  profiling targets.
+- **D51 — Query quantization is four bit planes with an explicit error term.**
+  Each rotated query is stochastically quantized to 4-bit unsigned values as in
+  RaBitQ Section 3.3, then decomposed into four `u64` bit planes. A code/query
+  inner product becomes four AND+popcount passes plus the affine terms from
+  Equation 20. AArch64 processes two words at once with NEON byte popcount;
+  other targets use portable `u64::count_ones`. The pruning radius adds the
+  Equation-66 Hoeffding term for query quantization to the original estimator
+  bound. Packed recall, explicit dequantization parity, SIMD/portable count
+  parity, and invalid Walsh–Hadamard dimensions are tested. On the ARM64
+  development host, 768-D estimation improved from 1.1 to 48.0 million codes/s
+  (45.6x) while preserving the deterministic recall/rerank fixture.
+
+---
+
+## Current milestone: Stage 9 — Object-Store Operations
+
+Goal: move expensive maintenance off the write/query path and add the
+operational primitives needed by an object-store-first service.
+
+Planned tasks:
+
+- [ ] Add a durable brokered indexing queue with bounded worker claims/leases.
+- [ ] Add warm-cache planning and an explicit prewarm endpoint.
+- [ ] Add branch/copy/export operations over immutable manifest generations.
+- [ ] Add namespace pinning/read-replica controls after cache behavior is measured.
 
 ---
 

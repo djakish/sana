@@ -1,7 +1,9 @@
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
+use sana::rabitq::{RabitqCluster, RabitqCode};
 use sana::schema::DistanceMetric;
+use sana::value::Id;
 use sana::vector::{
     AutoDistanceKernel, DistanceKernel, ScalarDistanceKernel, distance_kernel_kind,
 };
@@ -11,6 +13,74 @@ fn main() {
     println!("logical GiB/s over candidate vectors (higher is better)");
     run_suite("cache-hot 4 MiB", 1 << 20, 32, &[128, 768, 1536]);
     run_suite("DRAM 64 MiB", 1 << 24, 4, &[768]);
+    run_rabitq_suite();
+}
+
+fn run_rabitq_suite() {
+    const DIM: usize = 768;
+    const PADDED_DIM: usize = 1024;
+    const CODE_COUNT: usize = 16_384;
+    const ITERATIONS: usize = 16;
+
+    let mut seed = 0x6f6e_655f_6269_7451;
+    let cluster = RabitqCluster {
+        centroid_id: 0,
+        transform_seed: seed,
+        codes: Vec::new(),
+    };
+    let query = cluster
+        .rotate_query(&random_vector(DIM, &mut seed), PADDED_DIM)
+        .unwrap();
+    let codes = (0..CODE_COUNT)
+        .map(|id| RabitqCode {
+            id: Id::U64(id as u64),
+            local_id: id as u32,
+            version: 1,
+            residual_norm: 1.0,
+            dot_code: 0.8,
+            code_words: (0..PADDED_DIM / 64)
+                .map(|_| {
+                    seed = splitmix(seed);
+                    seed
+                })
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+
+    let scalar = measure_rabitq(&codes, ITERATIONS, |code| code.estimate_l2_sq(&query));
+    let packed = measure_rabitq(&codes, ITERATIONS, |code| {
+        code.estimate_l2_sq_packed(&query)
+    });
+    println!(
+        "RaBitQ dim={DIM} codes={CODE_COUNT} float={:.1} packed={:.1} Mcodes/s speedup={:.2}x",
+        scalar.1,
+        packed.1,
+        scalar.0.as_secs_f64() / packed.0.as_secs_f64()
+    );
+}
+
+fn measure_rabitq(
+    codes: &[RabitqCode],
+    iterations: usize,
+    estimate: impl Fn(&RabitqCode) -> f32,
+) -> (Duration, f64) {
+    for _ in 0..2 {
+        for code in black_box(codes) {
+            black_box(estimate(code));
+        }
+    }
+    let start = Instant::now();
+    let mut checksum = 0.0f32;
+    for _ in 0..iterations {
+        for code in black_box(codes) {
+            checksum += black_box(estimate(code));
+        }
+    }
+    let elapsed = start.elapsed();
+    black_box(checksum);
+    let millions_per_second =
+        codes.len() as f64 * iterations as f64 / elapsed.as_secs_f64() / 1_000_000.0;
+    (elapsed, millions_per_second)
 }
 
 fn run_suite(label: &str, target_floats: usize, iterations: usize, dimensions: &[usize]) {

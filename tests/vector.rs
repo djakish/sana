@@ -156,6 +156,7 @@ fn rabitq_code_generation_packs_cluster_residual_bits() {
     let cluster = &rabitq.clusters[0];
     assert_eq!(cluster.centroid_id, 0);
     assert_eq!(cluster.codes.len(), 2);
+    assert!(cluster.rotate_query(&vec![0.0; dim], dim).is_err());
 
     // Non-zero residual: code spans the padded dimension, norm and factor are set.
     let non_zero = &cluster.codes[0];
@@ -226,25 +227,36 @@ fn rabitq_estimate_recovers_nearest_neighbours() {
         .collect();
 
     let mut estimated: Vec<(Id, f32)> = Vec::with_capacity(n);
+    let mut packed_estimated: Vec<(Id, f32)> = Vec::with_capacity(n);
     for cluster in &rabitq.clusters {
         let centroid = &index.centroids[cluster.centroid_id as usize];
         let residual: Vec<f32> = query.iter().zip(centroid).map(|(q, c)| q - c).collect();
-        let rotated = cluster.rotate_query(&residual, rabitq.padded_dim);
+        let rotated = cluster.rotate_query(&residual, rabitq.padded_dim).unwrap();
         for code in &cluster.codes {
             let est = code.estimate_l2_sq(&rotated);
             assert!(est.is_finite() && est >= 0.0);
             estimated.push((code.id.clone(), est));
+            let packed_est = code.estimate_l2_sq_packed(&rotated);
+            assert!(packed_est.is_finite() && packed_est >= 0.0);
+            packed_estimated.push((code.id.clone(), packed_est));
         }
     }
     assert_eq!(estimated.len(), n);
+    assert_eq!(packed_estimated.len(), n);
 
     let top_k = 10;
     let truth: std::collections::BTreeSet<Id> = top_ids(exact, top_k);
     let approx: std::collections::BTreeSet<Id> = top_ids(estimated, top_k);
+    let packed_approx: std::collections::BTreeSet<Id> = top_ids(packed_estimated, top_k);
     let hits = truth.intersection(&approx).count();
+    let packed_hits = truth.intersection(&packed_approx).count();
     assert!(
         hits as f64 / top_k as f64 >= 0.6,
         "RaBitQ recall@{top_k} too low: {hits}/{top_k}"
+    );
+    assert!(
+        packed_hits as f64 / top_k as f64 >= 0.6,
+        "packed RaBitQ recall@{top_k} too low: {packed_hits}/{top_k}"
     );
 
     let reranked = rabitq
