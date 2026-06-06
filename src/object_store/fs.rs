@@ -6,6 +6,7 @@
 use std::io::ErrorKind;
 use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
+use std::sync::OnceLock;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -16,15 +17,16 @@ use crate::error::{Error, Result};
 
 pub struct FsObjectStore {
     root: PathBuf,
-    write_lock: tokio::sync::Mutex<()>,
 }
 
 impl FsObjectStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self {
-            root: root.into(),
-            write_lock: tokio::sync::Mutex::new(()),
-        }
+        Self { root: root.into() }
+    }
+
+    fn write_lock() -> &'static tokio::sync::Mutex<()> {
+        static WRITE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        WRITE_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
     }
 
     /// Map an object key to a path under root, rejecting absolute paths and
@@ -56,6 +58,16 @@ impl FsObjectStore {
         drop(f);
 
         tokio::fs::rename(&tmp, path).await?;
+        #[cfg(unix)]
+        {
+            let parent = path
+                .parent()
+                .ok_or_else(|| Error::Corrupt("object path has no parent".into()))?
+                .to_owned();
+            tokio::task::spawn_blocking(move || std::fs::File::open(parent)?.sync_all())
+                .await
+                .map_err(|e| Error::Corrupt(format!("directory sync join error: {e}")))??;
+        }
         Ok(())
     }
 }
@@ -103,14 +115,14 @@ impl ObjectStore for FsObjectStore {
 
     async fn put(&self, key: &str, bytes: Bytes) -> Result<ObjectVersion> {
         let path = self.resolve(key)?;
-        let _g = self.write_lock.lock().await;
+        let _g = Self::write_lock().lock().await;
         Self::write_atomic(&path, &bytes).await?;
         Ok(version_of(&bytes))
     }
 
     async fn put_if_absent(&self, key: &str, bytes: Bytes) -> Result<ObjectVersion> {
         let path = self.resolve(key)?;
-        let _g = self.write_lock.lock().await;
+        let _g = Self::write_lock().lock().await;
         if tokio::fs::try_exists(&path).await? {
             return Err(Error::AlreadyExists(key.to_string()));
         }
@@ -125,7 +137,7 @@ impl ObjectStore for FsObjectStore {
         bytes: Bytes,
     ) -> Result<ObjectVersion> {
         let path = self.resolve(key)?;
-        let _g = self.write_lock.lock().await;
+        let _g = Self::write_lock().lock().await;
         let actual = match tokio::fs::read(&path).await {
             Ok(data) => Some(version_of(&data)),
             Err(e) if e.kind() == ErrorKind::NotFound => None,
@@ -190,7 +202,7 @@ impl ObjectStore for FsObjectStore {
 
     async fn delete(&self, key: &str) -> Result<()> {
         let path = self.resolve(key)?;
-        let _g = self.write_lock.lock().await;
+        let _g = Self::write_lock().lock().await;
         match tokio::fs::remove_file(&path).await {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),

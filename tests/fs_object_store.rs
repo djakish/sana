@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use sana::error::Error;
 use sana::object_store::{FsObjectStore, ObjectStore, version_of};
+use std::sync::Arc;
 use tempfile::tempdir;
 
 fn store() -> (tempfile::TempDir, FsObjectStore) {
@@ -75,6 +76,42 @@ async fn cas_fails_on_stale_version() {
         .unwrap_err();
     assert!(matches!(err, Error::CasMismatch { .. }));
     assert_eq!(store.get(key).await.unwrap().bytes, Bytes::from_static(b"v1"));
+}
+
+#[tokio::test]
+async fn independent_handles_share_one_cas_lock() {
+    let dir = tempdir().unwrap();
+    let initial = FsObjectStore::new(dir.path());
+    let expected = initial
+        .put("ptr", Bytes::from_static(b"v0"))
+        .await
+        .unwrap();
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(16));
+    let mut tasks = Vec::new();
+    for value in 0..16u8 {
+        let store = FsObjectStore::new(dir.path());
+        let expected = expected.clone();
+        let barrier = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            store
+                .compare_and_set("ptr", expected, Bytes::from(vec![value]))
+                .await
+        }));
+    }
+
+    let mut successes = 0;
+    let mut mismatches = 0;
+    for task in tasks {
+        match task.await.unwrap() {
+            Ok(_) => successes += 1,
+            Err(Error::CasMismatch { .. }) => mismatches += 1,
+            Err(error) => panic!("unexpected CAS result: {error}"),
+        }
+    }
+    assert_eq!(successes, 1);
+    assert_eq!(mismatches, 15);
 }
 
 #[tokio::test]
