@@ -13,13 +13,13 @@ the next unchecked task under "Current milestone" / "Next up".
 
 - **Current stage:** Stage 10 (Durability hardening and write semantics) —
   **in progress**.
-- **Next up:** Checksum and bounds-check the SST footer, then make oversized
-  SST fields fail explicitly instead of truncating.
+- **Next up:** Make WAL idempotency keys durable and reject conflicting retries
+  without consuming a new sequence.
 - **Done:** Stage 0 (Skeleton), Stage 1 (Durable Documents), Stage 2 (SST/LSM),
   Stage 3 (Attributes & Exact Search), Stage 4 (ANN v0), Stage 5 (Native
   Filtering), Stage 6 (SPFresh local rebuild), Stage 7 (Full-text search),
   Stage 8 (RaBitQ & kernels), Stage 9 (Object-store operations).
-- **Tests:** `cargo test` green (149 tests); `cargo clippy --all-targets` clean.
+- **Tests:** `cargo test` green (154 tests); `cargo clippy --all-targets` clean.
 - **Note:** post-Stage-2 and Stage-3–5 code-review fixes applied; remaining
   findings tracked under "Stage 2 — code review follow-ups" and "Stages 3–5 —
   code review follow-ups". Recently fixed limitations: Stage 2 ranged
@@ -43,7 +43,9 @@ the next unchecked task under "Current milestone" / "Next up".
   generations support zero-copy branches, independent cross-store copies, and
   deterministic catalog-last exports. Namespace pinning now uses durable,
   leased replica slots with fenced claims, exact-generation warm readiness,
-  deterministic routing, and utilization metadata.
+  deterministic routing, and utilization metadata. New SSTs use a checksummed
+  v2 footer and fully checked metadata arithmetic while v1 files remain
+  readable.
 - **Last updated:** 2026-06-06.
 
 ---
@@ -237,11 +239,15 @@ single-process, epoch-0, trusted-storage assumptions, but they are real):**
       scans and the batch `resolve_ids` path. Whole-object and ranged paths now
       share one set of footer/index/block decoders. A counting-store test asserts
       a point lookup makes ≤3 requests and reads under a quarter of the object.
-- [ ] **SST footer not checksummed.** Unlike blocks/index, footer fields aren't
-      CRC'd, so accidental corruption can overflow/panic instead of erroring;
-      add a footer checksum and use checked arithmetic on parsed offsets.
-- [ ] **`u32` size/offset fields** (restart offsets, index key length) silently
-      truncate for >4 GiB blocks/keys — widen or bound.
+- [x] **SST footer not checksummed.** *Done.* Writers emit a v2 36-byte footer
+      whose CRC covers the index handle, index CRC, version, and magic. Readers
+      retain v1 compatibility and both whole/ranged paths require the index to
+      end exactly at the footer.
+- [x] **`u32` size/offset fields.** *Done.* Writer fields use checked
+      conversions and return `InvalidWrite` on format-limit overflow. Readers
+      use checked conversions/arithmetic for footer, index, block, restart,
+      varint, key, and value metadata and reject malformed regions before
+      slicing or allocating.
 - [x] **Test gap.** *Done.* `point_lookup_prunes_ssts_by_id_range`
       (`tests/namespace.rs`) builds two un-compacted doc SSTs with disjoint id
       ranges and asserts, via a key-recording store, that a lookup issues zero
@@ -844,7 +850,7 @@ engine through a small service API without weakening the object-store model.
 
 Planned tasks:
 
-- [ ] Add an SST footer checksum, checked offset arithmetic, and explicit size
+- [x] Add an SST footer checksum, checked offset arithmetic, and explicit size
       bounds with corruption/oversize regression tests.
 - [ ] Make WAL idempotency keys durable and reject conflicting retries.
 - [ ] Add compare-and-set conditional writes and patch/delete-by-filter against
@@ -852,6 +858,20 @@ Planned tasks:
 - [ ] Add unindexed-WAL byte accounting and configurable write backpressure.
 - [ ] Add HTTP write/query/metadata/recall/warm-cache endpoints over the same
       library contracts used by the CLI.
+
+Stage 10 decisions / notes:
+
+- **D60 — SST v2 adds footer integrity without stranding v1 objects.** The
+  footer grows from 32 to 36 bytes and checksums every footer field except the
+  checksum itself. Readers identify v1/v2 from the stable trailing
+  version+magic and parse either format, so manifests need no migration.
+  Whole-object and ranged readers share strict layout validation: contiguous
+  block handles cover exactly the pre-index data region, the index ends exactly
+  at the footer, keys are ordered, restart metadata is bounded, varints reject
+  overflow, and decoded ranges use checked arithmetic. `SstWriter::finish`
+  returns `Result`, making representational limits explicit. Tests retain the
+  v1 golden, add a v2 golden, and cover footer tampering, validly rechecksummed
+  invalid handles, restart corruption, and both v1 read paths.
 
 ---
 

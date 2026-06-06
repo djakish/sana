@@ -261,6 +261,12 @@ SST object:
   footer               # magic, format version, checksums, index offset
 ```
 
+SST writers currently emit format v2: each data block, the index, and the
+footer are checksummed independently. Readers retain v1 footer compatibility
+and validate all offsets, lengths, restart metadata, and integer conversions
+before slicing or allocating. Block handles must cover the data region
+contiguously and the index must end exactly where the footer begins.
+
 The key format must sort lexicographically by index family:
 
 ```text
