@@ -13,6 +13,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::attr::{self, AttrBound};
+use crate::backpressure::{DEFAULT_MAX_UNINDEXED_WAL_BYTES, enforce_limit, unindexed_wal_bytes};
 use crate::doc::encode_id;
 use crate::error::{Error, Result};
 use crate::manifest::{NamespaceManifest, VectorIndexMeta};
@@ -27,6 +28,20 @@ use crate::wal::WalCursor;
 
 const DEFAULT_RECALL_NUM: usize = 25;
 const DEFAULT_RECALL_TOP_K: usize = 10;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryOptions {
+    #[serde(default = "default_max_unindexed_wal_bytes")]
+    pub max_unindexed_wal_bytes: u64,
+}
+
+impl Default for QueryOptions {
+    fn default() -> Self {
+        Self {
+            max_unindexed_wal_bytes: DEFAULT_MAX_UNINDEXED_WAL_BYTES,
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Query {
@@ -238,25 +253,56 @@ fn default_recall_top_k() -> usize {
     DEFAULT_RECALL_TOP_K
 }
 
+fn default_max_unindexed_wal_bytes() -> u64 {
+    DEFAULT_MAX_UNINDEXED_WAL_BYTES
+}
+
 pub async fn execute(ns: &Namespace, query: Query) -> Result<QueryResult> {
-    let manifest = ns.load_manifest().await?;
-    let commit = ns.commit_cursor().await?;
+    execute_with_options(ns, query, QueryOptions::default()).await
+}
+
+pub async fn execute_with_options(
+    ns: &Namespace,
+    query: Query,
+    options: QueryOptions,
+) -> Result<QueryResult> {
+    let (manifest, commit) = load_strong_snapshot(ns, options).await?;
     execute_with_snapshot(ns, &manifest, commit, query).await
 }
 
 pub async fn execute_multi(ns: &Namespace, request: MultiQuery) -> Result<MultiQueryResult> {
+    execute_multi_with_options(ns, request, QueryOptions::default()).await
+}
+
+pub async fn execute_multi_with_options(
+    ns: &Namespace,
+    request: MultiQuery,
+    options: QueryOptions,
+) -> Result<MultiQueryResult> {
     if request.queries.is_empty() {
         return Err(Error::InvalidQuery(
             "multi-query requires at least one query".into(),
         ));
     }
-    let manifest = ns.load_manifest().await?;
-    let commit = ns.commit_cursor().await?;
+    let (manifest, commit) = load_strong_snapshot(ns, options).await?;
     let mut results = Vec::with_capacity(request.queries.len());
     for query in request.queries {
         results.push(execute_with_snapshot(ns, &manifest, commit, query).await?);
     }
     Ok(MultiQueryResult { results })
+}
+
+async fn load_strong_snapshot(
+    ns: &Namespace,
+    options: QueryOptions,
+) -> Result<(NamespaceManifest, WalCursor)> {
+    let manifest = ns.load_manifest().await?;
+    let (commit, committed_wal_bytes) = ns.wal_commit_stats().await?;
+    enforce_limit(
+        unindexed_wal_bytes(&manifest, committed_wal_bytes)?,
+        options.max_unindexed_wal_bytes,
+    )?;
+    Ok((manifest, commit))
 }
 
 async fn execute_with_snapshot(
@@ -429,6 +475,14 @@ async fn text_hits_and_docs(
 }
 
 pub async fn recall(ns: &Namespace, request: RecallRequest) -> Result<RecallResult> {
+    recall_with_options(ns, request, QueryOptions::default()).await
+}
+
+pub async fn recall_with_options(
+    ns: &Namespace,
+    request: RecallRequest,
+    options: QueryOptions,
+) -> Result<RecallResult> {
     if request.num == 0 {
         return Err(Error::InvalidQuery(
             "recall num must be greater than zero".into(),
@@ -439,7 +493,7 @@ pub async fn recall(ns: &Namespace, request: RecallRequest) -> Result<RecallResu
             "recall top_k must be greater than zero".into(),
         ));
     }
-    let manifest = ns.load_manifest().await?;
+    let (manifest, commit) = load_strong_snapshot(ns, options).await?;
     let column = match request.column.clone() {
         Some(column) => column,
         None => manifest
@@ -470,7 +524,8 @@ pub async fn recall(ns: &Namespace, request: RecallRequest) -> Result<RecallResu
         }
     }
 
-    let mut candidates = recall_candidates(ns, &column, dim, request.filter.as_ref()).await?;
+    let mut candidates =
+        recall_candidates(ns, &manifest, commit, &column, dim, request.filter.as_ref()).await?;
     if candidates.is_empty() {
         return Err(Error::InvalidQuery(format!(
             "recall column '{column}' has no stored vectors"
@@ -517,7 +572,10 @@ pub async fn recall(ns: &Namespace, request: RecallRequest) -> Result<RecallResu
             }),
             text: None,
         };
-        let (exact, ann) = tokio::join!(execute(ns, exact_query), execute(ns, ann_query));
+        let (exact, ann) = tokio::join!(
+            execute_with_snapshot(ns, &manifest, commit, exact_query),
+            execute_with_snapshot(ns, &manifest, commit, ann_query)
+        );
         let (exact, ann) = (exact?, ann?);
 
         let exhaustive_ids = exact.rows.into_iter().map(|row| row.id).collect::<Vec<_>>();
@@ -1266,11 +1324,13 @@ struct RecallCandidate {
 
 async fn recall_candidates(
     ns: &Namespace,
+    manifest: &NamespaceManifest,
+    commit: WalCursor,
     column: &str,
     dim: usize,
     filter: Option<&FilterExpr>,
 ) -> Result<Vec<RecallCandidate>> {
-    let docs = ns.replay().await?;
+    let docs = ns.replay_at(manifest, commit).await?;
     let mut out = Vec::new();
     for (id, document) in docs {
         if !matches_filter(filter, &document)? {

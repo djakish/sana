@@ -25,18 +25,21 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
+use crate::backpressure::{enforce_limit, unindexed_wal_bytes};
 use crate::doc::{DocRecord, decode_id, encode_id};
 use crate::error::{Error, Result};
 use crate::index_queue::{EnqueueOutcome, IndexQueue};
 use crate::manifest::{ManifestPointer, NamespaceManifest};
 use crate::object_store::{GetResult, ObjectStore, ObjectVersion, version_of};
-use crate::query::{MultiQuery, MultiQueryResult, Query, QueryResult, RecallRequest, RecallResult};
+use crate::query::{
+    MultiQuery, MultiQueryResult, Query, QueryOptions, QueryResult, RecallRequest, RecallResult,
+};
 use crate::sst::SstReader;
 use crate::value::{Document, Id, Value};
 use crate::wal::{WalBatch, WalCursor, WalOp};
 use crate::write::{
     ConditionalWriteOp, ConditionalWriteResult, DeleteByFilterRequest, PatchByFilterRequest,
-    WriteOutcome,
+    WriteOptions, WriteOutcome,
 };
 
 const WAL_COMMIT_FORMAT_VERSION: u32 = 1;
@@ -161,6 +164,7 @@ struct PreparedWrite {
     request_fingerprint: RequestFingerprint,
     idempotency_kind: IdempotencyKind,
     conditional_outcome: Option<WriteOutcome>,
+    max_unindexed_wal_bytes: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -346,6 +350,12 @@ pub(crate) fn op_id(op: &WalOp) -> &Id {
     match op {
         WalOp::Upsert { id, .. } | WalOp::Patch { id, .. } | WalOp::Delete { id } => id,
     }
+}
+
+fn can_disable_backpressure(operations: &[WalOp]) -> bool {
+    operations
+        .iter()
+        .all(|operation| matches!(operation, WalOp::Upsert { .. } | WalOp::Delete { .. }))
 }
 
 pub struct Namespace {
@@ -810,6 +820,16 @@ impl Namespace {
         operations: Vec<WalOp>,
         idempotency_key: Option<String>,
     ) -> Result<WalCursor> {
+        self.append_with_options(operations, idempotency_key, WriteOptions::default())
+            .await
+    }
+
+    pub async fn append_with_options(
+        &self,
+        operations: Vec<WalOp>,
+        idempotency_key: Option<String>,
+        options: WriteOptions,
+    ) -> Result<WalCursor> {
         if operations.is_empty() {
             return Err(Error::InvalidWrite("write batch cannot be empty".into()));
         }
@@ -817,10 +837,21 @@ impl Namespace {
             validate_idempotency_key(key)?;
         }
         let fingerprint = request_fingerprint(&operations)?;
+        let max_unindexed_wal_bytes =
+            if options.disable_backpressure && can_disable_backpressure(&operations) {
+                None
+            } else {
+                Some(options.max_unindexed_wal_bytes)
+            };
 
         let append_guard = self.append_lock.lock().await;
         let committed = self
-            .append_locked(operations, idempotency_key, fingerprint)
+            .append_locked(
+                operations,
+                idempotency_key,
+                fingerprint,
+                max_unindexed_wal_bytes,
+            )
             .await?;
         drop(append_guard);
 
@@ -842,6 +873,16 @@ impl Namespace {
         writes: Vec<ConditionalWriteOp>,
         idempotency_key: Option<String>,
     ) -> Result<ConditionalWriteResult> {
+        self.conditional_write_with_options(writes, idempotency_key, WriteOptions::default())
+            .await
+    }
+
+    pub async fn conditional_write_with_options(
+        &self,
+        writes: Vec<ConditionalWriteOp>,
+        idempotency_key: Option<String>,
+        options: WriteOptions,
+    ) -> Result<ConditionalWriteResult> {
         if writes.is_empty() {
             return Err(Error::InvalidWrite(
                 "conditional write batch cannot be empty".into(),
@@ -861,6 +902,7 @@ impl Namespace {
                 fingerprint,
                 IdempotencyKind::Conditional,
                 false,
+                options.max_unindexed_wal_bytes,
             )
             .await?;
         drop(append_guard);
@@ -878,6 +920,16 @@ impl Namespace {
         request: PatchByFilterRequest,
         idempotency_key: Option<String>,
     ) -> Result<ConditionalWriteResult> {
+        self.patch_by_filter_with_options(request, idempotency_key, WriteOptions::default())
+            .await
+    }
+
+    pub async fn patch_by_filter_with_options(
+        &self,
+        request: PatchByFilterRequest,
+        idempotency_key: Option<String>,
+        options: WriteOptions,
+    ) -> Result<ConditionalWriteResult> {
         if request.attributes.is_empty() && request.vectors.is_empty() {
             return Err(Error::InvalidWrite(
                 "patch-by-filter requires at least one patched field".into(),
@@ -891,7 +943,23 @@ impl Namespace {
         }])
         .await?;
         let fingerprint = request_fingerprint(&request)?;
-        let candidates = self.matching_filter_ids(&request.filter).await?;
+        {
+            let append_guard = self.append_lock.lock().await;
+            if let Some(result) = self
+                .lookup_write_result(
+                    idempotency_key.as_deref(),
+                    &fingerprint,
+                    IdempotencyKind::PatchByFilter,
+                )
+                .await?
+            {
+                drop(append_guard);
+                return Ok(result);
+            }
+        }
+        let candidates = self
+            .matching_filter_ids(&request.filter, options.max_unindexed_wal_bytes)
+            .await?;
         let append_guard = self.append_lock.lock().await;
         if let Some(result) = self
             .lookup_write_result(
@@ -928,6 +996,7 @@ impl Namespace {
                 fingerprint,
                 IdempotencyKind::PatchByFilter,
                 rows_remaining,
+                options.max_unindexed_wal_bytes,
             )
             .await?;
         drop(append_guard);
@@ -944,9 +1013,35 @@ impl Namespace {
         request: DeleteByFilterRequest,
         idempotency_key: Option<String>,
     ) -> Result<ConditionalWriteResult> {
+        self.delete_by_filter_with_options(request, idempotency_key, WriteOptions::default())
+            .await
+    }
+
+    pub async fn delete_by_filter_with_options(
+        &self,
+        request: DeleteByFilterRequest,
+        idempotency_key: Option<String>,
+        options: WriteOptions,
+    ) -> Result<ConditionalWriteResult> {
         self.validate_filter_mutation_input(request.max_rows, idempotency_key.as_deref())?;
         let fingerprint = request_fingerprint(&request)?;
-        let candidates = self.matching_filter_ids(&request.filter).await?;
+        {
+            let append_guard = self.append_lock.lock().await;
+            if let Some(result) = self
+                .lookup_write_result(
+                    idempotency_key.as_deref(),
+                    &fingerprint,
+                    IdempotencyKind::DeleteByFilter,
+                )
+                .await?
+            {
+                drop(append_guard);
+                return Ok(result);
+            }
+        }
+        let candidates = self
+            .matching_filter_ids(&request.filter, options.max_unindexed_wal_bytes)
+            .await?;
         let append_guard = self.append_lock.lock().await;
         if let Some(result) = self
             .lookup_write_result(
@@ -979,6 +1074,7 @@ impl Namespace {
                 fingerprint,
                 IdempotencyKind::DeleteByFilter,
                 rows_remaining,
+                options.max_unindexed_wal_bytes,
             )
             .await?;
         drop(append_guard);
@@ -1004,8 +1100,18 @@ impl Namespace {
         Ok(())
     }
 
-    async fn matching_filter_ids(&self, filter: &crate::query::FilterExpr) -> Result<Vec<Id>> {
-        let documents = self.replay().await?;
+    async fn matching_filter_ids(
+        &self,
+        filter: &crate::query::FilterExpr,
+        max_unindexed_wal_bytes: u64,
+    ) -> Result<Vec<Id>> {
+        let manifest = self.load_manifest().await?;
+        let (commit, committed_wal_bytes) = self.wal_commit_stats().await?;
+        enforce_limit(
+            unindexed_wal_bytes(&manifest, committed_wal_bytes)?,
+            max_unindexed_wal_bytes,
+        )?;
+        let documents = self.replay_at(&manifest, commit).await?;
         let mut ids = Vec::new();
         for (id, document) in documents {
             if crate::query::filter_matches(filter, &document)? {
@@ -1052,6 +1158,7 @@ impl Namespace {
         operations: Vec<WalOp>,
         idempotency_key: Option<String>,
         fingerprint: RequestFingerprint,
+        max_unindexed_wal_bytes: Option<u64>,
     ) -> Result<WalCursor> {
         loop {
             let (current, state) = self.load_commit_state().await?;
@@ -1078,6 +1185,7 @@ impl Namespace {
                         request_fingerprint: fingerprint.clone(),
                         idempotency_kind: IdempotencyKind::Append,
                         conditional_outcome: None,
+                        max_unindexed_wal_bytes,
                     },
                 )
                 .await?
@@ -1095,6 +1203,7 @@ impl Namespace {
         fingerprint: RequestFingerprint,
         idempotency_kind: IdempotencyKind,
         rows_remaining: bool,
+        max_unindexed_wal_bytes: u64,
     ) -> Result<ConditionalWriteResult> {
         let all_operations: Vec<WalOp> =
             writes.iter().map(|write| write.operation.clone()).collect();
@@ -1126,6 +1235,20 @@ impl Namespace {
             self.validate_ops_for_current_schema(&all_operations)
                 .await?;
             let manifest = self.load_manifest().await?;
+            let committed_wal_bytes = state
+                .committed_wal_bytes
+                .ok_or_else(|| Error::Corrupt("WAL commit byte counter was not migrated".into()))?;
+            let current_unindexed = match unindexed_wal_bytes(&manifest, committed_wal_bytes) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    let latest = self.store.get(&wal_commit_key(&self.name)).await?;
+                    if latest.version != current.version {
+                        continue;
+                    }
+                    return Err(error);
+                }
+            };
+            enforce_limit(current_unindexed, max_unindexed_wal_bytes)?;
             let documents = self.replay_at(&manifest, state.committed).await?;
             let (operations, mut outcome) = evaluate_conditional_writes(&writes, &documents)?;
             outcome.rows_remaining = rows_remaining;
@@ -1140,6 +1263,7 @@ impl Namespace {
                         request_fingerprint: fingerprint.clone(),
                         idempotency_kind,
                         conditional_outcome: Some(outcome.clone()),
+                        max_unindexed_wal_bytes: Some(max_unindexed_wal_bytes),
                     },
                 )
                 .await?
@@ -1189,6 +1313,29 @@ impl Namespace {
         let encoded = batch.encode()?;
         let wal_size_bytes = u64::try_from(encoded.len())
             .map_err(|_| Error::InvalidWrite("encoded WAL batch is too large".into()))?;
+        if let Some(limit_bytes) = prepared.max_unindexed_wal_bytes {
+            let manifest = self.load_manifest().await?;
+            let committed_wal_bytes = state
+                .committed_wal_bytes
+                .ok_or_else(|| Error::Corrupt("WAL commit byte counter was not migrated".into()))?;
+            let current_unindexed = match unindexed_wal_bytes(&manifest, committed_wal_bytes) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    let latest = self.store.get(&wal_commit_key(&self.name)).await?;
+                    if latest.version != current.version {
+                        return Ok(None);
+                    }
+                    return Err(error);
+                }
+            };
+            let projected_unindexed =
+                current_unindexed
+                    .checked_add(wal_size_bytes)
+                    .ok_or_else(|| {
+                        Error::InvalidWrite("projected unindexed WAL bytes overflow".into())
+                    })?;
+            enforce_limit(projected_unindexed, limit_bytes)?;
+        }
         let staging_version = version_of(&encoded);
         let staging_key = wal_staging_key(&self.name, next, &staging_version);
         put_immutable_if_absent(&self.store, &staging_key, Bytes::from(encoded)).await?;
@@ -1458,13 +1605,27 @@ impl Namespace {
     }
 
     pub async fn upsert(&self, document: Document) -> Result<WalCursor> {
+        self.upsert_with_options(document, WriteOptions::default())
+            .await
+    }
+
+    pub async fn upsert_with_options(
+        &self,
+        document: Document,
+        options: WriteOptions,
+    ) -> Result<WalCursor> {
         let id = document.id.clone();
-        self.append(vec![WalOp::Upsert { id, document }], None)
+        self.append_with_options(vec![WalOp::Upsert { id, document }], None, options)
             .await
     }
 
     pub async fn delete(&self, id: Id) -> Result<WalCursor> {
-        self.append(vec![WalOp::Delete { id }], None).await
+        self.delete_with_options(id, WriteOptions::default()).await
+    }
+
+    pub async fn delete_with_options(&self, id: Id, options: WriteOptions) -> Result<WalCursor> {
+        self.append_with_options(vec![WalOp::Delete { id }], None, options)
+            .await
     }
 
     /// Materialize the full document snapshot: SST base (newest-first wins,
@@ -1526,20 +1687,47 @@ impl Namespace {
     /// documents; attribute/vector index acceleration can replace the candidate
     /// generation inside `query` without changing this entry point.
     pub async fn query(&self, query: Query) -> Result<QueryResult> {
-        crate::query::execute(self, query).await
+        self.query_with_options(query, QueryOptions::default())
+            .await
+    }
+
+    pub async fn query_with_options(
+        &self,
+        query: Query,
+        options: QueryOptions,
+    ) -> Result<QueryResult> {
+        crate::query::execute_with_options(self, query, options).await
     }
 
     /// Execute several independent query plans against one captured manifest
     /// and WAL commit snapshot. Hybrid rank fusion stays a caller concern; this
     /// gives text/vector/attribute subqueries a consistent read timestamp.
     pub async fn multi_query(&self, query: MultiQuery) -> Result<MultiQueryResult> {
-        crate::query::execute_multi(self, query).await
+        self.multi_query_with_options(query, QueryOptions::default())
+            .await
+    }
+
+    pub async fn multi_query_with_options(
+        &self,
+        query: MultiQuery,
+        options: QueryOptions,
+    ) -> Result<MultiQueryResult> {
+        crate::query::execute_multi_with_options(self, query, options).await
     }
 
     /// Evaluate ANN recall by comparing approximate vector search with exact
     /// search over sampled vectors from the strong snapshot.
     pub async fn recall(&self, request: RecallRequest) -> Result<RecallResult> {
-        crate::query::recall(self, request).await
+        self.recall_with_options(request, QueryOptions::default())
+            .await
+    }
+
+    pub async fn recall_with_options(
+        &self,
+        request: RecallRequest,
+        options: QueryOptions,
+    ) -> Result<RecallResult> {
+        crate::query::recall_with_options(self, request, options).await
     }
 }
 

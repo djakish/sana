@@ -26,6 +26,12 @@ pub enum Error {
     #[error("idempotency key conflict: {0}")]
     IdempotencyConflict(String),
 
+    #[error("backpressure: {unindexed_bytes} unindexed WAL bytes exceeds limit {limit_bytes}")]
+    Backpressure {
+        unindexed_bytes: u64,
+        limit_bytes: u64,
+    },
+
     #[error("invalid schema: {0}")]
     InvalidSchema(String),
 

@@ -11,6 +11,7 @@ use sana::namespace::Namespace;
 use sana::object_store::{FsObjectStore, GetResult, ObjectMeta, ObjectStore, ObjectVersion};
 use sana::value::{Document, Id, Value, VectorValue};
 use sana::wal::WalOp;
+use sana::write::WriteOptions;
 use tempfile::TempDir;
 
 fn store(dir: &TempDir) -> Arc<dyn ObjectStore> {
@@ -257,6 +258,111 @@ async fn unindexed_wal_bytes_tracks_commits_and_flushes() {
         .bytes
         .len() as u64;
     assert_eq!(ns.unindexed_wal_bytes().await.unwrap(), third_size);
+}
+
+#[tokio::test]
+async fn write_backpressure_is_projected_and_bulk_bypass_is_idempotent() {
+    let dir = tempfile::tempdir().unwrap();
+    let ns = Namespace::create(store(&dir), "docs").await.unwrap();
+    let blocked = WriteOptions {
+        disable_backpressure: false,
+        max_unindexed_wal_bytes: 0,
+    };
+    let bulk = WriteOptions {
+        disable_backpressure: true,
+        max_unindexed_wal_bytes: 0,
+    };
+    let operation = vec![WalOp::Upsert {
+        id: Id::U64(1),
+        document: doc_with(1, "alpha", 10),
+    }];
+
+    let error = ns
+        .append_with_options(operation.clone(), Some("bulk-one".into()), blocked)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Backpressure { limit_bytes: 0, .. }));
+    assert_eq!(ns.commit_cursor().await.unwrap().seq, 0);
+
+    let cursor = ns
+        .append_with_options(operation.clone(), Some("bulk-one".into()), bulk)
+        .await
+        .unwrap();
+    assert_eq!(cursor.seq, 1);
+
+    assert_eq!(
+        ns.append_with_options(operation, Some("bulk-one".into()), blocked)
+            .await
+            .unwrap(),
+        cursor,
+        "an exact idempotent retry must resolve before backpressure"
+    );
+
+    let error = ns
+        .append_with_options(
+            vec![WalOp::Patch {
+                id: Id::U64(1),
+                attributes: BTreeMap::from([("score".into(), Value::Int(11))]),
+                vectors: BTreeMap::new(),
+            }],
+            None,
+            bulk,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Backpressure { .. }));
+    assert_eq!(ns.commit_cursor().await.unwrap(), cursor);
+}
+
+#[tokio::test]
+async fn concurrent_writers_share_one_backpressure_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let object_store = store(&dir);
+    let ns = Namespace::create(object_store.clone(), "docs")
+        .await
+        .unwrap();
+    let calibration = ns.delete(Id::U64(1)).await.unwrap();
+    let calibration_size = object_store
+        .get(&format!(
+            "namespaces/docs/wal/{}/{}.wal",
+            calibration.epoch, calibration.seq
+        ))
+        .await
+        .unwrap()
+        .bytes
+        .len() as u64;
+    indexer::flush(&ns).await.unwrap();
+
+    let options = WriteOptions {
+        disable_backpressure: false,
+        max_unindexed_wal_bytes: calibration_size + 32,
+    };
+    let barrier = Arc::new(tokio::sync::Barrier::new(9));
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let namespace = Namespace::open(object_store.clone(), "docs").await.unwrap();
+        let barrier = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            namespace
+                .append_with_options(vec![WalOp::Delete { id: Id::U64(1) }], None, options)
+                .await
+        }));
+    }
+    barrier.wait().await;
+
+    let mut committed = 0;
+    let mut throttled = 0;
+    for task in tasks {
+        match task.await.unwrap() {
+            Ok(_) => committed += 1,
+            Err(Error::Backpressure { .. }) => throttled += 1,
+            Err(error) => panic!("unexpected concurrent write error: {error}"),
+        }
+    }
+    assert_eq!(committed, 1);
+    assert_eq!(throttled, 7);
+    assert_eq!(ns.commit_cursor().await.unwrap().seq, 2);
 }
 
 #[tokio::test]

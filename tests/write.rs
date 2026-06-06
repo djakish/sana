@@ -12,7 +12,7 @@ use sana::object_store::{FsObjectStore, GetResult, ObjectMeta, ObjectStore, Obje
 use sana::query::{FilterExpr, RangeBound};
 use sana::value::{Document, Id, Value};
 use sana::wal::WalOp;
-use sana::write::{ConditionalWriteOp, DeleteByFilterRequest, PatchByFilterRequest};
+use sana::write::{ConditionalWriteOp, DeleteByFilterRequest, PatchByFilterRequest, WriteOptions};
 
 fn store(dir: &tempfile::TempDir) -> Arc<dyn ObjectStore> {
     Arc::new(FsObjectStore::new(dir.path()))
@@ -111,6 +111,50 @@ fn upsert(document: Document, condition: FilterExpr) -> ConditionalWriteOp {
         },
         condition: Some(condition),
     }
+}
+
+#[tokio::test]
+async fn read_dependent_writes_ignore_disable_backpressure() {
+    let dir = tempfile::tempdir().unwrap();
+    let namespace = Namespace::create(store(&dir), "docs").await.unwrap();
+    let options = WriteOptions {
+        disable_backpressure: true,
+        max_unindexed_wal_bytes: 0,
+    };
+
+    let error = namespace
+        .conditional_write_with_options(
+            vec![upsert(
+                document(1, 1, "new"),
+                FilterExpr::Eq {
+                    column: "state".into(),
+                    value: Value::String("missing".into()),
+                },
+            )],
+            None,
+            options,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Backpressure { .. }));
+
+    let error = namespace
+        .delete_by_filter_with_options(
+            DeleteByFilterRequest {
+                filter: FilterExpr::Eq {
+                    column: "state".into(),
+                    value: Value::String("missing".into()),
+                },
+                max_rows: 10,
+                allow_partial: false,
+            },
+            None,
+            options,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Backpressure { .. }));
+    assert_eq!(namespace.commit_cursor().await.unwrap().seq, 0);
 }
 
 #[tokio::test]

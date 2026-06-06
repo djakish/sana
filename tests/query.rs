@@ -9,7 +9,7 @@ use sana::namespace::Namespace;
 use sana::object_store::{FsObjectStore, GetResult, ObjectMeta, ObjectStore, ObjectVersion};
 use sana::query::{
     Aggregate, AggregateResult, ApproxVectorQuery, ExactVectorQuery, FilterExpr, MultiQuery,
-    OrderBy, OrderTarget, Query, RangeBound, RecallRequest, SortDirection, TextQuery,
+    OrderBy, OrderTarget, Query, QueryOptions, RangeBound, RecallRequest, SortDirection, TextQuery,
 };
 use sana::schema::DistanceMetric;
 use sana::sst::SstReader;
@@ -160,6 +160,44 @@ async fn query_filters_orders_and_aggregates() {
                 total: 35.0,
             }
         ]
+    );
+}
+
+#[tokio::test]
+async fn strong_queries_reject_oversized_overlay_until_flush() {
+    let dir = tempfile::tempdir().unwrap();
+    let ns = Namespace::create(store(&dir), "docs").await.unwrap();
+    ns.upsert(doc(1, "alpha", 10, &["search"], [1.0, 0.0]))
+        .await
+        .unwrap();
+    let options = QueryOptions {
+        max_unindexed_wal_bytes: 0,
+    };
+
+    let error = ns
+        .query_with_options(Query::all(), options)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Backpressure { limit_bytes: 0, .. }));
+    let error = ns
+        .multi_query_with_options(
+            MultiQuery {
+                queries: vec![Query::all(), Query::all()],
+            },
+            options,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Backpressure { .. }));
+
+    indexer::flush(&ns).await.unwrap();
+    assert_eq!(
+        ns.query_with_options(Query::all(), options)
+            .await
+            .unwrap()
+            .rows
+            .len(),
+        1
     );
 }
 
