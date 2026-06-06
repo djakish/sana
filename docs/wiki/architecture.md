@@ -157,7 +157,9 @@ namespaces/{ns}/
   manifest/current                 # CAS pointer to current namespace generation
   manifest/g/{generation}.json     # immutable manifest body
   wal/{epoch}/{seq}.wal            # durable write batches
-  wal_commit/current               # CAS commit cursor for grouped WAL entries
+  wal_staging/{epoch}/*.wal        # immutable bytes for pending reservations
+  wal_commit/current               # committed cursor + one CAS-reserved write
+  idempotency/{hex-key}.json       # permanent request fingerprint -> cursor
   routing/pinning.json             # leased pinned-replica assignments
   index/g/{generation}/
     doc/*.sst
@@ -220,16 +222,23 @@ Write path:
    formats into internal rows.
 2. For conditional writes and patch/delete-by-filter, read the current snapshot
    and determine affected IDs.
-3. Append the batch to a per-namespace group-commit buffer.
-4. The group-commit loop writes one WAL object and advances the commit cursor
-   with CAS.
-5. Enqueue an indexing job.
-6. Update the local write-through cache for this node.
-7. Return after the WAL commit is durable.
+3. Write the encoded batch to an immutable staging object.
+4. CAS-reserve the next sequence in `wal_commit/current`. A writer first helps
+   finish any older pending reservation it observes.
+5. Publish the canonical WAL object and any idempotency record, then
+   CAS-advance the committed cursor and clear the reservation.
+6. Enqueue an indexing job.
+7. Update the local write-through cache for this node.
+8. Return after the WAL commit is durable.
 
-One WAL entry per second per namespace is an acceptable early constraint. The
-implementation should still be structured as group commit from the start so
-throughput is not tied to object write latency.
+The reservation stores a content-addressed staging key rather than the request
+body. A crash at any point is recoverable by the next writer, concurrent
+namespace handles cannot overwrite the same sequence, and an ambiguous
+successful CAS response is safe to retry. An idempotency key maps to an
+immutable operation fingerprint and original cursor; a different payload using
+that key is rejected. Completed staging orphans are GC-able, while idempotency
+records are retained. A future broker can group-commit batches behind the same
+state transition when throughput requires it.
 
 Strong reads use the manifest's indexed cursor plus WAL entries after that
 cursor. Unindexed rows are searched exhaustively and merged with indexed

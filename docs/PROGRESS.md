@@ -13,13 +13,13 @@ the next unchecked task under "Current milestone" / "Next up".
 
 - **Current stage:** Stage 10 (Durability hardening and write semantics) —
   **in progress**.
-- **Next up:** Make WAL idempotency keys durable and reject conflicting retries
-  without consuming a new sequence.
+- **Next up:** Add atomic per-ID conditional upsert/patch/delete against one
+  committed snapshot.
 - **Done:** Stage 0 (Skeleton), Stage 1 (Durable Documents), Stage 2 (SST/LSM),
   Stage 3 (Attributes & Exact Search), Stage 4 (ANN v0), Stage 5 (Native
   Filtering), Stage 6 (SPFresh local rebuild), Stage 7 (Full-text search),
   Stage 8 (RaBitQ & kernels), Stage 9 (Object-store operations).
-- **Tests:** `cargo test` green (154 tests); `cargo clippy --all-targets` clean.
+- **Tests:** `cargo test` green (164 tests); `cargo clippy --all-targets` clean.
 - **Note:** post-Stage-2 and Stage-3–5 code-review fixes applied; remaining
   findings tracked under "Stage 2 — code review follow-ups" and "Stages 3–5 —
   code review follow-ups". Recently fixed limitations: Stage 2 ranged
@@ -45,7 +45,9 @@ the next unchecked task under "Current milestone" / "Next up".
   leased replica slots with fenced claims, exact-generation warm readiness,
   deterministic routing, and utilization metadata. New SSTs use a checksummed
   v2 footer and fully checked metadata arithmetic while v1 files remain
-  readable.
+  readable. WAL commits now use recoverable CAS reservations, and durable
+  per-key records make exact retries return the original cursor while rejecting
+  conflicting payloads.
 - **Last updated:** 2026-06-06.
 
 ---
@@ -92,8 +94,10 @@ architecture doc:
 ```
 namespaces/{ns}/manifest/current        # ManifestPointer -> generation
 namespaces/{ns}/manifest/g/{gen}.json   # immutable manifest body
-namespaces/{ns}/wal_commit/current      # CAS commit cursor (WalCursor as JSON)
+namespaces/{ns}/wal_commit/current      # committed cursor + pending reservation
+namespaces/{ns}/wal_staging/{epoch}/*   # immutable pending WAL bytes
 namespaces/{ns}/wal/{epoch}/{seq}.wal   # durable batches
+namespaces/{ns}/idempotency/{key}.json  # request fingerprint -> cursor
 ```
 
 Stage 1 decisions / notes:
@@ -105,19 +109,23 @@ Stage 1 decisions / notes:
   realizes Principle 2 (write durability vs. indexing freshness). Manifest's
   own `wal_commit_cursor`/`indexed_cursor` are snapshots set at index-publish
   time (Stage 2+).
-- **D13 — Single-writer-per-namespace append.** In-process append lock + cursor
-  CAS. WAL object written with `put` (overwrite) before the cursor advances, so
-  a crashed prior attempt at that seq is a harmless orphan we overwrite. Same
-  single-process caveat as D4; cross-process append needs `put_if_absent` +
-  explicit orphan reconciliation (future).
+- **D13 — One durable pending WAL reservation per namespace.** An in-process
+  append lock reduces local contention, but correctness comes from
+  `wal_commit/current`: writers stage immutable WAL bytes, CAS-reserve the next
+  sequence, and only then publish the canonical WAL and advance the committed
+  cursor. Any later writer can finish a pending reservation after a crash.
+  Concurrent namespace handles therefore cannot overwrite each other's WAL.
+  The filesystem backend still has D4's cross-process CAS limitation.
 - **D14 — Patch = create-or-update; null clears a field.** Patch onto a missing
   id creates a partial doc; a `Value::Null` attribute removes the field.
 
 Known limitations to fix in later stages:
 
 - `replay`/`lookup` are O(WAL) — full scan per call. Stage 2 SSTs fix this.
-- No idempotency-key dedup yet (field is plumbed through the WAL batch).
-- Idempotency-key dedup and conditional writes are still future work.
+- ~~No idempotency-key dedup.~~ **Done.** Exact-key records survive WAL GC and
+  process restart; equal payloads return the original cursor and unequal
+  payloads return `IdempotencyConflict`.
+- Conditional writes are still future work.
 - Single WAL epoch only; epoch rotation is unused.
 
 ---
@@ -852,7 +860,7 @@ Planned tasks:
 
 - [x] Add an SST footer checksum, checked offset arithmetic, and explicit size
       bounds with corruption/oversize regression tests.
-- [ ] Make WAL idempotency keys durable and reject conflicting retries.
+- [x] Make WAL idempotency keys durable and reject conflicting retries.
 - [ ] Add compare-and-set conditional writes and patch/delete-by-filter against
       one validated snapshot.
 - [ ] Add unindexed-WAL byte accounting and configurable write backpressure.
@@ -872,6 +880,21 @@ Stage 10 decisions / notes:
   returns `Result`, making representational limits explicit. Tests retain the
   v1 golden, add a v2 golden, and cover footer tampering, validly rechecksummed
   invalid handles, restart corruption, and both v1 read paths.
+- **D61 — Idempotency is coupled to a recoverable WAL commit reservation.**
+  `wal_commit/current` is now a versioned state containing the committed cursor
+  and at most one pending staged WAL. A writer first validates the request,
+  writes immutable staging bytes, and CAS-reserves the next sequence. Any
+  writer that sees that reservation verifies the staged bytes, finishes schema
+  evolution, publishes the canonical WAL, writes the immutable per-key dedup
+  record, and CAS-advances the committed cursor. This closes both marker-order
+  crash windows and makes ambiguous successful CAS responses retry-safe.
+  Existing bare `WalCursor` JSON is read as legacy state and migrates on the
+  next append. Idempotency keys are 1–256 UTF-8 bytes and hex-encoded in object
+  paths; records store a content version, byte length, and CRC of the operation
+  payload. GC preserves all dedup records and an active staging object while
+  reclaiming completed staging orphans. Records currently have no expiry,
+  favoring retry correctness over bounded metadata count until retention
+  semantics are defined.
 
 ---
 
