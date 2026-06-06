@@ -771,6 +771,9 @@ batch, CAS-advance the manifest, and replay the namespace into documents.
   watermarks avoid hot-path listings; projected writes and strong reads enforce
   a configurable 2 GiB default.
 - Expose write, query, metadata, recall, and cache-warm operations through HTTP.
+  **Done:** an Axum adapter calls the existing `Namespace` contracts, returns
+  structured errors, bounds bodies at 64 MiB, and is served by `sana serve`
+  over the immutable-object caching store.
 
 ## Risks
 

@@ -12,14 +12,16 @@ the next unchecked task under "Current milestone" / "Next up".
 ## Status snapshot
 
 - **Current stage:** Stage 10 (Durability hardening and write semantics) —
-  **in progress**.
-- **Next up:** Add HTTP write/query/metadata/recall/warm-cache endpoints over
-  the existing library contracts.
+  **complete**.
+- **Next up:** Final cross-stage hardening: make the single-WAL-epoch
+  assumption explicit in overlay, flush, and GC paths so future epoch rotation
+  cannot silently misread data.
 - **Done:** Stage 0 (Skeleton), Stage 1 (Durable Documents), Stage 2 (SST/LSM),
   Stage 3 (Attributes & Exact Search), Stage 4 (ANN v0), Stage 5 (Native
   Filtering), Stage 6 (SPFresh local rebuild), Stage 7 (Full-text search),
-  Stage 8 (RaBitQ & kernels), Stage 9 (Object-store operations).
-- **Tests:** `cargo test` green (182 tests); `cargo clippy --all-targets` clean.
+  Stage 8 (RaBitQ & kernels), Stage 9 (Object-store operations), Stage 10
+  (Durability hardening and write semantics).
+- **Tests:** `cargo test` green (186 tests); `cargo clippy --all-targets` clean.
 - **Note:** post-Stage-2 and Stage-3–5 code-review fixes applied; remaining
   findings tracked under "Stage 2 — code review follow-ups" and "Stages 3–5 —
   code review follow-ups". Recently fixed limitations: Stage 2 ranged
@@ -54,6 +56,9 @@ the next unchecked task under "Current milestone" / "Next up".
   watermark, giving exact unindexed-byte metadata without object listings.
   Projected writes and strong query/recall snapshots enforce a configurable
   2 GiB default limit; bulk bypass is limited to unconditional upsert/delete.
+  An Axum HTTP service now exposes write, query/multi-query, metadata, recall,
+  and cache-warm routes over the same library methods, with structured
+  400/404/409/429/500 errors and a cache-backed `sana serve` command.
 - **Last updated:** 2026-06-06.
 
 ---
@@ -83,7 +88,7 @@ the next unchecked task under "Current milestone" / "Next up".
       portable then SIMD kernels.
 - [x] **Stage 9 — Object-store operations.** Brokered indexing queue, warm-cache
       endpoint, branch/copy/export, pinning.
-- [ ] **Stage 10 — Durability hardening and write semantics.** Corruption-safe
+- [x] **Stage 10 — Durability hardening and write semantics.** Corruption-safe
       SST metadata, idempotent/conditional writes, bounded write backpressure,
       and a service-facing HTTP/metadata surface.
 
@@ -299,8 +304,8 @@ Planned tasks (refine when started):
       and `Namespace::query`. Integration tests cover filters, order-by,
       aggregation, kNN, and invalid vector queries.
 - [x] A `query` CLI verb over the library query entry point
-      (`sana query <dir> <ns> [json-query]`). HTTP/API surface is still future
-      work.
+      (`sana query <dir> <ns> [json-query]`), plus the Stage 10 Axum query and
+      multi-query route.
 
 Known limitations to improve later:
 
@@ -321,8 +326,9 @@ Known limitations to improve later:
   resolution now reads each SST once via `Namespace::resolve_ids`; see "Stages
   3–5 — code review follow-ups". The remaining work is pushing predicate/agg
   evaluation into the index families themselves.)
-- The CLI query accepts the internal serde JSON shape for `Query`; a polished
-  public HTTP/API shape is still future work.
+- The CLI query accepts the internal serde JSON shape for `Query`. The HTTP
+  surface wraps it in a stable tagged single/multi request envelope; broader
+  turbopuffer wire compatibility remains a future compatibility layer.
 
 Stage 3 decisions / notes so far:
 
@@ -874,7 +880,7 @@ Planned tasks:
       one validated snapshot.
 - [x] Add unindexed-WAL byte accounting and configurable write/query
       backpressure.
-- [ ] Add HTTP write/query/metadata/recall/warm-cache endpoints over the same
+- [x] Add HTTP write/query/metadata/recall/warm-cache endpoints over the same
       library contracts used by the CLI.
 
 Stage 10 decisions / notes:
@@ -943,6 +949,19 @@ Stage 10 decisions / notes:
   multi-query, and recall snapshots reject oversized overlays, and recall now
   evaluates candidates plus exact/ANN comparisons against one captured
   manifest and commit cursor.
+- **D65 — HTTP is a thin Axum adapter, not a second database implementation.**
+  `api::router` exposes `POST /v2/namespaces/{namespace}` for append,
+  conditional, patch-by-filter, and delete-by-filter writes; one tagged
+  single/multi query route; metadata, recall, cache-warm, and health endpoints.
+  Write requests create namespaces on demand, while reads require an existing
+  namespace. A 64 MiB body limit bounds request buffering. Engine failures map
+  to structured JSON with stable 400/404/409/429/500 classes, and extractor
+  failures preserve their HTTP status in the same envelope. `Namespace::metadata`
+  combines one manifest snapshot with WAL-byte and pinning control state.
+  `sana serve <dir> [address] [cache-bytes]` wraps the filesystem backend in the
+  immutable-object LRU before serving HTTP/1. Router-level tests cover every
+  write variant, single/multi queries, exact lag metadata, backpressure, recall,
+  cache warming, and error envelopes.
 
 ---
 
@@ -979,9 +998,10 @@ Decisions I (the implementer) made; the user delegated architectural calls.
   later runs compare; committed to git so format drift surfaces in review.
 - **D9 — `bytes::Bytes` in the store API.** Cheap clones (caching) and cheap
   slicing (range reads), matching the production design.
-- **D10 — Minimal dependency set.** tokio, async-trait, serde(+json), postcard,
-  crc32fast, bytes, thiserror; tempfile (dev). No HTTP/ANN/job-queue crates yet
-  (Stage 0 discipline).
+- **D10 — Minimal dependency set.** Stage 0 used tokio, async-trait,
+  serde(+json), postcard, crc32fast, bytes, thiserror, and tempfile only.
+  Purpose-built HTTP dependencies were deferred until Stage 10; Axum/Hyper and
+  Tower are now present for the service adapter and router tests.
 - **D11 — Single crate, module-per-subsystem.** Organized as if it could become
   a workspace later, per the architecture doc.
 
@@ -992,7 +1012,8 @@ Decisions I (the implementer) made; the user delegated architectural calls.
 ```
 src/
   lib.rs                 module exports
-  main.rs                CLI (data/query/index maintenance/queue operations)
+  main.rs                CLI + cache-backed HTTP server command
+  api.rs                 Axum routes, request/response envelopes, error mapping
   error.rs               shared Error / Result
   value.rs               Id, Value, VectorValue, Document
   schema.rs              ScalarType, ColumnType, Schema, ...
@@ -1001,6 +1022,7 @@ src/
     fs.rs                FsObjectStore (filesystem backend)
     cache.rs             immutable-object byte-bounded LRU decorator
   manifest.rs            NamespaceManifest, ManifestPointer, SstMeta (+ codecs)
+  metadata.rs            service-facing namespace/index/pinning metadata
   wal.rs                 WalCursor, WalOp, WalBatch (+ binary codec)
   sst.rs                 generic sorted-string-table writer/reader
   doc.rs                 Id key encoding (order-preserving) + DocRecord
