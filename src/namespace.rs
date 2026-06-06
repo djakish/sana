@@ -47,6 +47,7 @@ use crate::write::{
 const WAL_COMMIT_FORMAT_VERSION: u32 = 1;
 const IDEMPOTENCY_FORMAT_VERSION: u32 = 1;
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
+pub const MAX_NAMESPACE_NAME_BYTES: usize = 128;
 
 pub(crate) fn manifest_pointer_key(ns: &str) -> String {
     format!("namespaces/{ns}/manifest/current")
@@ -367,6 +368,20 @@ pub(crate) fn op_id(op: &WalOp) -> &Id {
     }
 }
 
+pub(crate) fn validate_namespace_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.len() > MAX_NAMESPACE_NAME_BYTES
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(Error::InvalidWrite(format!(
+            "namespace name must match [A-Za-z0-9-_.]{{1,{MAX_NAMESPACE_NAME_BYTES}}}"
+        )));
+    }
+    Ok(())
+}
+
 fn can_disable_backpressure(operations: &[WalOp]) -> bool {
     operations
         .iter()
@@ -406,6 +421,7 @@ impl Namespace {
         name: &str,
         manifest: NamespaceManifest,
     ) -> Result<Self> {
+        validate_namespace_name(name)?;
         if manifest.namespace != name || manifest.generation != 0 {
             return Err(Error::Corrupt(format!(
                 "initial manifest for namespace {name:?} must use matching name and generation 0"
@@ -447,6 +463,7 @@ impl Namespace {
 
     /// Open an existing namespace. Errors with `NotFound` if it does not exist.
     pub async fn open(store: Arc<dyn ObjectStore>, name: &str) -> Result<Self> {
+        validate_namespace_name(name)?;
         match store.get(&manifest_pointer_key(name)).await {
             Ok(_) => Ok(Self::handle(store, name)),
             Err(Error::NotFound(_)) => Err(Error::NotFound(format!("namespace {name}"))),

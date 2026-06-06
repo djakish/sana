@@ -766,6 +766,19 @@ async fn create_twice_is_already_exists() {
 }
 
 #[tokio::test]
+async fn namespace_names_are_validated_before_storage_access() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["", "with/slash", "../escape", "space name"] {
+        let error = Namespace::create(store(&dir), name).await.unwrap_err();
+        assert!(matches!(error, Error::InvalidWrite(_)));
+    }
+    let too_long = "a".repeat(129);
+    let error = Namespace::open(store(&dir), &too_long).await.unwrap_err();
+    assert!(matches!(error, Error::InvalidWrite(_)));
+    assert!(store(&dir).list("").await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn concurrent_create_publishes_one_consistent_namespace() {
     let dir = tempfile::tempdir().unwrap();
     let object_store = store(&dir);

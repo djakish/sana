@@ -9,6 +9,7 @@ use crate::error::{Error, Result};
 use crate::manifest::{BranchParent, NamespaceManifest};
 use crate::namespace::{
     ManifestSnapshot, Namespace, manifest_pointer_key, now_ms, put_immutable_if_absent,
+    validate_namespace_name,
 };
 use crate::object_store::{ObjectStore, ObjectVersion, version_of};
 use crate::wal::WalCursor;
@@ -73,6 +74,7 @@ impl Namespace {
     /// reproduce the snapshot. Branch publication should not race source GC;
     /// GC itself is an offline/quiescent operation.
     pub async fn branch(&self, child_name: &str) -> Result<Namespace> {
+        validate_namespace_name(child_name)?;
         let snapshot = self.fully_indexed_snapshot("branch").await?;
 
         let timestamp_ms = now_ms();
@@ -101,6 +103,7 @@ impl Namespace {
         target_store: Arc<dyn ObjectStore>,
         target_name: &str,
     ) -> Result<CopyReport> {
+        validate_namespace_name(target_name)?;
         match target_store.get(&manifest_pointer_key(target_name)).await {
             Ok(_) => {
                 return Err(Error::AlreadyExists(format!("namespace {target_name}")));

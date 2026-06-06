@@ -28,6 +28,8 @@ use crate::wal::WalCursor;
 
 const DEFAULT_RECALL_NUM: usize = 25;
 const DEFAULT_RECALL_TOP_K: usize = 10;
+pub const MAX_MULTI_QUERIES: usize = 16;
+pub const MAX_QUERY_RESULTS: usize = 10_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueryOptions {
@@ -284,6 +286,11 @@ pub async fn execute_multi_with_options(
             "multi-query requires at least one query".into(),
         ));
     }
+    if request.queries.len() > MAX_MULTI_QUERIES {
+        return Err(Error::InvalidQuery(format!(
+            "multi-query supports at most {MAX_MULTI_QUERIES} queries"
+        )));
+    }
     let (manifest, commit) = load_strong_snapshot(ns, options).await?;
     let mut results = Vec::with_capacity(request.queries.len());
     for query in request.queries {
@@ -311,6 +318,11 @@ async fn execute_with_snapshot(
     commit: WalCursor,
     query: Query,
 ) -> Result<QueryResult> {
+    if query.limit.is_some_and(|limit| limit > MAX_QUERY_RESULTS) {
+        return Err(Error::InvalidQuery(format!(
+            "query limit cannot exceed {MAX_QUERY_RESULTS}"
+        )));
+    }
     if query.exact_vector.is_some() && query.approx_vector.is_some() {
         return Err(Error::InvalidQuery(
             "query cannot specify both exact_vector and approx_vector".into(),
@@ -492,6 +504,11 @@ pub async fn recall_with_options(
         return Err(Error::InvalidQuery(
             "recall top_k must be greater than zero".into(),
         ));
+    }
+    if request.top_k > MAX_QUERY_RESULTS {
+        return Err(Error::InvalidQuery(format!(
+            "recall top_k cannot exceed {MAX_QUERY_RESULTS}"
+        )));
     }
     let (manifest, commit) = load_strong_snapshot(ns, options).await?;
     let column = match request.column.clone() {
@@ -1258,6 +1275,11 @@ fn validate_text_query(manifest: &NamespaceManifest, text_query: &TextQuery) -> 
             "text query k must be greater than zero".into(),
         ));
     }
+    if text_query.k > MAX_QUERY_RESULTS {
+        return Err(Error::InvalidQuery(format!(
+            "text query k cannot exceed {MAX_QUERY_RESULTS}"
+        )));
+    }
     text_query.params.validate()?;
     let spec = manifest
         .schema
@@ -1285,6 +1307,11 @@ fn vector_schema(
         return Err(Error::InvalidQuery(
             "exact vector query k must be greater than zero".into(),
         ));
+    }
+    if vector_query.k > MAX_QUERY_RESULTS {
+        return Err(Error::InvalidQuery(format!(
+            "exact vector query k cannot exceed {MAX_QUERY_RESULTS}"
+        )));
     }
     if vector_query.vector.is_empty() {
         return Err(Error::InvalidQuery(

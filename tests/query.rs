@@ -595,6 +595,25 @@ async fn multi_query_rejects_empty_batches() {
 }
 
 #[tokio::test]
+async fn query_cardinality_limits_are_enforced() {
+    let dir = tempfile::tempdir().unwrap();
+    let ns = Namespace::create(store(&dir), "docs").await.unwrap();
+
+    let error = ns
+        .multi_query(MultiQuery {
+            queries: vec![Query::all(); 17],
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidQuery(_)));
+
+    let mut query = Query::all();
+    query.limit = Some(10_001);
+    let error = ns.query(query).await.unwrap_err();
+    assert!(matches!(error, Error::InvalidQuery(_)));
+}
+
+#[tokio::test]
 async fn approx_vector_query_honors_limit_below_k() {
     let dir = tempfile::tempdir().unwrap();
     let ns = Namespace::create(store(&dir), "docs").await.unwrap();

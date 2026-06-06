@@ -6,6 +6,8 @@ use std::sync::Arc;
 use crate::error::{Error, Result};
 use crate::namespace::{Namespace, manifest_body_key_for_pointer};
 
+pub const MAX_CACHE_WARM_CONCURRENCY: usize = 256;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CacheObjectKind {
     Manifest,
@@ -152,8 +154,13 @@ impl Namespace {
     /// store. A [`CachingObjectStore`](crate::object_store::CachingObjectStore)
     /// retains them; a backend without a cache may treat this as a read hint.
     pub async fn hint_cache_warm(&self, options: CacheWarmOptions) -> Result<CacheWarmReport> {
+        if !(1..=MAX_CACHE_WARM_CONCURRENCY).contains(&options.max_concurrency) {
+            return Err(Error::InvalidQuery(format!(
+                "cache warm max_concurrency must be between 1 and {MAX_CACHE_WARM_CONCURRENCY}"
+            )));
+        }
         let plan = self.cache_warm_plan(options.max_bytes).await?;
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(options.max_concurrency.max(1)));
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(options.max_concurrency));
         let mut loads = tokio::task::JoinSet::new();
         for object in &plan.objects {
             let store = self.store().clone();

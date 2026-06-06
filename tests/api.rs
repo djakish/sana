@@ -274,6 +274,7 @@ async fn http_conditional_and_filter_writes_return_outcomes() {
 #[tokio::test]
 async fn http_errors_use_stable_status_and_json_envelopes() {
     let dir = tempfile::tempdir().unwrap();
+    Namespace::create(store(&dir), "bounded").await.unwrap();
     let app = router(store(&dir));
 
     let response = request(&app, Method::GET, "/v1/namespaces/missing/metadata", None).await;
@@ -307,4 +308,32 @@ async fn http_errors_use_stable_status_and_json_envelopes() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let error: serde_json::Value = json_body(response).await;
     assert_eq!(error["error"]["code"], "invalid_json");
+
+    let too_many = QueryRequest::Multi {
+        query: MultiQuery {
+            queries: vec![Query::all(); 17],
+        },
+        options: QueryOptions::default(),
+    };
+    let response = request(
+        &app,
+        Method::POST,
+        "/v2/namespaces/bounded/query",
+        Some(serde_json::to_vec(&too_many).unwrap()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: serde_json::Value = json_body(response).await;
+    assert_eq!(error["error"]["code"], "invalid_request");
+
+    let response = request(
+        &app,
+        Method::GET,
+        "/v1/namespaces/bounded/hint_cache_warm?max_concurrency=18446744073709551615",
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: serde_json::Value = json_body(response).await;
+    assert_eq!(error["error"]["code"], "invalid_request");
 }

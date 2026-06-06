@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use sana::cache_warm::{CacheObjectKind, CacheWarmOptions};
+use sana::error::Error;
 use sana::indexer;
 use sana::namespace::Namespace;
 use sana::object_store::{CachingObjectStore, FsObjectStore, ObjectStore};
@@ -98,4 +99,22 @@ async fn warmed_generation_serves_ann_after_backing_objects_are_removed() {
         stats_after_query.resident_bytes as u64,
         report.plan.planned_bytes
     );
+}
+
+#[tokio::test]
+async fn warm_rejects_invalid_concurrency_without_panicking() {
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(FsObjectStore::new(dir.path()));
+    let namespace = Namespace::create(store, "vectors").await.unwrap();
+
+    for max_concurrency in [0, usize::MAX] {
+        let error = namespace
+            .hint_cache_warm(CacheWarmOptions {
+                max_bytes: 1,
+                max_concurrency,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidQuery(_)));
+    }
 }
