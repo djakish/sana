@@ -11,6 +11,7 @@ pub mod frame;
 pub mod index_queue;
 pub mod indexer;
 pub mod manifest;
+pub mod metadata;
 pub mod namespace;
 pub mod object_store;
 pub mod operations;
