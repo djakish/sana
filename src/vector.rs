@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::attr;
 use crate::error::{Error, Result};
+use crate::frame;
 use crate::manifest::{
     VectorMaintenanceAction, VectorMaintenancePlan, VectorMaintenanceTask,
     VectorMaintenanceThresholds,
@@ -22,7 +23,6 @@ const VECTOR_MAGIC: &[u8; 8] = b"SANAVEC1";
 const VERSION_MAP_MAGIC: &[u8; 8] = b"SANAVM1!";
 const VECTOR_FORMAT_VERSION: u32 = 1;
 const VERSION_MAP_FORMAT_VERSION: u32 = 1;
-const HEADER_LEN: usize = 8 + 4 + 4 + 4;
 const KMEANS_ITERS: usize = 8;
 const MAX_CLUSTERS: usize = 16;
 const DEFAULT_REASSIGN_NEIGHBORHOOD: usize = 64;
@@ -200,51 +200,20 @@ impl VectorVersionMap {
 
     pub fn encode(&self) -> Result<Vec<u8>> {
         let body = postcard::to_allocvec(self).map_err(|e| Error::Codec(e.to_string()))?;
-        let crc = crc32fast::hash(&body);
-        let mut out = Vec::with_capacity(HEADER_LEN + body.len());
-        out.extend_from_slice(VERSION_MAP_MAGIC);
-        out.extend_from_slice(&VERSION_MAP_FORMAT_VERSION.to_le_bytes());
-        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
-        out.extend_from_slice(&crc.to_le_bytes());
-        out.extend_from_slice(&body);
-        Ok(out)
+        Ok(frame::encode(
+            VERSION_MAP_MAGIC,
+            VERSION_MAP_FORMAT_VERSION,
+            &body,
+        ))
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() < HEADER_LEN {
-            return Err(Error::Corrupt(
-                "vector version map frame shorter than header".into(),
-            ));
-        }
-        if &bytes[0..8] != VERSION_MAP_MAGIC {
-            return Err(Error::Corrupt("bad vector version map magic".into()));
-        }
-        let version = u32::from_le_bytes(
-            bytes[8..12]
-                .try_into()
-                .expect("slice is a fixed-size window"),
-        );
-        if version != VERSION_MAP_FORMAT_VERSION {
-            return Err(Error::Corrupt(format!(
-                "unsupported vector version map version {version}"
-            )));
-        }
-        let body_len = u32::from_le_bytes(
-            bytes[12..16]
-                .try_into()
-                .expect("slice is a fixed-size window"),
-        ) as usize;
-        let crc = u32::from_le_bytes(
-            bytes[16..20]
-                .try_into()
-                .expect("slice is a fixed-size window"),
-        );
-        let body = bytes
-            .get(HEADER_LEN..HEADER_LEN + body_len)
-            .ok_or_else(|| Error::Corrupt("vector version map body truncated".into()))?;
-        if crc32fast::hash(body) != crc {
-            return Err(Error::Corrupt("vector version map crc mismatch".into()));
-        }
+        let body = frame::decode(
+            bytes,
+            VERSION_MAP_MAGIC,
+            VERSION_MAP_FORMAT_VERSION,
+            "vector version map",
+        )?;
         let map: Self = postcard::from_bytes(body).map_err(|e| Error::Codec(e.to_string()))?;
         if map.format_version != VERSION_MAP_FORMAT_VERSION {
             return Err(Error::Corrupt(format!(
@@ -394,51 +363,11 @@ impl VectorIndex {
 
     pub fn encode(&self) -> Result<Vec<u8>> {
         let body = postcard::to_allocvec(self).map_err(|e| Error::Codec(e.to_string()))?;
-        let crc = crc32fast::hash(&body);
-        let mut out = Vec::with_capacity(HEADER_LEN + body.len());
-        out.extend_from_slice(VECTOR_MAGIC);
-        out.extend_from_slice(&VECTOR_FORMAT_VERSION.to_le_bytes());
-        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
-        out.extend_from_slice(&crc.to_le_bytes());
-        out.extend_from_slice(&body);
-        Ok(out)
+        Ok(frame::encode(VECTOR_MAGIC, VECTOR_FORMAT_VERSION, &body))
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() < HEADER_LEN {
-            return Err(Error::Corrupt(
-                "vector index frame shorter than header".into(),
-            ));
-        }
-        if &bytes[0..8] != VECTOR_MAGIC {
-            return Err(Error::Corrupt("bad vector index magic".into()));
-        }
-        let version = u32::from_le_bytes(
-            bytes[8..12]
-                .try_into()
-                .expect("slice is a fixed-size window"),
-        );
-        if version != VECTOR_FORMAT_VERSION {
-            return Err(Error::Corrupt(format!(
-                "unsupported vector index version {version}"
-            )));
-        }
-        let body_len = u32::from_le_bytes(
-            bytes[12..16]
-                .try_into()
-                .expect("slice is a fixed-size window"),
-        ) as usize;
-        let crc = u32::from_le_bytes(
-            bytes[16..20]
-                .try_into()
-                .expect("slice is a fixed-size window"),
-        );
-        let body = bytes
-            .get(HEADER_LEN..HEADER_LEN + body_len)
-            .ok_or_else(|| Error::Corrupt("vector index body truncated".into()))?;
-        if crc32fast::hash(body) != crc {
-            return Err(Error::Corrupt("vector index crc mismatch".into()));
-        }
+        let body = frame::decode(bytes, VECTOR_MAGIC, VECTOR_FORMAT_VERSION, "vector index")?;
         let index: Self = postcard::from_bytes(body).map_err(|e| Error::Codec(e.to_string()))?;
         if index.format_version != VECTOR_FORMAT_VERSION {
             return Err(Error::Corrupt(format!(

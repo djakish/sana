@@ -676,6 +676,13 @@ Stage 8 decisions / notes:
   cosine, plus the persisted query path, remain follow-ups. Extracting it out of
   the 1.5k-line `vector.rs` is the first step of splitting that module along its
   natural seams (filter bitmaps and maintenance are the next candidates).
+- **D47 — One framed-object envelope (`src/frame.rs`).** The 20-byte header
+  (magic, format version, body length, CRC32) was hand-rolled three times — WAL
+  batches, the vector index, and the vector version map — with identical byte
+  twiddling and `try_into().expect(...)` boilerplate. `frame::encode`/`decode`
+  now own it; callers pass their magic, version, and a label for error messages.
+  Pure dedup: the byte layout and every error string are unchanged, so the
+  golden WAL fixture still matches.
 
 ---
 

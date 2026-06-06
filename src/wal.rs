@@ -15,11 +15,11 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::frame;
 use crate::value::{Document, Id, Value, VectorValue};
 
 pub const WAL_MAGIC: &[u8; 8] = b"SANAWAL1";
 pub const WAL_FORMAT_VERSION: u32 = 1;
-const HEADER_LEN: usize = 8 + 4 + 4 + 4;
 
 /// A position in the WAL: writes advance `seq` within an `epoch`; an epoch bump
 /// lets the log be rotated without resetting sequence ordering globally.
@@ -68,47 +68,11 @@ pub struct WalBatch {
 impl WalBatch {
     pub fn encode(&self) -> Result<Vec<u8>> {
         let body = postcard::to_allocvec(self).map_err(|e| Error::Codec(e.to_string()))?;
-        let crc = crc32fast::hash(&body);
-        let mut out = Vec::with_capacity(HEADER_LEN + body.len());
-        out.extend_from_slice(WAL_MAGIC);
-        out.extend_from_slice(&WAL_FORMAT_VERSION.to_le_bytes());
-        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
-        out.extend_from_slice(&crc.to_le_bytes());
-        out.extend_from_slice(&body);
-        Ok(out)
+        Ok(frame::encode(WAL_MAGIC, WAL_FORMAT_VERSION, &body))
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() < HEADER_LEN {
-            return Err(Error::Corrupt("wal frame shorter than header".into()));
-        }
-        if &bytes[0..8] != WAL_MAGIC {
-            return Err(Error::Corrupt("bad wal magic".into()));
-        }
-        let version = u32::from_le_bytes(
-            bytes[8..12]
-                .try_into()
-                .expect("slice is a fixed-size window"),
-        );
-        if version != WAL_FORMAT_VERSION {
-            return Err(Error::Corrupt(format!("unsupported wal version {version}")));
-        }
-        let body_len = u32::from_le_bytes(
-            bytes[12..16]
-                .try_into()
-                .expect("slice is a fixed-size window"),
-        ) as usize;
-        let crc = u32::from_le_bytes(
-            bytes[16..20]
-                .try_into()
-                .expect("slice is a fixed-size window"),
-        );
-        let body = bytes
-            .get(HEADER_LEN..HEADER_LEN + body_len)
-            .ok_or_else(|| Error::Corrupt("wal body truncated".into()))?;
-        if crc32fast::hash(body) != crc {
-            return Err(Error::Corrupt("wal crc mismatch".into()));
-        }
+        let body = frame::decode(bytes, WAL_MAGIC, WAL_FORMAT_VERSION, "wal")?;
         postcard::from_bytes(body).map_err(|e| Error::Codec(e.to_string()))
     }
 }
