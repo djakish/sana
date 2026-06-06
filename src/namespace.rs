@@ -95,6 +95,7 @@ pub(crate) struct ManifestSnapshot {
     pub pointer_version: ObjectVersion,
     pub pointer: ManifestPointer,
     pub manifest: NamespaceManifest,
+    pub body_size_bytes: u64,
 }
 
 impl std::fmt::Debug for Namespace {
@@ -324,6 +325,7 @@ impl Namespace {
             pointer_version: ptr.version,
             pointer,
             manifest: NamespaceManifest::decode(&body.bytes)?,
+            body_size_bytes: body.bytes.len() as u64,
         })
     }
 

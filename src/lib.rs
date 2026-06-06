@@ -3,6 +3,7 @@
 //! `docs/PROGRESS.md` for the staged build status and decision log.
 
 pub mod attr;
+pub mod cache_warm;
 pub mod doc;
 pub mod error;
 pub mod frame;
