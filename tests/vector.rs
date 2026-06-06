@@ -4,7 +4,8 @@ use sana::manifest::{VectorMaintenanceAction, VectorMaintenanceTask, VectorMaint
 use sana::schema::DistanceMetric;
 use sana::value::{Document, Id, VectorValue};
 use sana::vector::{
-    VectorAddress, VectorEntry, VectorFilterIndex, VectorIndex, VectorPosting, VectorVersionMap,
+    DistanceKernel, ScalarDistanceKernel, VectorAddress, VectorEntry, VectorFilterIndex,
+    VectorIndex, VectorPosting, VectorVersionMap,
 };
 
 fn doc_with_vector(id: u64, vector: [f32; 2]) -> Document {
@@ -43,6 +44,57 @@ fn score_batch_rejects_dimension_mismatch() {
     let mut out = [0.0];
 
     assert!(sana::vector::score_batch(&query, &candidates, DistanceMetric::L2, &mut out).is_err());
+}
+
+#[test]
+fn runtime_distance_kernel_matches_scalar_across_vector_widths() {
+    let mut seed = 0x7a6b_5c4d_3e2f_1021u64;
+    for dim in [1, 3, 4, 7, 8, 15, 16, 31, 128, 769] {
+        let query = random_vector(dim, &mut seed);
+        let owned = (0..9)
+            .map(|_| random_vector(dim, &mut seed))
+            .collect::<Vec<_>>();
+        let candidates = owned.iter().map(Vec::as_slice).collect::<Vec<_>>();
+
+        for metric in [
+            DistanceMetric::L2,
+            DistanceMetric::Dot,
+            DistanceMetric::Cosine,
+        ] {
+            let mut expected = vec![0.0; candidates.len()];
+            match metric {
+                DistanceMetric::L2 => {
+                    ScalarDistanceKernel::l2_f32_batch(&query, &candidates, &mut expected)
+                }
+                DistanceMetric::Dot => {
+                    ScalarDistanceKernel::dot_f32_batch(&query, &candidates, &mut expected)
+                }
+                DistanceMetric::Cosine => {
+                    ScalarDistanceKernel::cosine_f32_batch(&query, &candidates, &mut expected)
+                }
+            }
+            .unwrap();
+
+            let mut actual = vec![0.0; candidates.len()];
+            sana::vector::score_batch(&query, &candidates, metric, &mut actual).unwrap();
+            for (expected, actual) in expected.into_iter().zip(actual) {
+                let tolerance = 2e-5 * (1.0 + expected.abs());
+                assert!(
+                    (actual - expected).abs() <= tolerance,
+                    "{metric:?} dim {dim}: SIMD {actual} differs from scalar {expected}"
+                );
+            }
+        }
+    }
+}
+
+fn random_vector(dim: usize, seed: &mut u64) -> Vec<f32> {
+    (0..dim)
+        .map(|_| {
+            *seed = splitmix(*seed);
+            (*seed >> 40) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0
+        })
+        .collect()
 }
 
 #[test]

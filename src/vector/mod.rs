@@ -15,10 +15,15 @@ use crate::schema::DistanceMetric;
 use crate::value::{Document, Id, VectorValue};
 
 mod filter;
+mod kernels;
 mod maintenance;
 
 pub use filter::{
     VectorFilterColumn, VectorFilterIndex, VectorFilterMask, VectorFilterRows, VectorFilterValue,
+};
+pub use kernels::{
+    AutoDistanceKernel, DistanceKernel, DistanceKernelKind, ScalarDistanceKernel,
+    distance_kernel_kind, score_batch,
 };
 pub use maintenance::{VectorLocalRebuildDelta, VectorReassignment, VectorReassignmentDelta};
 
@@ -68,60 +73,6 @@ pub struct VectorHit {
     pub id: Id,
     pub version: u64,
     pub score: f32,
-}
-
-pub trait DistanceKernel {
-    fn l2_f32_batch(query: &[f32], candidates: &[&[f32]], out: &mut [f32]) -> Result<()>;
-    fn dot_f32_batch(query: &[f32], candidates: &[&[f32]], out: &mut [f32]) -> Result<()>;
-    fn cosine_f32_batch(query: &[f32], candidates: &[&[f32]], out: &mut [f32]) -> Result<()>;
-}
-
-pub struct ScalarDistanceKernel;
-
-impl DistanceKernel for ScalarDistanceKernel {
-    fn l2_f32_batch(query: &[f32], candidates: &[&[f32]], out: &mut [f32]) -> Result<()> {
-        validate_batch(query, candidates, out)?;
-        for (candidate, score) in candidates.iter().zip(out) {
-            *score = -query
-                .iter()
-                .zip(*candidate)
-                .map(|(a, b)| {
-                    let d = a - b;
-                    d * d
-                })
-                .sum::<f32>();
-        }
-        Ok(())
-    }
-
-    fn dot_f32_batch(query: &[f32], candidates: &[&[f32]], out: &mut [f32]) -> Result<()> {
-        validate_batch(query, candidates, out)?;
-        for (candidate, score) in candidates.iter().zip(out) {
-            *score = query.iter().zip(*candidate).map(|(a, b)| a * b).sum();
-        }
-        Ok(())
-    }
-
-    fn cosine_f32_batch(query: &[f32], candidates: &[&[f32]], out: &mut [f32]) -> Result<()> {
-        validate_batch(query, candidates, out)?;
-        let q_norm = squared_norm(query).sqrt();
-        if q_norm == 0.0 {
-            return Err(Error::InvalidQuery(
-                "cosine query and candidate vectors must be non-zero".into(),
-            ));
-        }
-        for (candidate, score) in candidates.iter().zip(out) {
-            let c_norm = squared_norm(candidate).sqrt();
-            if c_norm == 0.0 {
-                return Err(Error::InvalidQuery(
-                    "cosine query and candidate vectors must be non-zero".into(),
-                ));
-            }
-            let dot: f32 = query.iter().zip(*candidate).map(|(a, b)| a * b).sum();
-            *score = dot / (q_norm * c_norm);
-        }
-        Ok(())
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -445,57 +396,11 @@ pub fn vector_to_f32(vector: &VectorValue) -> Vec<f32> {
     }
 }
 
-pub fn score_batch(
-    query: &[f32],
-    candidates: &[&[f32]],
-    metric: DistanceMetric,
-    out: &mut [f32],
-) -> Result<()> {
-    match metric {
-        DistanceMetric::L2 => ScalarDistanceKernel::l2_f32_batch(query, candidates, out),
-        DistanceMetric::Dot => ScalarDistanceKernel::dot_f32_batch(query, candidates, out),
-        DistanceMetric::Cosine => ScalarDistanceKernel::cosine_f32_batch(query, candidates, out),
-    }
-}
-
 pub fn score(query: &[f32], candidate: &[f32], metric: DistanceMetric) -> Result<f32> {
     let candidates = [candidate];
     let mut out = [0.0f32];
     score_batch(query, &candidates, metric, &mut out)?;
     Ok(out[0])
-}
-
-fn validate_batch(query: &[f32], candidates: &[&[f32]], out: &[f32]) -> Result<()> {
-    if candidates.len() != out.len() {
-        return Err(Error::InvalidQuery(format!(
-            "score output has len {}, expected {}",
-            out.len(),
-            candidates.len()
-        )));
-    }
-    if candidates
-        .iter()
-        .any(|candidate| candidate.len() != query.len())
-    {
-        return Err(Error::InvalidQuery(
-            "query and candidate vectors must have matching dimensions".into(),
-        ));
-    }
-    if query.iter().any(|v| !v.is_finite())
-        || candidates
-            .iter()
-            .flat_map(|candidate| candidate.iter())
-            .any(|v| !v.is_finite())
-    {
-        return Err(Error::InvalidQuery(
-            "query and candidate vectors must contain only finite values".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn squared_norm(vector: &[f32]) -> f32 {
-    vector.iter().map(|v| v * v).sum()
 }
 
 pub fn sort_hits(hits: &mut [VectorHit]) {

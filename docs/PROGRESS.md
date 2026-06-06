@@ -12,11 +12,11 @@ the next unchecked task under "Current milestone" / "Next up".
 ## Status snapshot
 
 - **Current stage:** Stage 8 (RaBitQ & kernels) — **in progress**.
-- **Next up:** SIMD kernels with runtime feature detection.
+- **Next up:** Packed/SIMD RaBitQ estimation and query quantization.
 - **Done:** Stage 0 (Skeleton), Stage 1 (Durable Documents), Stage 2 (SST/LSM),
   Stage 3 (Attributes & Exact Search), Stage 4 (ANN v0), Stage 5 (Native
   Filtering), Stage 6 (SPFresh local rebuild), Stage 7 (Full-text search).
-- **Tests:** `cargo test` green (110 tests); `cargo clippy --all-targets` clean.
+- **Tests:** `cargo test` green (111 tests); `cargo clippy --all-targets` clean.
 - **Note:** post-Stage-2 and Stage-3–5 code-review fixes applied; remaining
   findings tracked under "Stage 2 — code review follow-ups" and "Stages 3–5 —
   code review follow-ups". Recently fixed limitations: Stage 2 ranged
@@ -29,7 +29,8 @@ the next unchecked task under "Current milestone" / "Next up".
   retrieval. Stage 8 now has portable scalar batch distance kernels plus a
   faithful, persisted RaBitQ companion per vector segment; L2 ANN scans codes,
   applies the paper's confidence bound, and exact-reranks only candidates that
-  can still enter top-k.
+  can still enter top-k. Runtime-selected NEON/AVX2 f32 distance kernels now
+  accelerate full-precision scoring while preserving the scalar reference.
 - **Last updated:** 2026-06-06.
 
 ---
@@ -649,8 +650,9 @@ Planned tasks:
 - [x] Add per-cluster RaBitQ code generation (faithful: rotation + estimator).
 - [x] Add portable bitwise RaBitQ L2 estimator (unbiased, recall-tested).
 - [x] Persist a RaBitQ object and wire the quantized query path + rerank.
-- [ ] Add SIMD kernels with feature detection.
-- [ ] Benchmark cache/memory/CPU bottlenecks.
+- [x] Add SIMD f32 kernels with feature detection.
+- [ ] Add packed/SIMD RaBitQ estimation.
+- [x] Benchmark f32 cache/memory/CPU bottlenecks.
 
 Stage 8 decisions / notes:
 
@@ -705,6 +707,18 @@ Stage 8 decisions / notes:
   their Equation-14 lower bound exceeds the current exact kth distance, and
   surviving rows are exact-reranked. Companion bytes count toward logical size
   and remain live through maintenance, compaction, and GC.
+- **D50 — f32 kernels dispatch once, then run contiguous SIMD loops.**
+  `vector/kernels.rs` keeps `ScalarDistanceKernel` as the reference and caches a
+  runtime choice of NEON (AArch64), AVX2 (x86_64), or scalar. L2/dot use one
+  vector pass; cosine computes candidate dot product and norm together instead
+  of making the scalar path's two passes. Randomized parity tests cover vector
+  widths 1–769, including SIMD tails, and both ARM64 and x86_64 branches
+  compile. The dependency-free `cargo bench --bench distance` benchmark on the
+  ARM64 development host measured 1.63–2.25x for hot-cache L2/dot and
+  2.26–3.37x for cosine across 128/768/1536 dimensions. A 64 MiB working set at
+  768 dimensions stayed near the same ~6 GiB/s runtime throughput, so this API
+  is not saturating DRAM yet; validation, per-vector allocation/layout, and the
+  remaining scalar RaBitQ estimator are the next profiling targets.
 
 ---
 

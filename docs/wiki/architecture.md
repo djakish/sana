@@ -440,8 +440,10 @@ trait DistanceKernel {
 }
 ```
 
-Start portable. Add `std::arch` AVX2/AVX-512/aarch64 kernels only with tests
-and benchmarks.
+The f32 kernels use cached runtime dispatch to scalar, AArch64 NEON, or x86_64
+AVX2 implementations, with randomized parity tests and a dependency-free
+release benchmark. RaBitQ's packed estimator remains the next SIMD target;
+AVX-512/VPOPCNT should only be added when benchmarks justify a separate path.
 
 ## Native Filtering
 
