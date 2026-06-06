@@ -34,6 +34,9 @@ async fn main() -> CliResult {
         Some("branch") => branch(&args).await,
         Some("copy") => copy(&args).await,
         Some("export") => export(&args).await,
+        Some("pin") => pin(&args).await,
+        Some("unpin") => unpin(&args).await,
+        Some("pin-status") => pin_status(&args).await,
         Some("demo") => demo(&args).await,
         _ => {
             usage();
@@ -65,6 +68,9 @@ fn usage() {
     eprintln!("  sana branch <dir> <source-ns> <child-ns>   # zero-copy indexed snapshot");
     eprintln!("  sana copy <source-dir> <source-ns> <target-dir> <target-ns>");
     eprintln!("  sana export <source-dir> <ns> <target-dir> <prefix>");
+    eprintln!("  sana pin <dir> <ns> [replicas]");
+    eprintln!("  sana unpin <dir> <ns>");
+    eprintln!("  sana pin-status <dir> <ns>");
     eprintln!("  sana demo    <dir>");
 }
 
@@ -337,6 +343,50 @@ async fn export(args: &[String]) -> CliResult {
         "exported {namespace_name} generation {} to {}: {} object(s), {} bytes",
         report.source_generation, report.catalog_key, report.object_count, report.copied_bytes
     );
+    Ok(())
+}
+
+async fn pin(args: &[String]) -> CliResult {
+    let (dir, namespace_name) = (arg(args, 2)?, arg(args, 3)?);
+    let replicas = args
+        .get(4)
+        .map(|value| value.parse::<u32>())
+        .transpose()?
+        .unwrap_or(1);
+    sana::pinning::PinningController::new(store(dir))
+        .configure(namespace_name, Some(replicas))
+        .await?;
+    println!("pinned {namespace_name} with {replicas} replica(s)");
+    Ok(())
+}
+
+async fn unpin(args: &[String]) -> CliResult {
+    let (dir, namespace_name) = (arg(args, 2)?, arg(args, 3)?);
+    sana::pinning::PinningController::new(store(dir))
+        .configure(namespace_name, None)
+        .await?;
+    println!("unpinned {namespace_name}");
+    Ok(())
+}
+
+async fn pin_status(args: &[String]) -> CliResult {
+    let (dir, namespace_name) = (arg(args, 2)?, arg(args, 3)?);
+    match sana::pinning::PinningController::new(store(dir))
+        .metadata(namespace_name)
+        .await?
+    {
+        Some(metadata) => println!(
+            "{namespace_name}: {} configured, {} assigned, {} ready, utilization {}",
+            metadata.replicas,
+            metadata.assigned_replicas,
+            metadata.ready_replicas,
+            metadata
+                .average_utilization
+                .map(|value| format!("{:.1}%", value * 100.0))
+                .unwrap_or_else(|| "n/a".into())
+        ),
+        None => println!("{namespace_name}: not pinned"),
+    }
     Ok(())
 }
 

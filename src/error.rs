@@ -32,6 +32,9 @@ pub enum Error {
     #[error("invalid indexing queue claim: {0}")]
     InvalidQueueClaim(String),
 
+    #[error("invalid pinning replica claim: {0}")]
+    InvalidPinningClaim(String),
+
     #[error("corrupt data: {0}")]
     Corrupt(String),
 

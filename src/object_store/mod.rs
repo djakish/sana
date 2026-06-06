@@ -3,9 +3,10 @@
 //!
 //! Versioning is content-addressed: [`version_of`] hashes the bytes, which
 //! gives correct compare-and-set-by-content semantics that survive restarts
-//! without any sidecar state. For namespace manifests (the only objects we
-//! CAS) generations strictly increase, so the ABA problem inherent to
-//! content versioning cannot occur in practice.
+//! without any sidecar state. Mutable CAS objects include a monotonically
+//! increasing manifest generation, queue job-id counter, or control-plane
+//! revision, so the ABA problem inherent to content versioning does not occur
+//! in normal operation.
 
 use std::ops::Range;
 

@@ -28,6 +28,7 @@ use crate::namespace::{
     Namespace, apply_op, manifest_body_key_for_pointer, manifest_pointer_key, now_ms, op_id,
     wal_commit_key, wal_key,
 };
+use crate::pinning::pinning_key;
 use crate::rabitq;
 use crate::schema::{ColumnType, DistanceMetric};
 use crate::sst::SstWriter;
@@ -795,6 +796,7 @@ pub async fn gc(ns: &Namespace, apply: bool) -> Result<GcReport> {
     let mut live: BTreeSet<String> = BTreeSet::new();
     live.insert(manifest_pointer_key(ns.name()));
     live.insert(wal_commit_key(ns.name()));
+    live.insert(pinning_key(ns.name()));
     live.insert(manifest_body_key_for_pointer(ns.name(), &snapshot.pointer));
     live.extend(manifest.referenced_index_keys());
     live.extend(foreign_references_into_namespace(ns).await?);
