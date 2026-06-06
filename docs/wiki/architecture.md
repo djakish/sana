@@ -778,7 +778,9 @@ batch, CAS-advance the manifest, and replay the namespace into documents.
 - Expose write, query, metadata, recall, and cache-warm operations through HTTP.
   **Done:** an Axum adapter calls the existing `Namespace` contracts, returns
   structured errors, bounds bodies at 64 MiB, and is served by `sana serve`
-  over the immutable-object caching store.
+  over the immutable-object caching store. `api::serve` also runs one leased
+  durable indexing worker plus periodic WAL/manifest reconciliation, while
+  preserving the option to run additional external workers.
 
 ## Risks
 

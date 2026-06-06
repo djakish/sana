@@ -199,7 +199,48 @@ pub fn router(store: Arc<dyn ObjectStore>) -> Router {
 
 pub async fn serve(store: Arc<dyn ObjectStore>, address: SocketAddr) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(address).await?;
+    spawn_index_worker(store.clone());
     axum::serve(listener, router(store)).await
+}
+
+fn spawn_index_worker(store: Arc<dyn ObjectStore>) {
+    const LEASE_MS: u64 = 30_000;
+    const HEARTBEAT_MS: u64 = 1_000;
+    const IDLE_POLL_MS: u64 = 100;
+    const ERROR_RETRY_MS: u64 = 1_000;
+    const RECONCILE_INTERVAL_MS: u64 = 30_000;
+
+    let worker_id = format!("serve-{}", std::process::id());
+    tokio::spawn(async move {
+        let mut next_reconcile = tokio::time::Instant::now();
+        loop {
+            if tokio::time::Instant::now() >= next_reconcile {
+                if let Err(error) = crate::index_queue::reconcile_unindexed(store.clone()).await {
+                    eprintln!("index reconciliation failed: {error}");
+                }
+                next_reconcile = tokio::time::Instant::now()
+                    + std::time::Duration::from_millis(RECONCILE_INTERVAL_MS);
+            }
+
+            match crate::index_queue::run_worker_once(
+                store.clone(),
+                &worker_id,
+                LEASE_MS,
+                HEARTBEAT_MS,
+            )
+            .await
+            {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(IDLE_POLL_MS)).await;
+                }
+                Err(error) => {
+                    eprintln!("index worker failed: {error}");
+                    tokio::time::sleep(std::time::Duration::from_millis(ERROR_RETRY_MS)).await;
+                }
+            }
+        }
+    });
 }
 
 async fn health() -> Json<serde_json::Value> {

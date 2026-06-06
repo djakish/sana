@@ -57,7 +57,9 @@ the next unchecked task under "Current milestone" / "Next up".
   2 GiB default limit; bulk bypass is limited to unconditional upsert/delete.
   An Axum HTTP service now exposes write, query/multi-query, metadata, recall,
   and cache-warm routes over the same library methods, with structured
-  400/404/409/429/500 errors and a cache-backed `sana serve` command.
+  400/404/409/429/500 errors and a cache-backed `sana serve` command. The
+  service runs a durable indexing worker and periodic reconciliation loop, so
+  ordinary deployments index accepted writes without a second process.
 - **Last updated:** 2026-06-06.
 
 ---
@@ -968,6 +970,14 @@ Stage 10 decisions / notes:
   reject cross-epoch ranges, and use checked sequence increments. This prevents
   latent epoch fields from turning a malformed manifest or partial future
   rollout into silent stale reads, skipped indexing, or live-WAL deletion.
+- **D67 — The HTTP service owns a local durable index worker.** `api::serve`
+  starts one leased queue worker after binding succeeds, polls idle queues at
+  100 ms, retries failures with backoff, and reconciles authoritative
+  manifest/WAL lag every 30 seconds. Queue state remains durable and fenced, so
+  external workers can still be added for scale; the embedded worker simply
+  makes the default single-process service self-indexing. A live socket smoke
+  test observed metadata move from `updating` with unindexed bytes to
+  `up-to-date` after the background flush.
 
 ---
 
