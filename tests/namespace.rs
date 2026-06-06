@@ -198,6 +198,28 @@ async fn create_twice_is_already_exists() {
 }
 
 #[tokio::test]
+async fn concurrent_create_publishes_one_consistent_namespace() {
+    let dir = tempfile::tempdir().unwrap();
+    let object_store = store(&dir);
+    let (first, second) = tokio::join!(
+        Namespace::create(object_store.clone(), "docs"),
+        Namespace::create(object_store.clone(), "docs")
+    );
+
+    assert_ne!(first.is_ok(), second.is_ok());
+    let error = if let Err(error) = first {
+        error
+    } else {
+        second.unwrap_err()
+    };
+    assert!(matches!(error, Error::AlreadyExists(_)));
+
+    let namespace = Namespace::open(object_store, "docs").await.unwrap();
+    assert_eq!(namespace.commit_cursor().await.unwrap().seq, 0);
+    assert_eq!(namespace.load_manifest().await.unwrap().generation, 0);
+}
+
+#[tokio::test]
 async fn open_missing_is_not_found() {
     let dir = tempfile::tempdir().unwrap();
     let err = Namespace::open(store(&dir), "ghost").await.unwrap_err();

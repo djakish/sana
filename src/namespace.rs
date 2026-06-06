@@ -78,6 +78,27 @@ fn decode_cursor(bytes: &[u8]) -> Result<WalCursor> {
     serde_json::from_slice(bytes).map_err(|e| Error::Codec(e.to_string()))
 }
 
+async fn put_immutable_if_absent(
+    store: &Arc<dyn ObjectStore>,
+    key: &str,
+    bytes: Vec<u8>,
+) -> Result<()> {
+    match store.put_if_absent(key, Bytes::from(bytes.clone())).await {
+        Ok(_) => Ok(()),
+        Err(Error::AlreadyExists(_)) => {
+            let existing = store.get(key).await?;
+            if existing.bytes.as_ref() == bytes.as_slice() {
+                Ok(())
+            } else {
+                Err(Error::Corrupt(format!(
+                    "namespace creation found conflicting object at {key}"
+                )))
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
 pub(crate) fn op_id(op: &WalOp) -> &Id {
     match op {
         WalOp::Upsert { id, .. } | WalOp::Patch { id, .. } | WalOp::Delete { id } => id,
@@ -109,26 +130,49 @@ impl std::fmt::Debug for Namespace {
 impl Namespace {
     /// Create a brand-new namespace. Errors if it already exists.
     pub async fn create(store: Arc<dyn ObjectStore>, name: &str) -> Result<Self> {
+        Self::create_from_manifest(store, name, NamespaceManifest::new(name, now_ms())).await
+    }
+
+    pub(crate) async fn create_from_manifest(
+        store: Arc<dyn ObjectStore>,
+        name: &str,
+        manifest: NamespaceManifest,
+    ) -> Result<Self> {
+        if manifest.namespace != name || manifest.generation != 0 {
+            return Err(Error::Corrupt(format!(
+                "initial manifest for namespace {name:?} must use matching name and generation 0"
+            )));
+        }
         let pointer_key = manifest_pointer_key(name);
-        if store.get(&pointer_key).await.is_ok() {
-            return Err(Error::AlreadyExists(format!("namespace {name}")));
+        match store.get(&pointer_key).await {
+            Ok(_) => return Err(Error::AlreadyExists(format!("namespace {name}"))),
+            Err(Error::NotFound(_)) => {}
+            Err(error) => return Err(error),
         }
 
-        let manifest = NamespaceManifest::new(name, now_ms());
-        store
-            .put(&manifest_body_key(name, 0), Bytes::from(manifest.encode()?))
-            .await?;
-        store
-            .put(
-                &wal_commit_key(name),
-                Bytes::from(encode_cursor(&WalCursor::new(0, 0))?),
-            )
-            .await?;
+        let encoded_manifest = manifest.encode()?;
+        let body_version = version_of(&encoded_manifest);
+        let body_key = manifest_content_body_key(name, 0, &body_version);
+        put_immutable_if_absent(&store, &body_key, encoded_manifest).await?;
+
+        let cursor_key = wal_commit_key(name);
+        let encoded_cursor = encode_cursor(&WalCursor::new(0, 0))?;
+        put_immutable_if_absent(&store, &cursor_key, encoded_cursor).await?;
+
         // The pointer is the existence sentinel; create it last and atomically.
-        store
-            .put_if_absent(&pointer_key, Bytes::from(ManifestPointer::new(0).encode()?))
+        match store
+            .put_if_absent(
+                &pointer_key,
+                Bytes::from(ManifestPointer::for_body(0, body_key).encode()?),
+            )
             .await
-            .map_err(|_| Error::AlreadyExists(format!("namespace {name}")))?;
+        {
+            Ok(_) => {}
+            Err(Error::AlreadyExists(_)) => {
+                return Err(Error::AlreadyExists(format!("namespace {name}")));
+            }
+            Err(error) => return Err(error),
+        }
 
         Ok(Self::handle(store, name))
     }
