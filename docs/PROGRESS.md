@@ -12,12 +12,12 @@ the next unchecked task under "Current milestone" / "Next up".
 ## Status snapshot
 
 - **Current stage:** Stage 9 (Object-store operations) — **in progress**.
-- **Next up:** Branch/copy/export operations over immutable manifest generations.
+- **Next up:** Namespace pinning and read-replica controls.
 - **Done:** Stage 0 (Skeleton), Stage 1 (Durable Documents), Stage 2 (SST/LSM),
   Stage 3 (Attributes & Exact Search), Stage 4 (ANN v0), Stage 5 (Native
   Filtering), Stage 6 (SPFresh local rebuild), Stage 7 (Full-text search),
   Stage 8 (RaBitQ & kernels).
-- **Tests:** `cargo test` green (137 tests); `cargo clippy --all-targets` clean.
+- **Tests:** `cargo test` green (143 tests); `cargo clippy --all-targets` clean.
 - **Note:** post-Stage-2 and Stage-3–5 code-review fixes applied; remaining
   findings tracked under "Stage 2 — code review follow-ups" and "Stages 3–5 —
   code review follow-ups". Recently fixed limitations: Stage 2 ranged
@@ -37,7 +37,9 @@ the next unchecked task under "Current milestone" / "Next up".
   heartbeats, retries, at-least-once workers, brokered group commit, and
   WAL/manifest reconciliation for missed advisory notifications. Query nodes
   can wrap any backend in a byte-bounded immutable-object LRU and warm one
-  manifest generation under an explicit byte/concurrency budget.
+  manifest generation under an explicit byte/concurrency budget. Fully indexed
+  generations support zero-copy branches, independent cross-store copies, and
+  deterministic catalog-last exports.
 - **Last updated:** 2026-06-06.
 
 ---
@@ -753,7 +755,7 @@ Planned tasks:
 
 - [x] Add a durable brokered indexing queue with bounded worker claims/leases.
 - [x] Add warm-cache planning and an explicit prewarm endpoint.
-- [ ] Add branch/copy/export operations over immutable manifest generations.
+- [x] Add branch/copy/export operations over immutable manifest generations.
 - [ ] Add namespace pinning/read-replica controls after cache behavior is measured.
 
 Stage 9 decisions / notes:
@@ -798,6 +800,23 @@ Stage 9 decisions / notes:
   Backends may treat this as a read hint; `CachingObjectStore` retains the
   bytes. An end-to-end test removes every warmed immutable backing object and
   still serves L2 ANN plus document materialization from cache.
+- **D57 — Branches flatten one indexed generation into the child manifest.**
+  A branch requires `indexed_cursor == wal_commit/current`, directly reuses the
+  source generation's immutable doc/attr/text/vector keys, resets child WAL
+  cursors to zero, and records `branch_parent` for lineage. Existing read and
+  indexing code therefore needs no parent-chain merge: child writes form a
+  normal WAL overlay and later flushes publish child-local deltas. GC scans all
+  current manifests and treats foreign references into its namespace as live,
+  so source compaction cannot reclaim objects still owned by a branch.
+- **D58 — Physical copy/export share a bounded snapshot-transfer primitive.**
+  `copy_to` streams every manifest-referenced object to destination-local
+  `index/g/0/copy` keys, rewrites the new generation-0 manifest, and gives the
+  copy an independent WAL. `export_to` writes content-checksummed objects under
+  an arbitrary target-store prefix and publishes a deterministic versioned
+  `catalog.json` last. Both require a fully indexed source, use bounded
+  concurrency, and verify existing bytes for idempotent retries. Tests remove
+  every source object after a cross-store copy and verify the destination is
+  still readable and writable.
 
 ---
 
@@ -867,6 +886,7 @@ src/
   cache_warm.rs          manifest-driven warm plan and prefetch report
   index_queue.rs          durable queue, group-commit broker, leased worker
   indexer.rs             flush/compaction + attr/text/vector index publication
+  operations.rs          branch, physical copy, snapshot export
 tests/
   common/mod.rs          assert_golden snapshot helper
   fs_object_store.rs     object store behavior (CAS, ranges, list, ...)
@@ -879,6 +899,7 @@ tests/
   schema.rs              write-time schema inference/validation
   query.rs               filters, ordering, aggregation, exact kNN, ANN, BM25, recall
   cache_warm.rs          warm planning + cache-resident ANN integration
+  operations.rs          branch isolation/GC and cross-store copy/export
   text.rs                tokenization, BM25, text SST round-trip
   fixtures/              committed golden snapshots
 ```

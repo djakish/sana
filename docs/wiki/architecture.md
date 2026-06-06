@@ -586,23 +586,26 @@ exits successfully.
 
 ## Branching And Copy
 
-Branching is a manifest operation:
+Branching is a manifest operation over a fully indexed generation:
 
 ```text
-child manifest:
-  parent_namespace = source
-  parent_generation = source_generation
-  overlay_wal_cursor = empty
-  overlay_index = empty
+child generation 0:
+  index object references = source generation's immutable references
+  branch_parent = { source namespace, source generation }
+  WAL commit/indexed cursors = empty
 ```
 
-Reads merge parent generation files with child overlay files. Writes to parent
-and child are independent after branch creation. Compaction can later materialize
-or flatten branch chains.
+The child manifest is flattened rather than requiring parent-chain reads:
+ordinary reads treat shared source files as the base and merge the child's WAL
+overlay. Writes to parent and child are independent after branch creation.
+Source GC scans all current manifests and preserves cross-namespace references;
+child compaction can later replace shared files with child-local objects.
 
-`copy_from_namespace` is a physical or logical copy operation. It is useful for
-cross-region copies, re-encryption, and backups. Branching is the preferred
-same-region clone.
+`copy_to` physically streams the same indexed snapshot to destination-local
+keys, rewrites a generation-0 manifest, and works across object stores. Export
+uses the same bounded transfer path but writes content-checksummed objects plus
+a versioned deterministic catalog, with `catalog.json` published last.
+Branching remains the preferred same-store clone.
 
 ## Guarantees
 
