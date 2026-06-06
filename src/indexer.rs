@@ -792,13 +792,13 @@ pub struct GcReport {
 pub async fn gc(ns: &Namespace, apply: bool) -> Result<GcReport> {
     let snapshot = ns.load_manifest_snapshot().await?;
     let manifest = &snapshot.manifest;
-    let (commit, pending_staging_key) = ns.wal_gc_state().await?;
+    let (commit, pending_staging_keys) = ns.wal_gc_state().await?;
 
     let mut live: BTreeSet<String> = BTreeSet::new();
     live.insert(manifest_pointer_key(ns.name()));
     live.insert(wal_commit_key(ns.name()));
     live.insert(pinning_key(ns.name()));
-    if let Some(key) = pending_staging_key {
+    for key in pending_staging_keys {
         live.insert(key);
     }
     live.insert(manifest_body_key_for_pointer(ns.name(), &snapshot.pointer));

@@ -1012,7 +1012,7 @@ fn matches_filter(filter: Option<&FilterExpr>, document: &Document) -> Result<bo
     }
 }
 
-fn filter_matches(filter: &FilterExpr, document: &Document) -> Result<bool> {
+pub(crate) fn filter_matches(filter: &FilterExpr, document: &Document) -> Result<bool> {
     match filter {
         FilterExpr::Eq { column, value } => Ok(document
             .attributes

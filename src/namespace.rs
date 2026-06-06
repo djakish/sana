@@ -29,11 +29,12 @@ use crate::doc::{DocRecord, decode_id, encode_id};
 use crate::error::{Error, Result};
 use crate::index_queue::{EnqueueOutcome, IndexQueue};
 use crate::manifest::{ManifestPointer, NamespaceManifest};
-use crate::object_store::{ObjectStore, ObjectVersion, version_of};
+use crate::object_store::{GetResult, ObjectStore, ObjectVersion, version_of};
 use crate::query::{MultiQuery, MultiQueryResult, Query, QueryResult, RecallRequest, RecallResult};
 use crate::sst::SstReader;
 use crate::value::{Document, Id, Value};
 use crate::wal::{WalBatch, WalCursor, WalOp};
+use crate::write::{ConditionalWriteOp, ConditionalWriteResult, WriteOutcome};
 
 const WAL_COMMIT_FORMAT_VERSION: u32 = 1;
 const IDEMPOTENCY_FORMAT_VERSION: u32 = 1;
@@ -91,6 +92,28 @@ fn wal_staging_key(ns: &str, cursor: WalCursor, version: &ObjectVersion) -> Stri
     )
 }
 
+fn conditional_outcome_key(
+    ns: &str,
+    cursor: WalCursor,
+    idempotency_key: Option<&str>,
+    version: &ObjectVersion,
+) -> String {
+    match idempotency_key {
+        Some(key) => {
+            let record_key = idempotency_key_path(ns, key);
+            format!(
+                "{}.outcome-{}.json",
+                record_key.trim_end_matches(".json"),
+                version.0
+            )
+        }
+        None => format!(
+            "namespaces/{ns}/wal_staging/{}/{}-outcome-{}.json",
+            cursor.epoch, cursor.seq, version.0
+        ),
+    }
+}
+
 pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -106,13 +129,41 @@ struct RequestFingerprint {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct ImmutableObjectRef {
+    key: String,
+    version: ObjectVersion,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct PendingWalCommit {
     cursor: WalCursor,
     staging_key: String,
     staging_version: ObjectVersion,
     request_fingerprint: RequestFingerprint,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    wal_fingerprint: Option<RequestFingerprint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     idempotency_key: Option<String>,
+    #[serde(default)]
+    idempotency_kind: IdempotencyKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    conditional_outcome: Option<ImmutableObjectRef>,
+}
+
+struct PreparedWrite {
+    operations: Vec<WalOp>,
+    idempotency_key: Option<String>,
+    request_fingerprint: RequestFingerprint,
+    idempotency_kind: IdempotencyKind,
+    conditional_outcome: Option<WriteOutcome>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum IdempotencyKind {
+    #[default]
+    Append,
+    Conditional,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -167,6 +218,35 @@ impl WalCommitState {
                     "pending WAL has an invalid idempotency key".into(),
                 ));
             }
+            if matches!(pending.idempotency_kind, IdempotencyKind::Append)
+                && pending.conditional_outcome.is_some()
+            {
+                return Err(Error::Corrupt(
+                    "ordinary pending WAL contains a conditional outcome".into(),
+                ));
+            }
+            if matches!(pending.idempotency_kind, IdempotencyKind::Conditional)
+                && pending.conditional_outcome.is_none()
+            {
+                return Err(Error::Corrupt(
+                    "conditional pending WAL is missing its outcome".into(),
+                ));
+            }
+            if let Some(outcome) = &pending.conditional_outcome {
+                let suffix = format!("-{}.json", outcome.version.0);
+                let valid_prefix = match &pending.idempotency_key {
+                    Some(_) => idempotency_prefix(namespace),
+                    None => format!(
+                        "namespaces/{namespace}/wal_staging/{}/{}-",
+                        pending.cursor.epoch, pending.cursor.seq
+                    ),
+                };
+                if !outcome.key.starts_with(&valid_prefix) || !outcome.key.ends_with(&suffix) {
+                    return Err(Error::Corrupt(
+                        "conditional outcome key does not match its reservation".into(),
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -175,7 +255,7 @@ impl WalCommitState {
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum StoredWalCommit {
-    State(WalCommitState),
+    State(Box<WalCommitState>),
     Legacy(WalCursor),
 }
 
@@ -185,6 +265,10 @@ struct IdempotencyRecord {
     key: String,
     request_fingerprint: RequestFingerprint,
     cursor: WalCursor,
+    #[serde(default)]
+    kind: IdempotencyKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    conditional_outcome: Option<ImmutableObjectRef>,
 }
 
 fn encode_commit_state(state: &WalCommitState) -> Result<Vec<u8>> {
@@ -195,7 +279,7 @@ fn decode_commit_state(namespace: &str, bytes: &[u8]) -> Result<WalCommitState> 
     let stored: StoredWalCommit =
         serde_json::from_slice(bytes).map_err(|error| Error::Codec(error.to_string()))?;
     let state = match stored {
-        StoredWalCommit::State(state) => state,
+        StoredWalCommit::State(state) => *state,
         StoredWalCommit::Legacy(cursor) => WalCommitState::new(cursor),
     };
     state.validate(namespace)?;
@@ -211,9 +295,9 @@ fn validate_idempotency_key(key: &str) -> Result<()> {
     Ok(())
 }
 
-fn request_fingerprint(operations: &[WalOp]) -> Result<RequestFingerprint> {
+fn request_fingerprint<T: Serialize + ?Sized>(request: &T) -> Result<RequestFingerprint> {
     let encoded =
-        postcard::to_allocvec(operations).map_err(|error| Error::Codec(error.to_string()))?;
+        postcard::to_allocvec(request).map_err(|error| Error::Codec(error.to_string()))?;
     Ok(RequestFingerprint {
         version: version_of(&encoded),
         size_bytes: u64::try_from(encoded.len())
@@ -557,18 +641,22 @@ impl Namespace {
         Ok(self.load_commit_state().await?.1.committed)
     }
 
-    async fn load_commit_state(&self) -> Result<(crate::object_store::GetResult, WalCommitState)> {
+    async fn load_commit_state(&self) -> Result<(GetResult, WalCommitState)> {
         let got = self.store.get(&wal_commit_key(&self.name)).await?;
         let state = decode_commit_state(&self.name, &got.bytes)?;
         Ok((got, state))
     }
 
-    pub(crate) async fn wal_gc_state(&self) -> Result<(WalCursor, Option<String>)> {
+    pub(crate) async fn wal_gc_state(&self) -> Result<(WalCursor, Vec<String>)> {
         let (_, state) = self.load_commit_state().await?;
-        Ok((
-            state.committed,
-            state.pending.map(|pending| pending.staging_key),
-        ))
+        let mut pending_keys = Vec::new();
+        if let Some(pending) = state.pending {
+            pending_keys.push(pending.staging_key);
+            if let Some(outcome) = pending.conditional_outcome {
+                pending_keys.push(outcome.key);
+            }
+        }
+        Ok((state.committed, pending_keys))
     }
 
     /// Append one atomic batch and advance the commit cursor. Returns the
@@ -604,6 +692,37 @@ impl Namespace {
         Ok(committed)
     }
 
+    /// Atomically evaluate known-ID conditions and commit the operations that
+    /// match. Conditions use the same scalar/filter semantics as queries.
+    /// Missing upserts apply unconditionally; missing patches and deletes skip.
+    pub async fn conditional_write(
+        &self,
+        writes: Vec<ConditionalWriteOp>,
+        idempotency_key: Option<String>,
+    ) -> Result<ConditionalWriteResult> {
+        if writes.is_empty() {
+            return Err(Error::InvalidWrite(
+                "conditional write batch cannot be empty".into(),
+            ));
+        }
+        if let Some(key) = &idempotency_key {
+            validate_idempotency_key(key)?;
+        }
+        validate_unique_write_ids(&writes)?;
+        let fingerprint = request_fingerprint(&writes)?;
+
+        let append_guard = self.append_lock.lock().await;
+        let result = self
+            .conditional_write_locked(writes, idempotency_key, fingerprint)
+            .await?;
+        drop(append_guard);
+
+        let _ = IndexQueue::new(self.store.clone())
+            .enqueue(&self.name, result.cursor)
+            .await;
+        Ok(result)
+    }
+
     async fn append_locked(
         &self,
         operations: Vec<WalOp>,
@@ -618,58 +737,96 @@ impl Namespace {
             }
 
             if let Some(key) = &idempotency_key
-                && let Some(cursor) = self
-                    .lookup_idempotency(key, &fingerprint, state.committed)
+                && let Some(record) = self
+                    .lookup_idempotency(key, &fingerprint, IdempotencyKind::Append, state.committed)
                     .await?
             {
-                return Ok(cursor);
+                return Ok(record.cursor);
             }
 
-            // Do not reserve a request that is already invalid against the
-            // current schema. A concurrent writer must reserve the commit state
-            // before publishing its schema change, so a successful reservation
-            // fences schema evolution until this request commits or is aborted.
-            self.validate_ops_for_current_schema(&operations).await?;
-
-            let next_seq = state
-                .committed
-                .seq
-                .checked_add(1)
-                .ok_or_else(|| Error::InvalidWrite("WAL sequence exhausted".into()))?;
-            let next = WalCursor::new(state.committed.epoch, next_seq);
-            let batch = WalBatch {
-                namespace: self.name.clone(),
-                sequence: next.seq,
-                created_at_ms: now_ms(),
-                idempotency_key: idempotency_key.clone(),
-                operations: operations.clone(),
-            };
-            let encoded = batch.encode()?;
-            let staging_version = version_of(&encoded);
-            let staging_key = wal_staging_key(&self.name, next, &staging_version);
-            put_immutable_if_absent(&self.store, &staging_key, Bytes::from(encoded)).await?;
-
-            let pending = PendingWalCommit {
-                cursor: next,
-                staging_key,
-                staging_version,
-                request_fingerprint: fingerprint.clone(),
-                idempotency_key: idempotency_key.clone(),
-            };
-            let mut reserved = state;
-            reserved.pending = Some(pending.clone());
             match self
-                .store
-                .compare_and_set(
-                    &wal_commit_key(&self.name),
-                    current.version,
-                    Bytes::from(encode_commit_state(&reserved)?),
+                .try_reserve(
+                    current,
+                    state,
+                    PreparedWrite {
+                        operations: operations.clone(),
+                        idempotency_key: idempotency_key.clone(),
+                        request_fingerprint: fingerprint.clone(),
+                        idempotency_kind: IdempotencyKind::Append,
+                        conditional_outcome: None,
+                    },
                 )
-                .await
+                .await?
             {
-                Ok(_) => return self.finish_pending(pending).await,
-                Err(Error::CasMismatch { .. }) => continue,
-                Err(error) => return Err(error),
+                Some(pending) => return self.finish_pending(pending).await,
+                None => continue,
+            }
+        }
+    }
+
+    async fn conditional_write_locked(
+        &self,
+        writes: Vec<ConditionalWriteOp>,
+        idempotency_key: Option<String>,
+        fingerprint: RequestFingerprint,
+    ) -> Result<ConditionalWriteResult> {
+        let all_operations: Vec<WalOp> =
+            writes.iter().map(|write| write.operation.clone()).collect();
+        loop {
+            let (current, state) = self.load_commit_state().await?;
+            if let Some(pending) = state.pending.clone() {
+                self.finish_pending(pending).await?;
+                continue;
+            }
+
+            if let Some(key) = &idempotency_key
+                && let Some(record) = self
+                    .lookup_idempotency(
+                        key,
+                        &fingerprint,
+                        IdempotencyKind::Conditional,
+                        state.committed,
+                    )
+                    .await?
+            {
+                let outcome_ref = record.conditional_outcome.ok_or_else(|| {
+                    Error::Corrupt("conditional idempotency record has no outcome".into())
+                })?;
+                let outcome = self.load_write_outcome(&outcome_ref).await?;
+                return Ok(ConditionalWriteResult {
+                    cursor: record.cursor,
+                    outcome,
+                });
+            }
+
+            // Validate the complete request even when a condition will skip an
+            // operation. Only applied operations are later used for schema
+            // publication.
+            self.validate_ops_for_current_schema(&all_operations)
+                .await?;
+            let manifest = self.load_manifest().await?;
+            let documents = self.replay_at(&manifest, state.committed).await?;
+            let (operations, outcome) = evaluate_conditional_writes(&writes, &documents)?;
+
+            match self
+                .try_reserve(
+                    current,
+                    state,
+                    PreparedWrite {
+                        operations,
+                        idempotency_key: idempotency_key.clone(),
+                        request_fingerprint: fingerprint.clone(),
+                        idempotency_kind: IdempotencyKind::Conditional,
+                        conditional_outcome: Some(outcome.clone()),
+                    },
+                )
+                .await?
+            {
+                Some(pending) => {
+                    let cursor = self.finish_pending(pending).await?;
+                    return Ok(ConditionalWriteResult { cursor, outcome });
+                }
+                None => continue,
             }
         }
     }
@@ -678,6 +835,81 @@ impl Namespace {
         let mut schema = self.load_manifest().await?.schema;
         schema.infer_and_validate_ops(operations)?;
         Ok(())
+    }
+
+    async fn try_reserve(
+        &self,
+        current: GetResult,
+        state: WalCommitState,
+        prepared: PreparedWrite,
+    ) -> Result<Option<PendingWalCommit>> {
+        // Do not reserve a request that is already invalid against the current
+        // schema. A concurrent writer must reserve the commit state before
+        // publishing its schema change, so a successful reservation fences
+        // schema evolution until this request commits or is aborted.
+        self.validate_ops_for_current_schema(&prepared.operations)
+            .await?;
+
+        let next_seq = state
+            .committed
+            .seq
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidWrite("WAL sequence exhausted".into()))?;
+        let next = WalCursor::new(state.committed.epoch, next_seq);
+        let wal_fingerprint = request_fingerprint(&prepared.operations)?;
+        let batch = WalBatch {
+            namespace: self.name.clone(),
+            sequence: next.seq,
+            created_at_ms: now_ms(),
+            idempotency_key: prepared.idempotency_key.clone(),
+            operations: prepared.operations,
+        };
+        let encoded = batch.encode()?;
+        let staging_version = version_of(&encoded);
+        let staging_key = wal_staging_key(&self.name, next, &staging_version);
+        put_immutable_if_absent(&self.store, &staging_key, Bytes::from(encoded)).await?;
+        let conditional_outcome = match prepared.conditional_outcome {
+            Some(outcome) => {
+                let encoded = serde_json::to_vec(&outcome)
+                    .map_err(|error| Error::Codec(error.to_string()))?;
+                let version = version_of(&encoded);
+                let key = conditional_outcome_key(
+                    &self.name,
+                    next,
+                    prepared.idempotency_key.as_deref(),
+                    &version,
+                );
+                put_immutable_if_absent(&self.store, &key, Bytes::from(encoded)).await?;
+                Some(ImmutableObjectRef { key, version })
+            }
+            None => None,
+        };
+
+        let pending = PendingWalCommit {
+            cursor: next,
+            staging_key,
+            staging_version,
+            request_fingerprint: prepared.request_fingerprint,
+            wal_fingerprint: Some(wal_fingerprint),
+            idempotency_key: prepared.idempotency_key,
+            idempotency_kind: prepared.idempotency_kind,
+            conditional_outcome,
+        };
+        let mut reserved = state;
+        reserved.pending = Some(pending.clone());
+        match self
+            .store
+            .compare_and_set(
+                &wal_commit_key(&self.name),
+                current.version,
+                Bytes::from(encode_commit_state(&reserved)?),
+            )
+            .await
+        {
+            Ok(_) => Ok(Some(pending)),
+            Err(Error::CasMismatch { .. }) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     async fn finish_pending(&self, target: PendingWalCommit) -> Result<WalCursor> {
@@ -705,14 +937,21 @@ impl Namespace {
                 )));
             }
             let batch = WalBatch::decode(&staged.bytes)?;
+            let expected_wal_fingerprint = pending
+                .wal_fingerprint
+                .as_ref()
+                .unwrap_or(&pending.request_fingerprint);
             if batch.namespace != self.name
                 || batch.sequence != pending.cursor.seq
                 || batch.idempotency_key != pending.idempotency_key
-                || request_fingerprint(&batch.operations)? != pending.request_fingerprint
+                || &request_fingerprint(&batch.operations)? != expected_wal_fingerprint
             {
                 return Err(Error::Corrupt(
                     "pending WAL staging object does not match its reservation".into(),
                 ));
+            }
+            if let Some(outcome) = &pending.conditional_outcome {
+                self.load_write_outcome(outcome).await?;
             }
 
             if let Err(error) = self.evolve_schema_for_ops(&batch.operations).await {
@@ -761,8 +1000,9 @@ impl Namespace {
         &self,
         key: &str,
         fingerprint: &RequestFingerprint,
+        kind: IdempotencyKind,
         committed: WalCursor,
-    ) -> Result<Option<WalCursor>> {
+    ) -> Result<Option<IdempotencyRecord>> {
         let object_key = idempotency_key_path(&self.name, key);
         let got = match self.store.get(&object_key).await {
             Ok(got) => got,
@@ -776,7 +1016,16 @@ impl Namespace {
                 "invalid idempotency record at {object_key}"
             )));
         }
-        if &record.request_fingerprint != fingerprint {
+        if (matches!(record.kind, IdempotencyKind::Conditional)
+            && record.conditional_outcome.is_none())
+            || (matches!(record.kind, IdempotencyKind::Append)
+                && record.conditional_outcome.is_some())
+        {
+            return Err(Error::Corrupt(format!(
+                "idempotency record kind/outcome mismatch at {object_key}"
+            )));
+        }
+        if &record.request_fingerprint != fingerprint || record.kind != kind {
             return Err(Error::IdempotencyConflict(key.to_string()));
         }
         if record.cursor > committed {
@@ -784,7 +1033,7 @@ impl Namespace {
                 "idempotency record {object_key} points past the committed WAL"
             )));
         }
-        Ok(Some(record.cursor))
+        Ok(Some(record))
     }
 
     async fn write_idempotency_record(&self, key: &str, pending: &PendingWalCommit) -> Result<()> {
@@ -794,6 +1043,8 @@ impl Namespace {
             key: key.to_string(),
             request_fingerprint: pending.request_fingerprint.clone(),
             cursor: pending.cursor,
+            kind: pending.idempotency_kind,
+            conditional_outcome: pending.conditional_outcome.clone(),
         };
         let encoded =
             serde_json::to_vec(&record).map_err(|error| Error::Codec(error.to_string()))?;
@@ -817,6 +1068,17 @@ impl Namespace {
             }
             Err(error) => Err(error),
         }
+    }
+
+    async fn load_write_outcome(&self, object: &ImmutableObjectRef) -> Result<WriteOutcome> {
+        let got = self.store.get(&object.key).await?;
+        if got.version != object.version {
+            return Err(Error::Corrupt(format!(
+                "conditional write outcome version mismatch at {}",
+                object.key
+            )));
+        }
+        serde_json::from_slice(&got.bytes).map_err(|error| Error::Codec(error.to_string()))
     }
 
     /// Reconcile this namespace's current durable WAL cursor into the indexing
@@ -936,6 +1198,57 @@ impl Namespace {
     pub async fn recall(&self, request: RecallRequest) -> Result<RecallResult> {
         crate::query::recall(self, request).await
     }
+}
+
+fn validate_unique_write_ids(writes: &[ConditionalWriteOp]) -> Result<()> {
+    let mut ids = BTreeSet::new();
+    for write in writes {
+        let id = op_id(&write.operation);
+        if !ids.insert(id.clone()) {
+            return Err(Error::InvalidWrite(format!(
+                "conditional write contains duplicate id {id:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn evaluate_conditional_writes(
+    writes: &[ConditionalWriteOp],
+    documents: &BTreeMap<Id, Document>,
+) -> Result<(Vec<WalOp>, WriteOutcome)> {
+    let mut operations = Vec::new();
+    let mut outcome = WriteOutcome::default();
+    for write in writes {
+        let id = op_id(&write.operation);
+        let current = documents.get(id);
+        let applies = match (&write.operation, current) {
+            (WalOp::Upsert { .. }, None) => true,
+            (WalOp::Patch { .. } | WalOp::Delete { .. }, None) => false,
+            (_, Some(document)) => match &write.condition {
+                Some(condition) => crate::query::filter_matches(condition, document)?,
+                None => true,
+            },
+        };
+
+        if !applies {
+            outcome.skipped_ids.push(id.clone());
+            continue;
+        }
+
+        outcome.rows_affected = outcome
+            .rows_affected
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidWrite("conditional affected-row count overflow".into()))?;
+        match &write.operation {
+            WalOp::Upsert { .. } => outcome.rows_upserted += 1,
+            WalOp::Patch { .. } => outcome.rows_patched += 1,
+            WalOp::Delete { .. } => outcome.rows_deleted += 1,
+        }
+        outcome.applied_ids.push(id.clone());
+        operations.push(write.operation.clone());
+    }
+    Ok((operations, outcome))
 }
 
 pub(crate) fn apply_op(docs: &mut BTreeMap<Id, Document>, op: WalOp) {

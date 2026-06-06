@@ -22,5 +22,6 @@ pub mod text;
 pub mod value;
 pub mod vector;
 pub mod wal;
+pub mod write;
 
 pub use error::{Error, Result};
