@@ -100,11 +100,11 @@ impl VectorVersionMap {
 
     pub fn encode(&self) -> Result<Vec<u8>> {
         let body = postcard::to_allocvec(self).map_err(|e| Error::Codec(e.to_string()))?;
-        Ok(frame::encode(
+        frame::encode(
             VERSION_MAP_MAGIC,
             VERSION_MAP_FORMAT_VERSION,
             &body,
-        ))
+        )
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
@@ -224,7 +224,7 @@ impl VectorIndex {
 
     pub fn encode(&self) -> Result<Vec<u8>> {
         let body = postcard::to_allocvec(self).map_err(|e| Error::Codec(e.to_string()))?;
-        Ok(frame::encode(VECTOR_MAGIC, VECTOR_FORMAT_VERSION, &body))
+        frame::encode(VECTOR_MAGIC, VECTOR_FORMAT_VERSION, &body)
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {

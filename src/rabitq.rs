@@ -135,7 +135,7 @@ pub fn build_index(index: &VectorIndex) -> Result<RabitqIndex> {
 impl RabitqIndex {
     pub fn encode(&self) -> Result<Vec<u8>> {
         let body = postcard::to_allocvec(self).map_err(|e| Error::Codec(e.to_string()))?;
-        Ok(frame::encode(RABITQ_MAGIC, RABITQ_FORMAT_VERSION, &body))
+        frame::encode(RABITQ_MAGIC, RABITQ_FORMAT_VERSION, &body)
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {

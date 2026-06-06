@@ -68,7 +68,7 @@ pub struct WalBatch {
 impl WalBatch {
     pub fn encode(&self) -> Result<Vec<u8>> {
         let body = postcard::to_allocvec(self).map_err(|e| Error::Codec(e.to_string()))?;
-        Ok(frame::encode(WAL_MAGIC, WAL_FORMAT_VERSION, &body))
+        frame::encode(WAL_MAGIC, WAL_FORMAT_VERSION, &body)
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
