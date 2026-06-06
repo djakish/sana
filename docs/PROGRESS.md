@@ -12,12 +12,12 @@ the next unchecked task under "Current milestone" / "Next up".
 ## Status snapshot
 
 - **Current stage:** Stage 9 (Object-store operations) — **in progress**.
-- **Next up:** Durable brokered indexing queue and worker claim protocol.
+- **Next up:** Warm-cache planning and an explicit prewarm endpoint.
 - **Done:** Stage 0 (Skeleton), Stage 1 (Durable Documents), Stage 2 (SST/LSM),
   Stage 3 (Attributes & Exact Search), Stage 4 (ANN v0), Stage 5 (Native
   Filtering), Stage 6 (SPFresh local rebuild), Stage 7 (Full-text search),
   Stage 8 (RaBitQ & kernels).
-- **Tests:** `cargo test` green (114 tests); `cargo clippy --all-targets` clean.
+- **Tests:** `cargo test` green (130 tests); `cargo clippy --all-targets` clean.
 - **Note:** post-Stage-2 and Stage-3–5 code-review fixes applied; remaining
   findings tracked under "Stage 2 — code review follow-ups" and "Stages 3–5 —
   code review follow-ups". Recently fixed limitations: Stage 2 ranged
@@ -33,6 +33,9 @@ the next unchecked task under "Current milestone" / "Next up".
   can still enter top-k. Runtime-selected NEON/AVX2 f32 distance kernels now
   accelerate full-precision scoring while preserving the scalar reference;
   4-bit stochastic query packing reduces RaBitQ estimation to AND+popcount.
+  Stage 9 now has a durable global indexing queue with fenced leases,
+  heartbeats, retries, at-least-once workers, brokered group commit, and
+  WAL/manifest reconciliation for missed advisory notifications.
 - **Last updated:** 2026-06-06.
 
 ---
@@ -163,8 +166,12 @@ Known limitations to fix later:
   overlay `(indexed_cursor, commit]`. Dry-run by default (`sana gc`), deletes
   with `--apply`. Assumes single-writer quiescence (D4). A proper concurrent
   sweep would gate deletion on a reader watermark; left as future work.
-- No automatic flush trigger (backpressure on unindexed WAL bytes) — flush is
-  manual via API/CLI. Wire a trigger when the indexing queue lands (Stage 9).
+- ~~No automatic flush trigger.~~ **Done (durable notification queue).** Every
+  committed WAL batch best-effort enqueues its cursor in
+  `jobs/indexing_queue.json`; `sana work-indexing` claims and flushes one job.
+  Queue failure never changes a successful WAL result, and
+  `sana reconcile-indexing` repairs missed notifications by comparing
+  authoritative commit/indexed cursors.
 - `replay` still loads all SSTs fully; fine until namespaces get large.
 
 ---
@@ -742,10 +749,37 @@ operational primitives needed by an object-store-first service.
 
 Planned tasks:
 
-- [ ] Add a durable brokered indexing queue with bounded worker claims/leases.
+- [x] Add a durable brokered indexing queue with bounded worker claims/leases.
 - [ ] Add warm-cache planning and an explicit prewarm endpoint.
 - [ ] Add branch/copy/export operations over immutable manifest generations.
 - [ ] Add namespace pinning/read-replica controls after cache behavior is measured.
+
+Stage 9 decisions / notes:
+
+- **D52 — Queue jobs carry a WAL target and coalesce only while pending.**
+  `jobs/indexing_queue.json` is versioned pretty JSON and remains a notification
+  layer; WAL + manifest are authoritative. Repeated writes advance one pending
+  namespace job to the highest cursor. A write behind an active claim creates a
+  follow-up job, avoiding the lost-wakeup race where the worker flushes an older
+  snapshot and then completes the only notification.
+- **D53 — Leases are fenced by monotonically increasing claim attempts.**
+  Claim/heartbeat/complete/fail are queue-file CAS transitions. One live worker
+  per namespace prevents concurrent manifest publishers; lease expiry allows
+  takeover, and `{job_id, worker_id, attempt}` rejects stale heartbeat or
+  completion after reassignment. Workers heartbeat at one-third of the lease,
+  verify the published manifest reached the target cursor, and retry failures.
+  Repeating a flush after publication but before queue completion is a tested
+  no-op, providing at-least-once execution.
+- **D54 — Queue durability cannot weaken write durability.** WAL commit succeeds
+  independently of queue availability. Post-commit enqueue is best-effort;
+  advisory queue I/O runs after releasing the namespace append lock, so a slow
+  queue does not serialize later WAL commits.
+  `reconcile_unindexed` scans exact namespace manifest pointers, compares
+  `indexed_cursor` with `wal_commit/current`, and broker-enqueues lagging
+  namespaces. `IndexQueueBroker` is stateless and drains buffered mixed
+  operations into one CAS; tests prove 32 pushes in one CAS, per-request error
+  isolation, replacement-broker recovery, and correctness with overlapping
+  brokers.
 
 ---
 
@@ -795,7 +829,7 @@ Decisions I (the implementer) made; the user delegated architectural calls.
 ```
 src/
   lib.rs                 module exports
-  main.rs                CLI (create/upsert/get/delete/list/query/recall/flush/compact/gc/demo)
+  main.rs                CLI (data/query/index maintenance/queue operations)
   error.rs               shared Error / Result
   value.rs               Id, Value, VectorValue, Document
   schema.rs              ScalarType, ColumnType, Schema, ...
@@ -809,8 +843,9 @@ src/
   attr.rs                attribute postings SST encoding/query helpers
   text.rs                tokenizer, BM25 stats/scoring, text postings SST helpers
   query.rs               logical query types + exact/ANN/text/native filtering + recall
-  vector.rs              IVF vector index, version map, native filter bitmaps
+  vector/                 IVF, SIMD kernels, native filters, maintenance
   namespace.rs           Namespace: create/append + SST-aware replay/lookup
+  index_queue.rs          durable queue, group-commit broker, leased worker
   indexer.rs             flush/compaction + attr/text/vector index publication
 tests/
   common/mod.rs          assert_golden snapshot helper

@@ -554,7 +554,7 @@ are authoritative.
 
 MVP: scan namespaces for unindexed WAL and run indexers in a local process.
 
-Target: a single object-store queue file with brokered group commit:
+Implemented core: a single object-store queue file with brokered group commit:
 
 - clients send push/claim/heartbeat/complete requests to a stateless broker;
 - the broker batches changes and CAS-writes `jobs/indexing_queue.json`;
@@ -562,6 +562,14 @@ Target: a single object-store queue file with brokered group commit:
 - workers heartbeat claimed jobs;
 - timed-out jobs are returned to the queue;
 - delivery is at least once, so index jobs must be idempotent.
+
+Each job carries a namespace and target WAL cursor. Pending jobs for one
+namespace coalesce to the highest cursor, but a write arriving behind an active
+claim creates a follow-up notification. Claims are fenced by an incrementing
+attempt number, so a timed-out worker cannot complete a job after takeover.
+Queue publication is best-effort after WAL commit: write durability never
+depends on this advisory file. A reconciliation scan compares each namespace's
+commit and indexed cursors and restores missed notifications.
 
 Index job idempotence comes from deterministic output names or generation CAS:
 if a job sees that its WAL range is already indexed by the current manifest, it

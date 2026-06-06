@@ -29,6 +29,7 @@ async fn main() -> CliResult {
         Some("compact") => compact(&args).await,
         Some("gc") => gc(&args).await,
         Some("maintain-vectors") => maintain_vectors(&args).await,
+        Some("reconcile-indexing") => reconcile_indexing(&args).await,
         Some("work-indexing") => work_indexing(&args).await,
         Some("demo") => demo(&args).await,
         _ => {
@@ -56,6 +57,7 @@ fn usage() {
     eprintln!("  sana compact <dir> <ns>   # merge SSTs, drop tombstones");
     eprintln!("  sana gc      <dir> <ns> [--apply]   # report (or delete) orphaned objects");
     eprintln!("  sana maintain-vectors <dir> <ns>   # run one vector maintenance pass");
+    eprintln!("  sana reconcile-indexing <dir>   # restore missed indexing notifications");
     eprintln!("  sana work-indexing <dir> <worker-id>   # claim and run one indexing job");
     eprintln!("  sana demo    <dir>");
 }
@@ -276,6 +278,19 @@ async fn work_indexing(args: &[String]) -> CliResult {
         ),
         None => println!("no indexing jobs available"),
     }
+    Ok(())
+}
+
+async fn reconcile_indexing(args: &[String]) -> CliResult {
+    let dir = arg(args, 2)?;
+    let report = sana::index_queue::reconcile_unindexed(store(dir)).await?;
+    println!(
+        "scanned {} namespace(s): {} lagging, {} notification(s) added, {} coalesced",
+        report.scanned_namespaces,
+        report.lagging_namespaces,
+        report.notifications_added,
+        report.notifications_coalesced
+    );
     Ok(())
 }
 

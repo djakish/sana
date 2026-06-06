@@ -379,7 +379,7 @@ impl Namespace {
             return Err(Error::InvalidWrite("write batch cannot be empty".into()));
         }
 
-        let _g = self.append_lock.lock().await;
+        let append_guard = self.append_lock.lock().await;
         self.evolve_schema_for_ops(&operations).await?;
 
         let cursor_key = wal_commit_key(&self.name);
@@ -408,6 +408,7 @@ impl Namespace {
                 Bytes::from(encode_cursor(&next)?),
             )
             .await?;
+        drop(append_guard);
 
         // Indexing jobs are advisory. A queue outage must not turn a durable
         // WAL commit into a reported write failure; reconciliation can enqueue

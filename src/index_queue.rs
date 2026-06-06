@@ -82,6 +82,14 @@ pub struct WorkerRun {
     pub did_flush: bool,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReconcileReport {
+    pub scanned_namespaces: usize,
+    pub lagging_namespaces: usize,
+    pub notifications_added: usize,
+    pub notifications_coalesced: usize,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct QueueFile {
     format_version: u32,
@@ -229,6 +237,14 @@ impl QueueFile {
                 return Ok(Mutation::Changed(EnqueueOutcome::Coalesced { job_id }));
             }
             return Ok(Mutation::Unchanged(EnqueueOutcome::Coalesced { job_id }));
+        }
+
+        if let Some(job) = self.jobs.iter().find(|job| {
+            job.namespace == namespace && job.claim.is_some() && job.target_cursor >= target_cursor
+        }) {
+            return Ok(Mutation::Unchanged(EnqueueOutcome::Coalesced {
+                job_id: job.id,
+            }));
         }
 
         let job_id = self.next_job_id;
@@ -708,6 +724,85 @@ fn unexpected_broker_reply(operation: &str) -> Error {
     ))
 }
 
+/// Scan authoritative WAL/manifest state and restore any missed indexing
+/// notifications through a temporary group-commit broker.
+pub async fn reconcile_unindexed(store: Arc<dyn ObjectStore>) -> Result<ReconcileReport> {
+    let broker = IndexQueueBroker::start(store.clone(), 1_024, 256);
+    reconcile_unindexed_with_broker(store, &broker).await
+}
+
+/// Reconcile lagging namespaces through an existing broker.
+pub async fn reconcile_unindexed_with_broker(
+    store: Arc<dyn ObjectStore>,
+    broker: &IndexQueueBroker,
+) -> Result<ReconcileReport> {
+    const POINTER_SUFFIX: &str = "/manifest/current";
+
+    let namespace_names: BTreeSet<String> = store
+        .list("namespaces/")
+        .await?
+        .into_iter()
+        .filter_map(|object| {
+            object
+                .key
+                .strip_prefix("namespaces/")
+                .and_then(|key| key.strip_suffix(POINTER_SUFFIX))
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+        })
+        .collect();
+    let mut report = ReconcileReport {
+        scanned_namespaces: namespace_names.len(),
+        ..ReconcileReport::default()
+    };
+
+    let mut reads = tokio::task::JoinSet::new();
+    for namespace_name in namespace_names {
+        let store = store.clone();
+        reads.spawn(async move {
+            let namespace = Namespace::open(store, &namespace_name).await?;
+            let indexed = namespace.load_manifest().await?.indexed_cursor;
+            // Manifest first, then the monotonic commit cursor: a concurrent
+            // flush may advance the manifest between reads, but it cannot be
+            // ahead of a commit cursor captured afterward.
+            let commit = namespace.commit_cursor().await?;
+            Ok::<_, Error>((namespace_name, commit, indexed))
+        });
+    }
+
+    let mut lagging = Vec::new();
+    while let Some(result) = reads.join_next().await {
+        let (namespace, commit, indexed) =
+            result.map_err(|error| Error::Corrupt(format!("reconcile join error: {error}")))??;
+        if indexed.is_some_and(|cursor| cursor > commit) {
+            return Err(Error::Corrupt(format!(
+                "namespace {namespace:?} indexed cursor {indexed:?} is ahead of commit {commit:?}"
+            )));
+        }
+        let indexed = indexed.unwrap_or_else(|| WalCursor::new(commit.epoch, 0));
+        if indexed < commit {
+            lagging.push((namespace, commit));
+        }
+    }
+    report.lagging_namespaces = lagging.len();
+
+    let mut enqueues = tokio::task::JoinSet::new();
+    for (namespace, commit) in lagging {
+        let broker = broker.clone();
+        enqueues.spawn(async move { broker.enqueue(&namespace, commit).await });
+    }
+    while let Some(result) = enqueues.join_next().await {
+        let outcome =
+            result.map_err(|error| Error::Corrupt(format!("reconcile join error: {error}")))??;
+        match outcome {
+            EnqueueOutcome::Added { .. } => report.notifications_added += 1,
+            EnqueueOutcome::Coalesced { .. } => report.notifications_coalesced += 1,
+        }
+    }
+
+    Ok(report)
+}
+
 /// Claim and execute at most one indexing notification.
 ///
 /// The worker heartbeats while the indexer runs. Successful work is completed
@@ -807,6 +902,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use async_trait::async_trait;
+    use tokio::sync::{Notify, Semaphore};
 
     use super::*;
     use crate::object_store::{FsObjectStore, GetResult, ObjectMeta, ObjectVersion};
@@ -815,6 +911,10 @@ mod tests {
     struct CountingStore {
         inner: Arc<dyn ObjectStore>,
         queue_cas_count: AtomicUsize,
+        fail_queue: bool,
+        queue_gate: Option<Arc<Semaphore>>,
+        queue_get_count: AtomicUsize,
+        queue_get_entered: Notify,
     }
 
     impl CountingStore {
@@ -822,25 +922,86 @@ mod tests {
             Self {
                 inner,
                 queue_cas_count: AtomicUsize::new(0),
+                fail_queue: false,
+                queue_gate: None,
+                queue_get_count: AtomicUsize::new(0),
+                queue_get_entered: Notify::new(),
             }
+        }
+
+        fn failing_queue(inner: Arc<dyn ObjectStore>) -> Self {
+            Self {
+                inner,
+                queue_cas_count: AtomicUsize::new(0),
+                fail_queue: true,
+                queue_gate: None,
+                queue_get_count: AtomicUsize::new(0),
+                queue_get_entered: Notify::new(),
+            }
+        }
+
+        fn blocking_queue(inner: Arc<dyn ObjectStore>, gate: Arc<Semaphore>) -> Self {
+            Self {
+                inner,
+                queue_cas_count: AtomicUsize::new(0),
+                fail_queue: false,
+                queue_gate: Some(gate),
+                queue_get_count: AtomicUsize::new(0),
+                queue_get_entered: Notify::new(),
+            }
+        }
+
+        async fn wait_for_queue_gets(&self, expected: usize) {
+            loop {
+                let notified = self.queue_get_entered.notified();
+                if self.queue_get_count.load(Ordering::Acquire) >= expected {
+                    return;
+                }
+                notified.await;
+            }
+        }
+
+        fn reject_queue(&self, key: &str) -> Result<()> {
+            if self.fail_queue && key == INDEX_QUEUE_KEY {
+                return Err(Error::Io(std::io::Error::other(
+                    "injected indexing queue outage",
+                )));
+            }
+            Ok(())
         }
     }
 
     #[async_trait]
     impl ObjectStore for CountingStore {
         async fn get(&self, key: &str) -> Result<GetResult> {
+            self.reject_queue(key)?;
+            if key == INDEX_QUEUE_KEY
+                && let Some(gate) = &self.queue_gate
+            {
+                let get_number = self.queue_get_count.fetch_add(1, Ordering::Release) + 1;
+                self.queue_get_entered.notify_waiters();
+                if get_number <= 2 {
+                    gate.acquire()
+                        .await
+                        .expect("queue gate remains open")
+                        .forget();
+                }
+            }
             self.inner.get(key).await
         }
 
         async fn get_range(&self, key: &str, range: Range<u64>) -> Result<Bytes> {
+            self.reject_queue(key)?;
             self.inner.get_range(key, range).await
         }
 
         async fn put(&self, key: &str, bytes: Bytes) -> Result<ObjectVersion> {
+            self.reject_queue(key)?;
             self.inner.put(key, bytes).await
         }
 
         async fn put_if_absent(&self, key: &str, bytes: Bytes) -> Result<ObjectVersion> {
+            self.reject_queue(key)?;
             self.inner.put_if_absent(key, bytes).await
         }
 
@@ -850,6 +1011,7 @@ mod tests {
             expected: ObjectVersion,
             bytes: Bytes,
         ) -> Result<ObjectVersion> {
+            self.reject_queue(key)?;
             if key == INDEX_QUEUE_KEY {
                 self.queue_cas_count.fetch_add(1, Ordering::Relaxed);
             }
@@ -861,6 +1023,7 @@ mod tests {
         }
 
         async fn delete(&self, key: &str) -> Result<()> {
+            self.reject_queue(key)?;
             self.inner.delete(key).await
         }
     }
@@ -902,6 +1065,28 @@ mod tests {
         assert_eq!(jobs.len(), 2);
         assert!(jobs[0].claim.is_some());
         assert!(jobs[1].claim.is_none());
+    }
+
+    #[tokio::test]
+    async fn late_notification_coalesces_when_active_target_already_covers_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = queue(&dir);
+        queue
+            .enqueue_at("alpha", WalCursor::new(0, 2), 10)
+            .await
+            .unwrap();
+        let active = queue.claim_at("worker", 100, 20).await.unwrap().unwrap();
+
+        assert_eq!(
+            queue
+                .enqueue_at("alpha", WalCursor::new(0, 1), 30)
+                .await
+                .unwrap(),
+            EnqueueOutcome::Coalesced {
+                job_id: active.job.id
+            }
+        );
+        assert_eq!(queue.jobs().await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -1185,5 +1370,83 @@ mod tests {
         assert_eq!(jobs.len(), 32);
         let namespaces: BTreeSet<&str> = jobs.iter().map(|job| job.namespace.as_str()).collect();
         assert_eq!(namespaces.len(), 32);
+    }
+
+    #[tokio::test]
+    async fn reconciliation_restores_only_lagging_namespace_notifications() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(FsObjectStore::new(dir.path()));
+        let alpha = Namespace::create(store.clone(), "alpha").await.unwrap();
+        let beta = Namespace::create(store.clone(), "beta").await.unwrap();
+        let alpha_target = alpha.upsert(Document::new(Id::U64(1))).await.unwrap();
+        beta.upsert(Document::new(Id::U64(2))).await.unwrap();
+        assert!(indexer::flush(&beta).await.unwrap());
+
+        store.delete(INDEX_QUEUE_KEY).await.unwrap();
+        let report = reconcile_unindexed(store.clone()).await.unwrap();
+        assert_eq!(
+            report,
+            ReconcileReport {
+                scanned_namespaces: 2,
+                lagging_namespaces: 1,
+                notifications_added: 1,
+                notifications_coalesced: 0,
+            }
+        );
+        let jobs = IndexQueue::new(store.clone()).jobs().await.unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].namespace, "alpha");
+        assert_eq!(jobs[0].target_cursor, alpha_target);
+
+        let repeated = reconcile_unindexed(store).await.unwrap();
+        assert_eq!(repeated.lagging_namespaces, 1);
+        assert_eq!(repeated.notifications_added, 0);
+        assert_eq!(repeated.notifications_coalesced, 1);
+    }
+
+    #[tokio::test]
+    async fn queue_outage_does_not_fail_a_durable_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner: Arc<dyn ObjectStore> = Arc::new(FsObjectStore::new(dir.path()));
+        let failing: Arc<dyn ObjectStore> = Arc::new(CountingStore::failing_queue(inner.clone()));
+        let namespace = Namespace::create(failing, "alpha").await.unwrap();
+
+        let target = namespace.upsert(Document::new(Id::U64(1))).await.unwrap();
+        assert_eq!(namespace.commit_cursor().await.unwrap(), target);
+        assert!(namespace.lookup(&Id::U64(1)).await.unwrap().is_some());
+        assert!(matches!(
+            inner.get(INDEX_QUEUE_KEY).await,
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn advisory_queue_io_does_not_hold_the_namespace_append_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner: Arc<dyn ObjectStore> = Arc::new(FsObjectStore::new(dir.path()));
+        let gate = Arc::new(Semaphore::new(0));
+        let blocking = Arc::new(CountingStore::blocking_queue(inner, gate.clone()));
+        let store: Arc<dyn ObjectStore> = blocking.clone();
+        let namespace = Arc::new(Namespace::create(store, "alpha").await.unwrap());
+
+        let first_namespace = namespace.clone();
+        let first =
+            tokio::spawn(async move { first_namespace.upsert(Document::new(Id::U64(1))).await });
+        blocking.wait_for_queue_gets(1).await;
+
+        let second_namespace = namespace.clone();
+        let second =
+            tokio::spawn(async move { second_namespace.upsert(Document::new(Id::U64(2))).await });
+        tokio::time::timeout(Duration::from_secs(1), blocking.wait_for_queue_gets(2))
+            .await
+            .expect("second append should commit before first queue notification finishes");
+
+        gate.add_permits(2);
+        assert_eq!(first.await.unwrap().unwrap(), WalCursor::new(0, 1));
+        assert_eq!(second.await.unwrap().unwrap(), WalCursor::new(0, 2));
+        assert_eq!(
+            namespace.commit_cursor().await.unwrap(),
+            WalCursor::new(0, 2)
+        );
     }
 }
