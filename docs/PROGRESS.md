@@ -12,11 +12,11 @@ the next unchecked task under "Current milestone" / "Next up".
 ## Status snapshot
 
 - **Current stage:** Stage 8 (RaBitQ & kernels) — **in progress**.
-- **Next up:** Quantized query path and error-bound rerank selection.
+- **Next up:** SIMD kernels with runtime feature detection.
 - **Done:** Stage 0 (Skeleton), Stage 1 (Durable Documents), Stage 2 (SST/LSM),
   Stage 3 (Attributes & Exact Search), Stage 4 (ANN v0), Stage 5 (Native
   Filtering), Stage 6 (SPFresh local rebuild), Stage 7 (Full-text search).
-- **Tests:** `cargo test` green (109 tests); `cargo clippy --all-targets` clean.
+- **Tests:** `cargo test` green (110 tests); `cargo clippy --all-targets` clean.
 - **Note:** post-Stage-2 and Stage-3–5 code-review fixes applied; remaining
   findings tracked under "Stage 2 — code review follow-ups" and "Stages 3–5 —
   code review follow-ups". Recently fixed limitations: Stage 2 ranged
@@ -26,9 +26,10 @@ the next unchecked task under "Current milestone" / "Next up".
   read path fetches append deltas concurrently; Stage 7 now has tokenizer,
   block-shaped full-snapshot text postings, BM25 query support, rank-safe
   batched block MAXSCORE top-k, and consistent-snapshot multi-query for hybrid
-  retrieval. Stage 8 has started with portable scalar batch distance kernels
-  wired into exact and ANN vector scoring, plus a faithful, recall-tested RaBitQ
-  residual quantizer + L2 estimator in its own `src/rabitq.rs` module.
+  retrieval. Stage 8 now has portable scalar batch distance kernels plus a
+  faithful, persisted RaBitQ companion per vector segment; L2 ANN scans codes,
+  applies the paper's confidence bound, and exact-reranks only candidates that
+  can still enter top-k.
 - **Last updated:** 2026-06-06.
 
 ---
@@ -647,7 +648,7 @@ Planned tasks:
 - [x] Add portable scalar batch distance kernels for L2, dot, and cosine.
 - [x] Add per-cluster RaBitQ code generation (faithful: rotation + estimator).
 - [x] Add portable bitwise RaBitQ L2 estimator (unbiased, recall-tested).
-- [ ] Persist a RaBitQ object and wire the quantized query path + rerank.
+- [x] Persist a RaBitQ object and wire the quantized query path + rerank.
 - [ ] Add SIMD kernels with feature detection.
 - [ ] Benchmark cache/memory/CPU bottlenecks.
 
@@ -659,11 +660,11 @@ Stage 8 decisions / notes:
   exact query scoring and ANN centroid/posting scans share one batch scoring
   API. RaBitQ can add code-oriented kernels behind this boundary without
   changing query semantics.
-- **D45 — RaBitQ code generation is separate from index persistence.** Stage 8
-  builds `RabitqIndex` values from an in-memory `VectorIndex` and leaves the
-  vector SST format unchanged until the quantized query path proves the object
-  layout. `RabitqIndex` is therefore not serialized, which let D46 reshape the
-  code without touching any on-disk fixture.
+- **D45 — RaBitQ persistence is a separate companion object.** Stage 8 first
+  proved `RabitqIndex` in memory, then kept the IVF object format unchanged and
+  added a separately framed `.rabitq.bin` object per base/append/maintenance
+  segment. Manifest fields are optional for backward compatibility; old
+  manifests take the exact posting path.
 - **D46 — RaBitQ is faithful to the paper, in its own module.** The first cut
   was a placeholder: a per-dimension sign flip (recoverable, so it decorrelated
   nothing) with no normalization, no correction factor, and no estimator — bits
@@ -673,7 +674,7 @@ Stage 8 decisions / notes:
   `‖o − c‖` plus the correction factor `⟨ō_q, ō'⟩`. The unbiased estimator
   `⟨ō, q_r⟩ ≈ ⟨ō_q, q'⟩ / ⟨ō_q, ō'⟩` yields an L2 distance whose ranking is
   recall-tested against exact L2. Scope is L2 (RaBitQ's design metric); dot and
-  cosine, plus the persisted query path, remain follow-ups. Extracting it out of
+  cosine remain exact posting scans. Extracting it out of
   the 1.5k-line `vector.rs` is the first step of splitting that module along its
   natural seams (filter bitmaps and maintenance are the next candidates).
 - **D47 — One framed-object envelope (`src/frame.rs`).** The 20-byte header
@@ -694,6 +695,16 @@ Stage 8 decisions / notes:
   only `VectorFilterIndex::build`, which the parent's `assemble_index` calls,
   needed `pub(super)`. Public paths (`sana::vector::*`) are preserved by
   re-exports.
+- **D49 — Quantized pruning happens after liveness, before local top-k.** Every
+  published vector segment gets a framed RaBitQ companion because query-time L2
+  may override the cosine clustering metric. L2 queries fetch each IVF/companion
+  pair concurrently across base and append segments; cosine/dot skip companion
+  reads. Native filter masks, the vector version map, and WAL-shadowed IDs are
+  applied before estimate sorting so stale rows cannot consume a segment's
+  local top-k. Candidates are ordered by the unbiased estimate, pruned only when
+  their Equation-14 lower bound exceeds the current exact kth distance, and
+  surviving rows are exact-reranked. Companion bytes count toward logical size
+  and remain live through maintenance, compaction, and GC.
 
 ---
 

@@ -16,17 +16,25 @@
 //! for the paper's dense random orthogonal matrix.
 //!
 //! Query time uses the unbiased estimator `⟨ō, q_r⟩ ≈ ⟨ō_q, q'⟩ / ⟨ō_q, ō'⟩`
-//! (`q' = P·q_r`), from which the L2 distance follows. The estimator is built
-//! and tested here but not yet wired into the persisted query path; that is the
-//! next step (it needs an on-disk RaBitQ object and manifest entry).
+//! (`q' = P·q_r`), from which the L2 distance follows. Quantization itself only
+//! needs the segment's centroids, so it also supports an L2 query override over
+//! a segment whose clustering metric is cosine.
+
+use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::frame;
 use crate::schema::DistanceMetric;
 use crate::value::Id;
-use crate::vector::VectorIndex;
+use crate::vector::{VectorFilterMask, VectorHit, VectorIndex, score, sort_hits};
 
-#[derive(Clone, Debug, PartialEq)]
+const RABITQ_MAGIC: &[u8; 8] = b"SANARBT1";
+const RABITQ_FORMAT_VERSION: u32 = 1;
+const DEFAULT_EPSILON: f32 = 1.9;
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RabitqIndex {
+    pub format_version: u32,
     pub column: String,
     pub dim: usize,
     pub padded_dim: usize,
@@ -34,14 +42,14 @@ pub struct RabitqIndex {
     pub clusters: Vec<RabitqCluster>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RabitqCluster {
     pub centroid_id: u32,
     pub transform_seed: u64,
     pub codes: Vec<RabitqCode>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RabitqCode {
     pub id: Id,
     pub local_id: u32,
@@ -60,6 +68,19 @@ pub struct RabitqCode {
 pub struct RotatedQuery {
     rotated: Vec<f32>,
     residual_norm_sq: f32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RabitqSearchStats {
+    pub estimated: u64,
+    pub reranked: u64,
+    pub pruned: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RabitqSearchOutcome {
+    pub hits: Vec<VectorHit>,
+    pub stats: RabitqSearchStats,
 }
 
 /// Quantize every posting of `index` into RaBitQ codes, one cluster per posting.
@@ -97,12 +118,168 @@ pub fn build_index(index: &VectorIndex) -> Result<RabitqIndex> {
         });
     }
     Ok(RabitqIndex {
+        format_version: RABITQ_FORMAT_VERSION,
         column: index.column.clone(),
         dim: index.dim,
         padded_dim,
-        metric: index.metric,
+        metric: DistanceMetric::L2,
         clusters,
     })
+}
+
+impl RabitqIndex {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let body = postcard::to_allocvec(self).map_err(|e| Error::Codec(e.to_string()))?;
+        Ok(frame::encode(RABITQ_MAGIC, RABITQ_FORMAT_VERSION, &body))
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let body = frame::decode(bytes, RABITQ_MAGIC, RABITQ_FORMAT_VERSION, "RaBitQ index")?;
+        let index: Self = postcard::from_bytes(body).map_err(|e| Error::Codec(e.to_string()))?;
+        if index.format_version != RABITQ_FORMAT_VERSION {
+            return Err(Error::Corrupt(format!(
+                "unsupported RaBitQ body version {}",
+                index.format_version
+            )));
+        }
+        if index.padded_dim < index.dim || !index.padded_dim.is_power_of_two() {
+            return Err(Error::Corrupt("invalid RaBitQ padded dimension".into()));
+        }
+        if index.metric != DistanceMetric::L2 || index.clusters.is_empty() {
+            return Err(Error::Corrupt("invalid RaBitQ index topology".into()));
+        }
+        let code_words = index.padded_dim.div_ceil(64);
+        for (cluster_id, cluster) in index.clusters.iter().enumerate() {
+            if cluster.centroid_id as usize != cluster_id {
+                return Err(Error::Corrupt(
+                    "RaBitQ cluster ids are not contiguous".into(),
+                ));
+            }
+            for code in &cluster.codes {
+                if code.code_words.len() != code_words
+                    || !code.residual_norm.is_finite()
+                    || code.residual_norm < 0.0
+                    || !code.dot_code.is_finite()
+                    || code.dot_code < 0.0
+                    || code.dot_code > 1.0 + 1e-5
+                {
+                    return Err(Error::Corrupt("invalid RaBitQ code".into()));
+                }
+            }
+        }
+        Ok(index)
+    }
+
+    /// Estimate every eligible vector in the probed clusters, then exact-rerank
+    /// only candidates whose confidence lower bound can enter this segment's
+    /// top-k. `accept` excludes stale versions and WAL-shadowed ids before rank
+    /// pruning, which is required for local top-k to remain globally safe.
+    pub fn search_l2_with_filter(
+        &self,
+        index: &VectorIndex,
+        query: &[f32],
+        k: usize,
+        probes: Option<usize>,
+        filter: Option<&VectorFilterMask>,
+        mut accept: impl FnMut(&Id, u64) -> bool,
+    ) -> Result<RabitqSearchOutcome> {
+        validate_search(self, index, query, k)?;
+        let probe_count = probes
+            .unwrap_or_else(|| index.centroids.len().min(4))
+            .clamp(1, index.centroids.len());
+
+        let mut centroid_distances = index
+            .centroids
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| filter.is_none_or(|mask| mask.cluster_has_any(*idx)))
+            .map(|(idx, centroid)| Ok((idx, -score(query, centroid, DistanceMetric::L2)?)))
+            .collect::<Result<Vec<_>>>()?;
+        centroid_distances.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+
+        let mut candidates = Vec::new();
+        for (centroid_id, _) in centroid_distances.into_iter().take(probe_count) {
+            let posting = index
+                .postings
+                .get(centroid_id)
+                .ok_or_else(|| Error::Corrupt("vector posting id out of bounds".into()))?;
+            let cluster = self
+                .clusters
+                .get(centroid_id)
+                .ok_or_else(|| Error::Corrupt("RaBitQ cluster id out of bounds".into()))?;
+            if cluster.centroid_id as usize != centroid_id
+                || cluster.codes.len() != posting.vectors.len()
+            {
+                return Err(Error::Corrupt(
+                    "RaBitQ topology does not match vector posting".into(),
+                ));
+            }
+            let centroid = &index.centroids[centroid_id];
+            let residual = query
+                .iter()
+                .zip(centroid)
+                .map(|(q, c)| q - c)
+                .collect::<Vec<_>>();
+            let rotated = cluster.rotate_query(&residual, self.padded_dim);
+
+            for (entry, code) in posting.vectors.iter().zip(&cluster.codes) {
+                if code.id != entry.id
+                    || code.local_id != entry.local_id
+                    || code.version != entry.version
+                {
+                    return Err(Error::Corrupt(
+                        "RaBitQ code does not match vector entry".into(),
+                    ));
+                }
+                if filter.is_some_and(|mask| !mask.allows(centroid_id, entry.local_id as usize))
+                    || !accept(&entry.id, entry.version)
+                {
+                    continue;
+                }
+                let (estimate, radius) =
+                    code.estimate_l2_sq_with_error(&rotated, self.padded_dim, DEFAULT_EPSILON);
+                candidates.push(EstimatedCandidate {
+                    entry,
+                    estimate,
+                    lower_bound: (estimate - radius).max(0.0),
+                });
+            }
+        }
+
+        candidates.sort_by(|a, b| {
+            a.estimate
+                .total_cmp(&b.estimate)
+                .then_with(|| a.entry.id.cmp(&b.entry.id))
+        });
+        let mut hits: Vec<VectorHit> = Vec::with_capacity(k.min(candidates.len()));
+        let mut stats = RabitqSearchStats {
+            estimated: candidates.len() as u64,
+            ..Default::default()
+        };
+        for candidate in candidates {
+            let threshold =
+                (hits.len() == k).then(|| -hits.last().expect("full top-k has a tail").score);
+            if threshold.is_some_and(|distance| candidate.lower_bound > distance) {
+                stats.pruned += 1;
+                continue;
+            }
+            hits.push(VectorHit {
+                id: candidate.entry.id.clone(),
+                version: candidate.entry.version,
+                score: score(query, &candidate.entry.vector, DistanceMetric::L2)?,
+            });
+            stats.reranked += 1;
+            sort_hits(&mut hits);
+            hits.truncate(k);
+        }
+        Ok(RabitqSearchOutcome { hits, stats })
+    }
+}
+
+struct EstimatedCandidate<'a> {
+    entry: &'a crate::vector::VectorEntry,
+    estimate: f32,
+    lower_bound: f32,
 }
 
 impl RabitqCluster {
@@ -134,6 +311,29 @@ impl RabitqCode {
         est.max(0.0)
     }
 
+    /// Return the squared-distance estimate and its high-probability absolute
+    /// error radius from Equation 14 of the RaBitQ paper.
+    pub fn estimate_l2_sq_with_error(
+        &self,
+        query: &RotatedQuery,
+        padded_dim: usize,
+        epsilon: f32,
+    ) -> (f32, f32) {
+        let estimate = self.estimate_l2_sq(query);
+        if self.residual_norm == 0.0
+            || self.dot_code == 0.0
+            || padded_dim <= 1
+            || query.residual_norm_sq == 0.0
+        {
+            return (estimate, 0.0);
+        }
+        let dot_sq = self.dot_code * self.dot_code;
+        let ratio = ((1.0 - dot_sq).max(0.0) / dot_sq).sqrt();
+        let inner_radius =
+            query.residual_norm_sq.sqrt() * ratio * epsilon / ((padded_dim - 1) as f32).sqrt();
+        (estimate, 2.0 * self.residual_norm * inner_radius)
+    }
+
     /// `⟨ō_q, q'⟩ = (1/√n) Σ sign(ō'ᵢ)·q'ᵢ`, read straight off the sign bits.
     fn code_dot(&self, rotated_query: &[f32]) -> f32 {
         let mut acc = 0.0f32;
@@ -143,6 +343,35 @@ impl RabitqCode {
         }
         acc / (rotated_query.len() as f32).sqrt()
     }
+}
+
+fn validate_search(
+    quantized: &RabitqIndex,
+    index: &VectorIndex,
+    query: &[f32],
+    k: usize,
+) -> Result<()> {
+    if k == 0 {
+        return Err(Error::InvalidQuery(
+            "RaBitQ query k must be greater than zero".into(),
+        ));
+    }
+    if quantized.metric != DistanceMetric::L2
+        || quantized.column != index.column
+        || quantized.dim != index.dim
+        || quantized.clusters.len() != index.postings.len()
+    {
+        return Err(Error::Corrupt(
+            "RaBitQ index does not match its L2 vector segment".into(),
+        ));
+    }
+    if query.len() != index.dim || query.iter().any(|value| !value.is_finite()) {
+        return Err(Error::InvalidQuery(format!(
+            "RaBitQ query vector has invalid dimension or values for dim {}",
+            index.dim
+        )));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

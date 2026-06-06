@@ -8,6 +8,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -16,6 +17,8 @@ use crate::doc::encode_id;
 use crate::error::{Error, Result};
 use crate::manifest::{NamespaceManifest, VectorIndexMeta};
 use crate::namespace::{Namespace, op_id};
+use crate::object_store::ObjectStore;
+use crate::rabitq::RabitqIndex;
 use crate::schema::{ColumnType, DistanceMetric};
 use crate::text::{self, Bm25Params};
 use crate::value::{Document, Id, Value, compare_scalars, scalar_eq};
@@ -570,6 +573,18 @@ async fn execute_ann_vector(
             query.vector.len()
         )));
     }
+    if query.k == 0 {
+        return Err(Error::InvalidQuery(
+            "ANN query k must be greater than zero".into(),
+        ));
+    }
+    let segment_k = keep_count(query.k, limit);
+    if segment_k == 0 {
+        return Ok(QueryResult {
+            rows: Vec::new(),
+            aggregates: Vec::new(),
+        });
+    }
     let metric = query.metric.unwrap_or(default_metric);
     let plan = VectorPlan { metric, dim };
 
@@ -578,19 +593,18 @@ async fn execute_ann_vector(
             .await;
     };
 
-    // Search the base index plus every append delta. The delta keys are known up
-    // front, so prefetch them concurrently (mirroring `read_overlay_ops`) rather
-    // than a round trip per delta; decode and search stay sequential.
-    let index_bytes = ns.store().get(&meta.key).await?.bytes;
-    let mut segments = vec![VectorIndex::decode(&index_bytes)?];
-    for bytes in fetch_append_indexes(ns, meta).await? {
-        segments.push(VectorIndex::decode(&bytes)?);
-    }
+    // Search the base index plus every append delta. New segments have a
+    // separately framed RaBitQ companion, fetched only for L2; old manifests
+    // and other metrics simply take the exact segment path.
+    let load_rabitq = metric == DistanceMetric::L2;
+    let segments = fetch_vector_segments(ns, meta, load_rabitq).await?;
     let version_map = load_vector_version_map(ns, meta).await?;
+    let overlay = ns.read_overlay_ops(manifest.indexed_cursor, commit).await?;
+    let touched: BTreeSet<Id> = overlay.iter().map(|op| op_id(op).clone()).collect();
 
     let mut ann_hits = Vec::new();
     for segment in &segments {
-        let mask = match plan_native_filter(segment, filter)? {
+        let mask = match plan_native_filter(&segment.index, filter)? {
             NativeFilter::Mask(mask) => mask,
             NativeFilter::Fallback => {
                 return exact_vector_fallback(
@@ -605,17 +619,36 @@ async fn execute_ann_vector(
                 .await;
             }
         };
-        ann_hits.extend(segment.search_with_filter(
-            &query.vector,
-            usize::MAX,
-            query.probes,
-            Some(metric),
-            mask.as_ref(),
-        )?);
+        if metric == DistanceMetric::L2
+            && let Some(quantized) = &segment.rabitq
+        {
+            ann_hits.extend(
+                quantized
+                    .search_l2_with_filter(
+                        &segment.index,
+                        &query.vector,
+                        segment_k,
+                        query.probes,
+                        mask.as_ref(),
+                        |id, version| {
+                            !touched.contains(id)
+                                && version_map
+                                    .as_ref()
+                                    .is_none_or(|versions| versions.is_live(id, version))
+                        },
+                    )?
+                    .hits,
+            );
+        } else {
+            ann_hits.extend(segment.index.search_with_filter(
+                &query.vector,
+                usize::MAX,
+                query.probes,
+                Some(metric),
+                mask.as_ref(),
+            )?);
+        }
     }
-
-    let overlay = ns.read_overlay_ops(manifest.indexed_cursor, commit).await?;
-    let touched: BTreeSet<Id> = overlay.iter().map(|op| op_id(op).clone()).collect();
 
     // The documents we need: live ANN hits (not superseded by the overlay) plus
     // every overlay-touched id, resolved in one SST pass rather than per id.
@@ -681,32 +714,74 @@ async fn execute_ann_vector(
     })
 }
 
-/// Fetch every append-delta index object for a vector column concurrently,
-/// returning their bytes in `append_indexes` order. The keys are all known from
-/// the manifest, so the GETs need not be serialized.
-async fn fetch_append_indexes(ns: &Namespace, meta: &VectorIndexMeta) -> Result<Vec<bytes::Bytes>> {
-    if meta.append_indexes.is_empty() {
-        return Ok(Vec::new());
-    }
+struct LoadedVectorSegment {
+    index: VectorIndex,
+    rabitq: Option<RabitqIndex>,
+}
+
+async fn load_vector_segment(
+    store: &Arc<dyn ObjectStore>,
+    index_key: &str,
+    rabitq_key: Option<&str>,
+) -> Result<LoadedVectorSegment> {
+    let index_get = store.get(index_key);
+    let rabitq_get = async {
+        let bytes: Result<Option<bytes::Bytes>> = match rabitq_key {
+            Some(key) => Ok(Some(store.get(key).await?.bytes)),
+            None => Ok(None),
+        };
+        bytes
+    };
+    let (index_bytes, rabitq_bytes) = tokio::join!(index_get, rabitq_get);
+    Ok(LoadedVectorSegment {
+        index: VectorIndex::decode(&index_bytes?.bytes)?,
+        rabitq: rabitq_bytes?
+            .map(|bytes| RabitqIndex::decode(&bytes))
+            .transpose()?,
+    })
+}
+
+/// Fetch the base and every append-delta segment concurrently, preserving
+/// manifest order.
+async fn fetch_vector_segments(
+    ns: &Namespace,
+    meta: &VectorIndexMeta,
+    load_rabitq: bool,
+) -> Result<Vec<LoadedVectorSegment>> {
     let mut set = tokio::task::JoinSet::new();
+    let store = ns.store().clone();
+    let index_key = meta.key.clone();
+    let rabitq_key = load_rabitq.then_some(meta.rabitq_key.clone()).flatten();
+    set.spawn(async move {
+        Ok::<(usize, LoadedVectorSegment), Error>((
+            0,
+            load_vector_segment(&store, &index_key, rabitq_key.as_deref()).await?,
+        ))
+    });
     for (idx, append_meta) in meta.append_indexes.iter().enumerate() {
         let store = ns.store().clone();
-        let key = append_meta.key.clone();
+        let index_key = append_meta.key.clone();
+        let rabitq_key = load_rabitq
+            .then_some(append_meta.rabitq_key.clone())
+            .flatten();
         set.spawn(async move {
-            Ok::<(usize, bytes::Bytes), Error>((idx, store.get(&key).await?.bytes))
+            Ok::<(usize, LoadedVectorSegment), Error>((
+                idx + 1,
+                load_vector_segment(&store, &index_key, rabitq_key.as_deref()).await?,
+            ))
         });
     }
 
-    let mut slots: Vec<Option<bytes::Bytes>> =
-        (0..meta.append_indexes.len()).map(|_| None).collect();
+    let mut slots: Vec<Option<LoadedVectorSegment>> =
+        (0..=meta.append_indexes.len()).map(|_| None).collect();
     while let Some(res) = set.join_next().await {
-        let (idx, bytes) =
-            res.map_err(|e| Error::Corrupt(format!("append index join error: {e}")))??;
-        slots[idx] = Some(bytes);
+        let (idx, segment) =
+            res.map_err(|e| Error::Corrupt(format!("vector segment join error: {e}")))??;
+        slots[idx] = Some(segment);
     }
     Ok(slots
         .into_iter()
-        .map(|slot| slot.expect("every append slot is filled exactly once"))
+        .map(|slot| slot.expect("every vector segment slot is filled exactly once"))
         .collect())
 }
 

@@ -89,6 +89,13 @@ fn rabitq_code_generation_packs_cluster_residual_bits() {
     };
 
     let rabitq = sana::rabitq::build_index(&index).unwrap();
+    assert_eq!(
+        sana::rabitq::RabitqIndex::decode(&rabitq.encode().unwrap()).unwrap(),
+        rabitq
+    );
+    let mut malformed = rabitq.clone();
+    malformed.clusters[0].codes[0].code_words.clear();
+    assert!(sana::rabitq::RabitqIndex::decode(&malformed.encode().unwrap()).is_err());
     assert_eq!(rabitq.column, "embedding");
     assert_eq!(rabitq.dim, dim);
     assert_eq!(rabitq.padded_dim, 128); // dim 70 rounded up to a power of two
@@ -186,6 +193,31 @@ fn rabitq_estimate_recovers_nearest_neighbours() {
     assert!(
         hits as f64 / top_k as f64 >= 0.6,
         "RaBitQ recall@{top_k} too low: {hits}/{top_k}"
+    );
+
+    let reranked = rabitq
+        .search_l2_with_filter(
+            &index,
+            &query,
+            top_k,
+            Some(index.centroids.len()),
+            None,
+            |_, _| true,
+        )
+        .unwrap();
+    let reranked_ids = reranked
+        .hits
+        .iter()
+        .map(|hit| hit.id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(reranked_ids, truth);
+    assert_eq!(
+        reranked.stats.estimated,
+        reranked.stats.reranked + reranked.stats.pruned
+    );
+    assert!(
+        reranked.stats.pruned > 0,
+        "confidence bounds should avoid at least one exact rerank"
     );
 }
 

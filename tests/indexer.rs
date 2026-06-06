@@ -10,6 +10,7 @@ use sana::manifest::{
 use sana::namespace::Namespace;
 use sana::object_store::{FsObjectStore, ObjectStore};
 use sana::query::{ApproxVectorQuery, FilterExpr, Query};
+use sana::rabitq::RabitqIndex;
 use sana::schema::DistanceMetric;
 use sana::value::{Document, Id, Value, VectorValue};
 use sana::vector::{VectorIndex, VectorVersionMap};
@@ -41,10 +42,11 @@ fn indexed_bytes(manifest: &sana::manifest::NamespaceManifest) -> u64 {
             .values()
             .map(|m| {
                 m.size_bytes
+                    + m.rabitq_size_bytes
                     + m.version_map_size_bytes
                     + m.append_indexes
                         .iter()
-                        .map(|append| append.size_bytes)
+                        .map(|append| append.size_bytes + append.rabitq_size_bytes)
                         .sum::<u64>()
             })
             .sum::<u64>()
@@ -162,6 +164,7 @@ async fn flush_publishes_vector_indexes() {
     assert_eq!(meta.dim, 2);
     assert!(meta.centroid_count >= 1);
     assert!(meta.append_indexes.is_empty());
+    assert!(meta.rabitq_size_bytes > 0);
     assert_eq!(
         manifest.vector_index_generations["embedding"],
         manifest.generation
@@ -169,7 +172,23 @@ async fn flush_publishes_vector_indexes() {
     assert_eq!(manifest.approx_logical_bytes, indexed_bytes(&manifest));
 
     let index = VectorIndex::decode(&object_store.get(&meta.key).await.unwrap().bytes).unwrap();
+    let rabitq = RabitqIndex::decode(
+        &object_store
+            .get(meta.rabitq_key.as_ref().unwrap())
+            .await
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
     assert_eq!(index.addresses.len(), 2);
+    assert_eq!(
+        rabitq
+            .clusters
+            .iter()
+            .map(|cluster| cluster.codes.len())
+            .sum::<usize>(),
+        2
+    );
     assert!(
         index
             .addresses
@@ -248,6 +267,7 @@ async fn second_flush_publishes_vector_append_delta() {
     let meta = manifest.vector_indexes.get("embedding").unwrap();
     assert_eq!(meta.key, first_meta.key);
     assert_eq!(meta.size_bytes, first_meta.size_bytes);
+    assert_eq!(meta.rabitq_key, first_meta.rabitq_key);
     assert_eq!(meta.row_count, 3);
     assert_eq!(meta.append_indexes.len(), 1);
     assert_eq!(
@@ -260,10 +280,20 @@ async fn second_flush_publishes_vector_append_delta() {
     assert_eq!(append_meta.generation, manifest.generation);
     assert_eq!(append_meta.row_count, 1);
     assert!(append_meta.size_bytes > 0);
+    assert!(append_meta.rabitq_size_bytes > 0);
 
     let append =
         VectorIndex::decode(&object_store.get(&append_meta.key).await.unwrap().bytes).unwrap();
+    let append_rabitq = RabitqIndex::decode(
+        &object_store
+            .get(append_meta.rabitq_key.as_ref().unwrap())
+            .await
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
     assert_eq!(append.row_count(), 1);
+    assert_eq!(append_rabitq.clusters.len(), append.postings.len());
     assert_eq!(append.centroids.len() as u64, first_meta.centroid_count);
     assert_eq!(append.addresses.len(), 1);
     assert_eq!(append.addresses[0].id, Id::U64(3));
@@ -379,6 +409,20 @@ async fn vector_maintenance_publishes_local_rebuild_delta() {
         maintained_meta.append_indexes[0].kind,
         VectorAppendKind::LocalRebuild
     );
+    assert!(maintained_meta.append_indexes[0].rabitq_size_bytes > 0);
+    RabitqIndex::decode(
+        &object_store
+            .get(
+                maintained_meta.append_indexes[0]
+                    .rabitq_key
+                    .as_ref()
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
     assert!(maintained.generation > manifest.generation);
     let version_map = VectorVersionMap::decode(
         &object_store
@@ -746,18 +790,29 @@ async fn attr_postings_are_delta_appended_and_tiered() {
 #[tokio::test]
 async fn gc_reclaims_orphans_and_preserves_live_reads() {
     let dir = tempfile::tempdir().unwrap();
-    let ns = Namespace::create(store(&dir), "docs").await.unwrap();
+    let object_store = store(&dir);
+    let ns = Namespace::create(object_store.clone(), "docs")
+        .await
+        .unwrap();
 
     // Make orphans: two flushes (superseding manifest bodies + indexing WAL
     // seqs 1..=3), then a compaction (superseding both flushes' doc/attr runs).
-    ns.upsert(doc_with(1, "a", 1)).await.unwrap();
-    ns.upsert(doc_with(2, "b", 2)).await.unwrap();
+    ns.upsert(doc_with_vector(1, "a", 1, [1.0, 0.0]))
+        .await
+        .unwrap();
+    ns.upsert(doc_with_vector(2, "b", 2, [2.0, 0.0]))
+        .await
+        .unwrap();
     indexer::flush(&ns).await.unwrap();
-    ns.upsert(doc_with(3, "c", 3)).await.unwrap();
+    ns.upsert(doc_with_vector(3, "c", 3, [3.0, 0.0]))
+        .await
+        .unwrap();
     indexer::flush(&ns).await.unwrap();
     indexer::compact(&ns).await.unwrap();
     // A live, unindexed write: its WAL object is in the overlay and must survive.
-    ns.upsert(doc_with(4, "d", 4)).await.unwrap();
+    ns.upsert(doc_with_vector(4, "d", 4, [4.0, 0.0]))
+        .await
+        .unwrap();
 
     // Dry run reports orphans but deletes nothing.
     let report = indexer::gc(&ns, false).await.unwrap();
@@ -777,12 +832,40 @@ async fn gc_reclaims_orphans_and_preserves_live_reads() {
     // The compacted SST survived (indexed rows)…
     assert_eq!(
         ns.lookup(&Id::U64(1)).await.unwrap(),
-        Some(doc_with(1, "a", 1))
+        Some(doc_with_vector(1, "a", 1, [1.0, 0.0]))
     );
     // …and so did the live unindexed WAL batch (overlay row).
     assert_eq!(
         ns.lookup(&Id::U64(4)).await.unwrap(),
-        Some(doc_with(4, "d", 4))
+        Some(doc_with_vector(4, "d", 4, [4.0, 0.0]))
+    );
+    let manifest = ns.load_manifest().await.unwrap();
+    let rabitq_key = manifest.vector_indexes["embedding"]
+        .rabitq_key
+        .as_ref()
+        .unwrap();
+    RabitqIndex::decode(&object_store.get(rabitq_key).await.unwrap().bytes).unwrap();
+    let ann = ns
+        .query(Query {
+            filter: None,
+            order_by: None,
+            limit: None,
+            aggregates: Vec::new(),
+            exact_vector: None,
+            approx_vector: Some(ApproxVectorQuery {
+                column: "embedding".into(),
+                vector: vec![0.0, 0.0],
+                k: 2,
+                probes: Some(16),
+                metric: Some(DistanceMetric::L2),
+            }),
+            text: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        ann.rows.into_iter().map(|row| row.id).collect::<Vec<_>>(),
+        vec![Id::U64(1), Id::U64(2)]
     );
 
     // Idempotent: a second pass finds nothing, proving the live set was complete

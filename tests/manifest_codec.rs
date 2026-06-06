@@ -88,6 +88,10 @@ fn manifest_round_trips_doc_sst_metadata() {
         VectorIndexMeta {
             key: "namespaces/docs/index/g/7/vector/656d62656464696e67/ivf.bin".into(),
             size_bytes: 8192,
+            rabitq_key: Some(
+                "namespaces/docs/index/g/7/vector/656d62656464696e67/base.rabitq.bin".into(),
+            ),
+            rabitq_size_bytes: 4096,
             version_map_key: Some(
                 "namespaces/docs/index/g/7/vector/656d62656464696e67/versions.bin".into(),
             ),
@@ -95,6 +99,11 @@ fn manifest_round_trips_doc_sst_metadata() {
             append_indexes: vec![VectorAppendMeta {
                 key: "namespaces/docs/index/g/8/vector/656d62656464696e67/append-8.ivf.bin".into(),
                 size_bytes: 512,
+                rabitq_key: Some(
+                    "namespaces/docs/index/g/8/vector/656d62656464696e67/append-8.rabitq.bin"
+                        .into(),
+                ),
+                rabitq_size_bytes: 256,
                 row_count: 1,
                 generation: 8,
                 kind: VectorAppendKind::Reassign,

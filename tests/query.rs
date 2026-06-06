@@ -588,6 +588,26 @@ async fn approx_vector_query_honors_limit_below_k() {
 
     let ids: Vec<Id> = ann.rows.iter().map(|row| row.id.clone()).collect();
     assert_eq!(ids, vec![Id::U64(1), Id::U64(2)]);
+
+    let empty = ns
+        .query(Query {
+            filter: None,
+            order_by: None,
+            limit: Some(0),
+            aggregates: Vec::new(),
+            exact_vector: None,
+            approx_vector: Some(ApproxVectorQuery {
+                column: "embedding".into(),
+                vector: vec![0.0, 0.0],
+                k: 4,
+                probes: Some(16),
+                metric: Some(DistanceMetric::L2),
+            }),
+            text: None,
+        })
+        .await
+        .unwrap();
+    assert!(empty.rows.is_empty());
 }
 
 #[tokio::test]
@@ -695,6 +715,54 @@ async fn ann_vector_query_matches_exact_with_full_probes() {
     let ann_ids: Vec<Id> = ann.rows.iter().map(|row| row.id.clone()).collect();
     assert_eq!(vector::recall_at(&exact_ids, &ann_ids, 3), 1.0);
     assert_eq!(ann_ids, exact_ids);
+}
+
+#[tokio::test]
+async fn ann_l2_loads_rabitq_while_cosine_skips_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let object_store = store(&dir);
+    let ns = Namespace::create(object_store.clone(), "docs")
+        .await
+        .unwrap();
+    ns.upsert(doc(1, "near", 1, &["v"], [1.0, 0.0]))
+        .await
+        .unwrap();
+    ns.upsert(doc(2, "far", 2, &["v"], [0.0, 1.0]))
+        .await
+        .unwrap();
+    indexer::flush(&ns).await.unwrap();
+
+    let manifest = ns.load_manifest().await.unwrap();
+    let rabitq_key = manifest.vector_indexes["embedding"]
+        .rabitq_key
+        .as_ref()
+        .unwrap();
+    object_store
+        .put(rabitq_key, Bytes::from_static(b"corrupt"))
+        .await
+        .unwrap();
+
+    let query = |metric| Query {
+        filter: None,
+        order_by: None,
+        limit: None,
+        aggregates: Vec::new(),
+        exact_vector: None,
+        approx_vector: Some(ApproxVectorQuery {
+            column: "embedding".into(),
+            vector: vec![1.0, 0.0],
+            k: 1,
+            probes: Some(16),
+            metric: Some(metric),
+        }),
+        text: None,
+    };
+    let cosine = ns.query(query(DistanceMetric::Cosine)).await.unwrap();
+    assert_eq!(cosine.rows[0].id, Id::U64(1));
+    assert!(matches!(
+        ns.query(query(DistanceMetric::L2)).await,
+        Err(Error::Corrupt(_))
+    ));
 }
 
 #[tokio::test]
@@ -914,6 +982,13 @@ async fn ann_vector_query_drops_stale_index_versions() {
     });
     object_store
         .put(&meta.key, Bytes::from(index.encode().unwrap()))
+        .await
+        .unwrap();
+    object_store
+        .put(
+            meta.rabitq_key.as_ref().unwrap(),
+            Bytes::from(sana::rabitq::build_index(&index).unwrap().encode().unwrap()),
+        )
         .await
         .unwrap();
 

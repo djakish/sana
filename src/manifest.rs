@@ -43,6 +43,10 @@ pub struct VectorIndexMeta {
     pub key: String,
     pub size_bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rabitq_key: Option<String>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub rabitq_size_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version_map_key: Option<String>,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub version_map_size_bytes: u64,
@@ -60,6 +64,10 @@ pub struct VectorIndexMeta {
 pub struct VectorAppendMeta {
     pub key: String,
     pub size_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rabitq_key: Option<String>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub rabitq_size_bytes: u64,
     pub row_count: u64,
     pub generation: u64,
     #[serde(default, skip_serializing_if = "VectorAppendKind::is_plain_append")]

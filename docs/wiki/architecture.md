@@ -164,7 +164,7 @@ namespaces/{ns}/
     fts/*.sst
     vector/{column}/tree.bin
     vector/{column}/postings/*.vpost
-    vector/{column}/quant/*.rabitq
+    vector/{column}/*.rabitq.bin
   jobs/indexing_queue.json         # brokered queue later
   ops/{token}.json                 # async operation status
   branches/{child}.json            # optional branch metadata
@@ -400,8 +400,9 @@ Concurrency rules:
 
 ### RaBitQ Quantization
 
-RaBitQ is the target compressed distance-estimation layer. It should be added
-after the unquantized ANN path is correct.
+RaBitQ is the compressed L2 distance-estimation layer. Each immutable IVF base,
+append, or maintenance segment has a separately framed `.rabitq.bin` companion;
+the manifest names both objects so older manifests can fall back to exact scans.
 
 For each vector cluster:
 
@@ -418,6 +419,12 @@ At query time:
 - estimate inner products using bitwise AND and popcount;
 - convert estimated inner products back to raw squared distances;
 - use the error bound to decide which candidates require exact reranking.
+
+Sana loads IVF/companion pairs concurrently only for L2 queries. It applies
+native filter masks, version-map liveness, and WAL shadowing before segment
+top-k pruning. A candidate is exact-reranked unless its confidence lower bound
+is already worse than the current exact kth distance. Cosine and dot queries do
+not fetch the companion.
 
 The key engineering payoff is that quantized vectors are 16-32x smaller than
 full `f16`/`f32` vectors, moving scans higher in the memory hierarchy. The

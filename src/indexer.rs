@@ -28,6 +28,7 @@ use crate::namespace::{
     Namespace, apply_op, manifest_body_key_for_pointer, manifest_pointer_key, now_ms, op_id,
     wal_commit_key, wal_key,
 };
+use crate::rabitq;
 use crate::schema::{ColumnType, DistanceMetric};
 use crate::sst::SstWriter;
 use crate::text;
@@ -37,11 +38,12 @@ use crate::wal::WalCursor;
 
 fn vector_family_bytes(meta: &VectorIndexMeta) -> u64 {
     meta.size_bytes
+        + meta.rabitq_size_bytes
         + meta.version_map_size_bytes
         + meta
             .append_indexes
             .iter()
-            .map(|append| append.size_bytes)
+            .map(|append| append.size_bytes + append.rabitq_size_bytes)
             .sum::<u64>()
 }
 
@@ -104,6 +106,26 @@ async fn publish_vector_version_map(
         .put(&version_map_key, Bytes::from(version_map_bytes.clone()))
         .await?;
     Ok((version_map_key, version_map_bytes.len() as u64))
+}
+
+async fn publish_rabitq_index(
+    ns: &Namespace,
+    generation: u64,
+    column: &str,
+    suffix: &str,
+    index: &VectorIndex,
+) -> Result<(String, u64)> {
+    let key = format!(
+        "namespaces/{}/index/g/{}/vector/{}/{}.rabitq.bin",
+        ns.name(),
+        generation,
+        object_path_component(column),
+        suffix
+    );
+    let bytes = rabitq::build_index(index)?.encode()?;
+    let size_bytes = bytes.len() as u64;
+    ns.store().put(&key, Bytes::from(bytes)).await?;
+    Ok((key, size_bytes))
 }
 
 async fn publish_attr_sst(
@@ -228,11 +250,15 @@ async fn publish_full_vector_index(
         component
     );
     ns.store().put(&key, Bytes::from(bytes.clone())).await?;
+    let (rabitq_key, rabitq_size_bytes) =
+        publish_rabitq_index(ns, generation, column.name, "base", &index).await?;
     let (version_map_key, version_map_size_bytes) =
         publish_vector_version_map(ns, generation, column.name, &version_map).await?;
     Ok(Some(VectorIndexMeta {
         key,
         size_bytes: bytes.len() as u64,
+        rabitq_key: Some(rabitq_key),
+        rabitq_size_bytes,
         version_map_key: Some(version_map_key),
         version_map_size_bytes,
         append_indexes: Vec::new(),
@@ -301,9 +327,19 @@ async fn publish_vector_append(
         );
         ns.store().put(&key, Bytes::from(bytes.clone())).await?;
         let size_bytes = bytes.len() as u64;
+        let (rabitq_key, rabitq_size_bytes) = publish_rabitq_index(
+            ns,
+            generation,
+            column.name,
+            &format!("append-{generation}"),
+            &append,
+        )
+        .await?;
         append_indexes.push(VectorAppendMeta {
             key,
             size_bytes,
+            rabitq_key: Some(rabitq_key),
+            rabitq_size_bytes,
             row_count: append.row_count() as u64,
             generation,
             kind: VectorAppendKind::Append,
@@ -323,6 +359,8 @@ async fn publish_vector_append(
     Ok(Some(VectorIndexMeta {
         key: prev.key.clone(),
         size_bytes: prev.size_bytes,
+        rabitq_key: prev.rabitq_key.clone(),
+        rabitq_size_bytes: prev.rabitq_size_bytes,
         version_map_key: Some(version_map_key),
         version_map_size_bytes,
         append_indexes,
@@ -742,8 +780,9 @@ pub struct GcReport {
 /// orphans. The live set is computed from the *current* manifest pointer, so an
 /// object is kept iff the read path can still reach it: the pointer and its
 /// manifest body, the commit cursor, every doc/attr/vector run (plus version
-/// maps and append deltas) named by the manifest, and the unindexed WAL overlay
-/// `(indexed_cursor, commit]`. Everything else under the prefix is orphaned.
+/// maps, RaBitQ companions, and append deltas) named by the manifest, and the
+/// unindexed WAL overlay `(indexed_cursor, commit]`. Everything else under the
+/// prefix is orphaned.
 ///
 /// Assumes single-writer quiescence, like the filesystem store's CAS (D4): a
 /// concurrent reader still holding an older manifest could reference an object
@@ -767,11 +806,17 @@ pub async fn gc(ns: &Namespace, apply: bool) -> Result<GcReport> {
     }
     for vmeta in manifest.vector_indexes.values() {
         live.insert(vmeta.key.clone());
+        if let Some(key) = &vmeta.rabitq_key {
+            live.insert(key.clone());
+        }
         if let Some(key) = &vmeta.version_map_key {
             live.insert(key.clone());
         }
         for append in &vmeta.append_indexes {
             live.insert(append.key.clone());
+            if let Some(key) = &append.rabitq_key {
+                live.insert(key.clone());
+            }
         }
     }
     // The unindexed WAL overlay the read path still merges: `(indexed_cursor,
@@ -853,11 +898,21 @@ pub async fn maintain_vectors(ns: &Namespace) -> Result<bool> {
                     task_idx
                 );
                 ns.store().put(&key, Bytes::from(bytes.clone())).await?;
+                let (rabitq_key, rabitq_size_bytes) = publish_rabitq_index(
+                    ns,
+                    new_gen,
+                    column,
+                    &format!("local-rebuild-{new_gen}-{task_idx}"),
+                    &delta.index,
+                )
+                .await?;
 
                 let mut append_indexes = meta.append_indexes.clone();
                 append_indexes.push(VectorAppendMeta {
                     key,
                     size_bytes: bytes.len() as u64,
+                    rabitq_key: Some(rabitq_key),
+                    rabitq_size_bytes,
                     row_count: delta.index.row_count() as u64,
                     generation: new_gen,
                     kind: VectorAppendKind::LocalRebuild,
@@ -894,11 +949,21 @@ pub async fn maintain_vectors(ns: &Namespace) -> Result<bool> {
                     task_idx
                 );
                 ns.store().put(&key, Bytes::from(bytes.clone())).await?;
+                let (rabitq_key, rabitq_size_bytes) = publish_rabitq_index(
+                    ns,
+                    new_gen,
+                    column,
+                    &format!("reassign-{new_gen}-{task_idx}"),
+                    &delta.index,
+                )
+                .await?;
 
                 let mut append_indexes = meta.append_indexes.clone();
                 append_indexes.push(VectorAppendMeta {
                     key,
                     size_bytes: bytes.len() as u64,
+                    rabitq_key: Some(rabitq_key),
+                    rabitq_size_bytes,
                     row_count: delta.index.row_count() as u64,
                     generation: new_gen,
                     kind: VectorAppendKind::Reassign,
@@ -924,6 +989,8 @@ pub async fn maintain_vectors(ns: &Namespace) -> Result<bool> {
             VectorIndexMeta {
                 key: meta.key.clone(),
                 size_bytes: meta.size_bytes,
+                rabitq_key: meta.rabitq_key.clone(),
+                rabitq_size_bytes: meta.rabitq_size_bytes,
                 version_map_key: Some(version_map_key),
                 version_map_size_bytes,
                 append_indexes,
