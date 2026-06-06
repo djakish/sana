@@ -26,7 +26,17 @@ fn build(pairs: &[(Vec<u8>, Vec<u8>)], block_target: usize) -> Vec<u8> {
     for (k, v) in pairs {
         w.add(k, v).unwrap();
     }
-    w.finish()
+    w.finish().unwrap()
+}
+
+fn refresh_v2_footer_crc(bytes: &mut [u8]) {
+    const FOOTER_LEN: usize = 36;
+    let footer_start = bytes.len() - FOOTER_LEN;
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&bytes[footer_start..footer_start + 20]);
+    hasher.update(&bytes[footer_start + 24..]);
+    let crc = hasher.finalize();
+    bytes[footer_start + 20..footer_start + 24].copy_from_slice(&crc.to_le_bytes());
 }
 
 #[test]
@@ -68,7 +78,7 @@ fn single_block_round_trips() {
 
 #[test]
 fn empty_sst_is_valid() {
-    let reader = SstReader::open(Bytes::from(SstWriter::new().finish())).unwrap();
+    let reader = SstReader::open(Bytes::from(SstWriter::new().finish().unwrap())).unwrap();
     assert!(reader.entries().unwrap().is_empty());
     assert_eq!(reader.get(b"anything").unwrap(), None);
 }
@@ -97,6 +107,65 @@ fn rejects_bad_magic() {
     let n = bytes.len();
     bytes[n - 1] ^= 0xff; // corrupt the trailing magic
     assert!(SstReader::open(Bytes::from(bytes)).is_err());
+}
+
+#[test]
+fn detects_footer_corruption() {
+    let mut bytes = build(&sample_pairs(), 64);
+    let footer_start = bytes.len() - 36;
+    bytes[footer_start] ^= 0xff;
+    let error = match SstReader::open(Bytes::from(bytes)) {
+        Ok(_) => panic!("corrupt footer was accepted"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("footer crc mismatch"));
+}
+
+#[test]
+fn rejects_checksummed_out_of_bounds_footer() {
+    let mut bytes = build(&sample_pairs(), 64);
+    let footer_start = bytes.len() - 36;
+    bytes[footer_start..footer_start + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+    refresh_v2_footer_crc(&mut bytes);
+    assert!(SstReader::open(Bytes::from(bytes)).is_err());
+}
+
+#[test]
+fn rejects_corrupt_restart_metadata() {
+    let mut bytes = build(&sample_pairs(), 64);
+    let footer_start = bytes.len() - 36;
+    let index_offset =
+        u64::from_le_bytes(bytes[footer_start..footer_start + 8].try_into().unwrap()) as usize;
+    let mut pos = index_offset + 4;
+    let key_len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+    pos += 4 + key_len + 8;
+    let block_size = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap()) as usize;
+    let restart_count_offset = block_size - 4;
+    bytes[restart_count_offset..restart_count_offset + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+    let block_crc = crc32fast::hash(&bytes[..block_size]);
+    bytes[block_size..block_size + 4].copy_from_slice(&block_crc.to_le_bytes());
+
+    let reader = SstReader::open(Bytes::from(bytes)).unwrap();
+    assert!(reader.get(b"user/00000").is_err());
+}
+
+#[tokio::test]
+async fn v1_fixture_remains_readable_by_whole_and_ranged_paths() {
+    let fixture = include_bytes!("fixtures/sst_v1.bin");
+    let reader = SstReader::open(Bytes::from_static(fixture)).unwrap();
+    assert_eq!(reader.entries().unwrap().len(), 40);
+    assert_eq!(reader.get(b"k0017").unwrap().as_deref(), Some(&b"v17"[..]));
+
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(FsObjectStore::new(dir.path()));
+    store
+        .put("v1.sst", Bytes::from_static(fixture))
+        .await
+        .unwrap();
+    let value = ranged_get(store.as_ref(), "v1.sst", fixture.len() as u64, b"k0017")
+        .await
+        .unwrap();
+    assert_eq!(value.as_deref(), Some(&b"v17"[..]));
 }
 
 /// Test-only `ObjectStore` decorator that counts read calls and bytes returned,
@@ -253,5 +322,5 @@ fn golden_format_is_stable() {
             )
         })
         .collect();
-    common::assert_golden("sst_v1.bin", &build(&pairs, 48));
+    common::assert_golden("sst_v2.bin", &build(&pairs, 48));
 }

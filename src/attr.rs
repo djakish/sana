@@ -72,7 +72,7 @@ pub fn build_attr_sst(docs: &BTreeMap<Id, Document>) -> Result<Option<BuiltAttrS
     }
 
     Ok(Some(BuiltAttrSst {
-        bytes: writer.finish(),
+        bytes: writer.finish()?,
         entry_count,
     }))
 }
@@ -104,7 +104,7 @@ pub fn merge_attr_ssts(readers: &[SstReader]) -> Result<Option<BuiltAttrSst>> {
         entry_count += 1;
     }
     Ok(Some(BuiltAttrSst {
-        bytes: writer.finish(),
+        bytes: writer.finish()?,
         entry_count,
     }))
 }

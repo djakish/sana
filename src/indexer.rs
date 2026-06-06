@@ -431,7 +431,7 @@ fn build_sst(records: &BTreeMap<Id, DocRecord>) -> Result<BuiltSst> {
         built.max_id = Some(id.clone());
         built.row_count += 1;
     }
-    built.bytes = writer.finish();
+    built.bytes = writer.finish()?;
     Ok(built)
 }
 

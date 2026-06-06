@@ -431,7 +431,7 @@ pub fn build_text_sst(docs: &BTreeMap<Id, Document>) -> Result<Option<BuiltTextS
     }
 
     Ok(Some(BuiltTextSst {
-        bytes: writer.finish(),
+        bytes: writer.finish()?,
         entry_count,
     }))
 }
