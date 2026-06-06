@@ -9,7 +9,7 @@
 //!   and tombstones.
 //!
 //! Both are idempotent: re-running with nothing to do is a no-op, and a lost
-//! CAS race leaves an orphaned SST object (harmless; GC is future work).
+//! CAS race leaves an orphaned SST object that the explicit GC pass can reclaim.
 //! Publishing follows the architecture: write immutable files, then CAS
 //! `manifest/current` to a new generation.
 
@@ -441,9 +441,21 @@ pub async fn flush(ns: &Namespace) -> Result<bool> {
     let snapshot = ns.load_manifest_snapshot().await?;
     let mut manifest = snapshot.manifest;
     let (commit, committed_wal_bytes) = ns.wal_commit_stats().await?;
-    let from_seq = manifest.indexed_cursor.map(|c| c.seq).unwrap_or(0);
-    if from_seq >= commit.seq {
-        return Ok(false);
+    if let Some(indexed) = manifest.indexed_cursor {
+        if indexed > commit {
+            return Err(Error::Corrupt(format!(
+                "indexed WAL cursor {indexed:?} is ahead of committed cursor {commit:?}"
+            )));
+        }
+        if indexed == commit {
+            return Ok(false);
+        }
+        if indexed.epoch != commit.epoch {
+            return Err(Error::Corrupt(format!(
+                "WAL flush crosses unsupported epoch boundary {} -> {}",
+                indexed.epoch, commit.epoch
+            )));
+        }
     }
 
     let ops = ns.read_overlay_ops(manifest.indexed_cursor, commit).await?;
@@ -581,7 +593,7 @@ const TIER_TRIGGER: usize = 4;
 /// hold the key, so only the full [`compact`] (which merges everything) may drop
 /// them. The live document set is unchanged, so attribute/vector families are
 /// untouched; this only reorganizes the document family and bounds read
-/// fan-out. Old run objects become unreferenced orphans (GC is future work).
+/// fan-out. Old run objects become unreferenced orphans for the GC pass.
 ///
 /// `doc_ssts` is kept ordered by read precedence: lower level (and, within a
 /// level, more recently written) first. The merged run is the newest of its new
@@ -808,9 +820,33 @@ pub async fn gc(ns: &Namespace, apply: bool) -> Result<GcReport> {
     live.extend(foreign_references_into_namespace(ns).await?);
     // The unindexed WAL overlay the read path still merges: `(indexed_cursor,
     // commit]`. WAL at or before `indexed_cursor` is already in the SSTs.
-    let from = manifest.indexed_cursor.map(|c| c.seq + 1).unwrap_or(1);
-    for seq in from..=commit.seq {
-        live.insert(wal_key(ns.name(), WalCursor::new(commit.epoch, seq)));
+    let from = match manifest.indexed_cursor {
+        Some(indexed) => {
+            if indexed > commit {
+                return Err(Error::Corrupt(format!(
+                    "indexed WAL cursor {indexed:?} is ahead of committed cursor {commit:?}"
+                )));
+            }
+            if indexed.epoch != commit.epoch {
+                return Err(Error::Corrupt(format!(
+                    "WAL GC crosses unsupported epoch boundary {} -> {}",
+                    indexed.epoch, commit.epoch
+                )));
+            }
+            if indexed == commit {
+                None
+            } else {
+                Some(indexed.seq.checked_add(1).ok_or_else(|| {
+                    Error::Corrupt("indexed WAL sequence overflow during GC".into())
+                })?)
+            }
+        }
+        None => Some(1),
+    };
+    if let Some(from) = from {
+        for seq in from..=commit.seq {
+            live.insert(wal_key(ns.name(), WalCursor::new(commit.epoch, seq)));
+        }
     }
 
     let objects = ns

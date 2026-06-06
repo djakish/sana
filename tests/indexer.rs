@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use sana::error::Error;
 use sana::indexer;
 use sana::manifest::{
     ManifestPointer, VectorAppendKind, VectorMaintenanceAction, VectorMaintenancePlan,
@@ -484,6 +485,27 @@ async fn flush_is_idempotent_when_up_to_date() {
     assert!(indexer::flush(&ns).await.unwrap());
     assert!(!indexer::flush(&ns).await.unwrap()); // nothing new to index
     assert_eq!(ns.load_manifest().await.unwrap().doc_ssts.len(), 1);
+}
+
+#[tokio::test]
+async fn cross_epoch_manifests_fail_reads_flush_and_gc_explicitly() {
+    let dir = tempfile::tempdir().unwrap();
+    let object_store = store(&dir);
+    let ns = Namespace::create(object_store.clone(), "docs")
+        .await
+        .unwrap();
+    ns.upsert(doc_with(1, "alpha", 10)).await.unwrap();
+
+    let mut manifest = ns.load_manifest().await.unwrap();
+    manifest.indexed_cursor = Some(sana::wal::WalCursor::new(1, 0));
+    overwrite_current_manifest_body(&object_store, "docs", &manifest).await;
+
+    assert!(matches!(ns.replay().await, Err(Error::Corrupt(_))));
+    assert!(matches!(indexer::flush(&ns).await, Err(Error::Corrupt(_))));
+    assert!(matches!(
+        indexer::gc(&ns, false).await,
+        Err(Error::Corrupt(_))
+    ));
 }
 
 #[tokio::test]

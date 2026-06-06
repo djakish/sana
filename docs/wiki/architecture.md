@@ -247,6 +247,11 @@ cursor. Unindexed rows are searched exhaustively and merged with indexed
 results. Eventual reads may use a cached manifest and only include a bounded
 recent-write overlay.
 
+WAL rotation is not implemented yet. The current engine fails closed if an
+indexed cursor and committed cursor span epochs (or if the indexed cursor is
+ahead), across overlay reads, flush, and GC. A future rotation protocol must
+persist epoch boundaries before cross-epoch traversal is allowed.
+
 Backpressure is based on exact unindexed WAL bytes. The commit state carries
 cumulative committed WAL bytes and each indexed manifest carries the cumulative
 watermark it absorbed, so the outstanding size is their checked difference

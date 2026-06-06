@@ -13,15 +13,14 @@ the next unchecked task under "Current milestone" / "Next up".
 
 - **Current stage:** Stage 10 (Durability hardening and write semantics) —
   **complete**.
-- **Next up:** Final cross-stage hardening: make the single-WAL-epoch
-  assumption explicit in overlay, flush, and GC paths so future epoch rotation
-  cannot silently misread data.
+- **Next up:** Run a final production-readiness review across service lifecycle,
+  indexing worker operation, and remaining documented storage limitations.
 - **Done:** Stage 0 (Skeleton), Stage 1 (Durable Documents), Stage 2 (SST/LSM),
   Stage 3 (Attributes & Exact Search), Stage 4 (ANN v0), Stage 5 (Native
   Filtering), Stage 6 (SPFresh local rebuild), Stage 7 (Full-text search),
   Stage 8 (RaBitQ & kernels), Stage 9 (Object-store operations), Stage 10
   (Durability hardening and write semantics).
-- **Tests:** `cargo test` green (186 tests); `cargo clippy --all-targets` clean.
+- **Tests:** `cargo test` green (187 tests); `cargo clippy --all-targets` clean.
 - **Note:** post-Stage-2 and Stage-3–5 code-review fixes applied; remaining
   findings tracked under "Stage 2 — code review follow-ups" and "Stages 3–5 —
   code review follow-ups". Recently fixed limitations: Stage 2 ranged
@@ -247,13 +246,14 @@ A high-effort recall review of the Stage 2 diff ran after it landed. Outcomes:
 - **Manifest serde test gap.** `tests/manifest_codec.rs` now round-trips
   populated `doc_ssts` metadata and content-keyed manifest pointers.
 
-**Outstanding (address before/within Stage 3 — none fire under the current
-single-process, epoch-0, trusted-storage assumptions, but they are real):**
+**Stage 2 review findings:**
 
-- [ ] **Epoch-blind reads.** `read_overlay_ops` builds WAL keys with `to.epoch`
-      and `flush`'s `from_seq >= commit.seq` compares only `seq`; both break if
-      the WAL epoch ever rotates. Make the overlay range epoch-aware when epoch
-      rotation is implemented.
+- [x] **Epoch-blind reads.** *Guarded explicitly.* Epoch rotation is still not
+      implemented, but overlay reads, flush, and GC now reject a manifest cursor
+      ahead of commit or crossing epochs instead of constructing keys from the
+      wrong epoch or comparing sequence numbers alone. Same-epoch sequence
+      increments are checked. A malformed-manifest regression covers all three
+      paths. A future rotation feature must add durable epoch-boundary metadata.
 - [x] **Point lookups load whole SSTs.** *Done.* `sst::ranged_get` reads only
       the footer, the index, and the one candidate block (using the manifest's
       `size_bytes` to find the footer — no extra `head`), so `Namespace::lookup`
@@ -962,6 +962,12 @@ Stage 10 decisions / notes:
   immutable-object LRU before serving HTTP/1. Router-level tests cover every
   write variant, single/multi queries, exact lag metadata, backpressure, recall,
   cache warming, and error envelopes.
+- **D66 — Unsupported WAL epoch rotation fails closed.** `WalCursor` retains an
+  epoch field for a future rotation protocol, but commit state currently writes
+  one epoch only. Overlay reads, index flush, and GC now compare full cursors,
+  reject cross-epoch ranges, and use checked sequence increments. This prevents
+  latent epoch fields from turning a malformed manifest or partial future
+  rollout into silent stale reads, skipped indexing, or live-WAL deletion.
 
 ---
 

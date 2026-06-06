@@ -478,7 +478,28 @@ impl Namespace {
         from: Option<WalCursor>,
         to: WalCursor,
     ) -> Result<Vec<WalOp>> {
-        let start = from.map(|c| c.seq + 1).unwrap_or(1);
+        let start = match from {
+            Some(from) => {
+                if from > to {
+                    return Err(Error::Corrupt(format!(
+                        "indexed WAL cursor {from:?} is ahead of committed cursor {to:?}"
+                    )));
+                }
+                if from == to {
+                    return Ok(Vec::new());
+                }
+                if from.epoch != to.epoch {
+                    return Err(Error::Corrupt(format!(
+                        "WAL overlay crosses unsupported epoch boundary {} -> {}",
+                        from.epoch, to.epoch
+                    )));
+                }
+                from.seq.checked_add(1).ok_or_else(|| {
+                    Error::Corrupt("indexed WAL sequence overflow while reading overlay".into())
+                })?
+            }
+            None => 1,
+        };
         if start > to.seq {
             return Ok(Vec::new());
         }
