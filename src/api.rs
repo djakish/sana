@@ -1,8 +1,10 @@
 //! Thin Axum service over the library contracts.
 
+use std::collections::HashMap;
 use std::future::{Future, IntoFuture};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{DefaultBodyLimit, Path, Query as QueryParams, State};
@@ -25,10 +27,68 @@ use crate::write::{
 };
 
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
+const MAX_CONCURRENT_QUERY_SLOTS: usize = 16;
+const QUERY_SLOT_WAIT: Duration = Duration::from_millis(800);
 
 #[derive(Clone)]
 struct ApiState {
     store: Arc<dyn ObjectStore>,
+    query_limiter: Arc<QueryLimiter>,
+}
+
+struct QueryLimiter {
+    namespaces: tokio::sync::Mutex<HashMap<String, Weak<tokio::sync::Semaphore>>>,
+    max_slots: usize,
+    wait: Duration,
+}
+
+impl QueryLimiter {
+    fn new(max_slots: usize, wait: Duration) -> Self {
+        Self {
+            namespaces: tokio::sync::Mutex::new(HashMap::new()),
+            max_slots,
+            wait,
+        }
+    }
+
+    async fn acquire(
+        &self,
+        namespace: &str,
+        slots: u32,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, ApiError> {
+        let semaphore = {
+            let mut namespaces = self.namespaces.lock().await;
+            if namespaces.len() >= 1_024 {
+                namespaces.retain(|_, semaphore| semaphore.strong_count() > 0);
+            }
+            match namespaces.get(namespace).and_then(Weak::upgrade) {
+                Some(semaphore) => semaphore,
+                None => {
+                    let semaphore =
+                        Arc::new(tokio::sync::Semaphore::new(self.max_slots));
+                    namespaces.insert(namespace.to_string(), Arc::downgrade(&semaphore));
+                    semaphore
+                }
+            }
+        };
+
+        match tokio::time::timeout(self.wait, semaphore.acquire_many_owned(slots)).await {
+            Ok(Ok(permit)) => Ok(permit),
+            Ok(Err(_)) => Err(ApiError::Request {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                code: "internal",
+                message: "query concurrency limiter is unavailable".into(),
+            }),
+            Err(_) => Err(ApiError::Request {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                code: "query_concurrency",
+                message: format!(
+                    "namespace query concurrency exceeded {0} slots",
+                    self.max_slots
+                ),
+            }),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -195,7 +255,13 @@ pub fn router(store: Arc<dyn ObjectStore>) -> Router {
             get(warm_cache),
         )
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
-        .with_state(ApiState { store })
+        .with_state(ApiState {
+            store,
+            query_limiter: Arc::new(QueryLimiter::new(
+                MAX_CONCURRENT_QUERY_SLOTS,
+                QUERY_SLOT_WAIT,
+            )),
+        })
 }
 
 pub async fn serve(store: Arc<dyn ObjectStore>, address: SocketAddr) -> std::io::Result<()> {
@@ -336,13 +402,21 @@ async fn query(
     request: Result<Json<QueryRequest>, JsonRejection>,
 ) -> Result<Json<QueryResponse>, ApiError> {
     let Json(request) = request.map_err(json_rejection)?;
-    let namespace = Namespace::open(state.store, &namespace).await?;
+    let namespace_handle = Namespace::open(state.store, &namespace).await?;
+    let _permit = state
+        .query_limiter
+        .acquire(&namespace, query_request_slots(&request))
+        .await?;
     let response = match request {
         QueryRequest::Single { query, options } => {
-            QueryResponse::Single(namespace.query_with_options(*query, options).await?)
+            QueryResponse::Single(namespace_handle.query_with_options(*query, options).await?)
         }
         QueryRequest::Multi { query, options } => {
-            QueryResponse::Multi(namespace.multi_query_with_options(query, options).await?)
+            QueryResponse::Multi(
+                namespace_handle
+                    .multi_query_with_options(query, options)
+                    .await?,
+            )
         }
     };
     Ok(Json(response))
@@ -362,9 +436,10 @@ async fn recall(
     request: Result<Json<RecallApiRequest>, JsonRejection>,
 ) -> Result<Json<RecallResult>, ApiError> {
     let Json(request) = request.map_err(json_rejection)?;
-    let namespace = Namespace::open(state.store, &namespace).await?;
+    let namespace_handle = Namespace::open(state.store, &namespace).await?;
+    let _permit = state.query_limiter.acquire(&namespace, 4).await?;
     Ok(Json(
-        namespace
+        namespace_handle
             .recall_with_options(request.request, request.options)
             .await?,
     ))
@@ -411,6 +486,25 @@ fn query_rejection(rejection: QueryRejection) -> ApiError {
     }
 }
 
+fn query_request_slots(request: &QueryRequest) -> u32 {
+    match request {
+        QueryRequest::Single { query, .. } => query_slots(query),
+        QueryRequest::Multi { query, .. } => {
+            query.queries.iter().map(query_slots).max().unwrap_or(1)
+        }
+    }
+}
+
+fn query_slots(query: &Query) -> u32 {
+    if !query.aggregates.is_empty() {
+        4
+    } else if query.exact_vector.is_some() {
+        2
+    } else {
+        1
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -436,5 +530,25 @@ mod tests {
         let polls_after_shutdown = polls.load(Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(polls.load(Ordering::SeqCst), polls_after_shutdown);
+    }
+
+    #[tokio::test]
+    async fn query_limiter_times_out_and_recovers_per_namespace() {
+        let limiter = super::QueryLimiter::new(2, Duration::from_millis(20));
+        let all_slots = limiter.acquire("docs", 2).await.unwrap();
+
+        let error = limiter.acquire("docs", 1).await.unwrap_err();
+        assert!(matches!(
+            error,
+            super::ApiError::Request {
+                status: axum::http::StatusCode::TOO_MANY_REQUESTS,
+                code: "query_concurrency",
+                ..
+            }
+        ));
+
+        drop(limiter.acquire("other", 1).await.unwrap());
+        drop(all_slots);
+        drop(limiter.acquire("docs", 1).await.unwrap());
     }
 }
