@@ -578,29 +578,19 @@ async fn execute_ann_vector(
             .await;
     };
 
+    // Search the base index plus every append delta. The delta keys are known up
+    // front, so prefetch them concurrently (mirroring `read_overlay_ops`) rather
+    // than a round trip per delta; decode and search stay sequential.
     let index_bytes = ns.store().get(&meta.key).await?.bytes;
-    let index = VectorIndex::decode(&index_bytes)?;
-    let version_map = load_vector_version_map(ns, meta).await?;
-    let native_filter = match plan_native_filter(&index, filter)? {
-        NativeFilter::Mask(mask) => mask,
-        NativeFilter::Fallback => {
-            return exact_vector_fallback(ns, manifest, commit, filter, &exact_query, plan, limit)
-                .await;
-        }
-    };
-    let mut ann_hits = index.search_with_filter(
-        &query.vector,
-        usize::MAX,
-        query.probes,
-        Some(metric),
-        native_filter.as_ref(),
-    )?;
-    // The append-delta object keys are known up front, so prefetch them
-    // concurrently (mirroring `read_overlay_ops`) rather than serializing a
-    // round trip per delta; decode + search stays sequential and in order.
+    let mut segments = vec![VectorIndex::decode(&index_bytes)?];
     for bytes in fetch_append_indexes(ns, meta).await? {
-        let append_index = VectorIndex::decode(&bytes)?;
-        let append_filter = match plan_native_filter(&append_index, filter)? {
+        segments.push(VectorIndex::decode(&bytes)?);
+    }
+    let version_map = load_vector_version_map(ns, meta).await?;
+
+    let mut ann_hits = Vec::new();
+    for segment in &segments {
+        let mask = match plan_native_filter(segment, filter)? {
             NativeFilter::Mask(mask) => mask,
             NativeFilter::Fallback => {
                 return exact_vector_fallback(
@@ -615,12 +605,12 @@ async fn execute_ann_vector(
                 .await;
             }
         };
-        ann_hits.extend(append_index.search_with_filter(
+        ann_hits.extend(segment.search_with_filter(
             &query.vector,
             usize::MAX,
             query.probes,
             Some(metric),
-            append_filter.as_ref(),
+            mask.as_ref(),
         )?);
     }
 
