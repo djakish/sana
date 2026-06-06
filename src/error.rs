@@ -23,6 +23,9 @@ pub enum Error {
     #[error("invalid write: {0}")]
     InvalidWrite(String),
 
+    #[error("idempotency key conflict: {0}")]
+    IdempotencyConflict(String),
+
     #[error("invalid schema: {0}")]
     InvalidSchema(String),
 

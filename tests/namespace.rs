@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::ops::Range;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -83,6 +84,90 @@ impl ObjectStore for RecordingStore {
     }
 }
 
+struct FailWalCommitCasStore {
+    inner: Arc<dyn ObjectStore>,
+    fail_attempt: usize,
+    fail_after_apply: bool,
+    attempts: AtomicUsize,
+}
+
+impl FailWalCommitCasStore {
+    fn new(inner: Arc<dyn ObjectStore>, fail_attempt: usize) -> Arc<Self> {
+        Self::with_mode(inner, fail_attempt, false)
+    }
+
+    fn after_apply(inner: Arc<dyn ObjectStore>, fail_attempt: usize) -> Arc<Self> {
+        Self::with_mode(inner, fail_attempt, true)
+    }
+
+    fn with_mode(
+        inner: Arc<dyn ObjectStore>,
+        fail_attempt: usize,
+        fail_after_apply: bool,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            fail_attempt,
+            fail_after_apply,
+            attempts: AtomicUsize::new(0),
+        })
+    }
+}
+
+#[async_trait]
+impl ObjectStore for FailWalCommitCasStore {
+    async fn get(&self, key: &str) -> sana::Result<GetResult> {
+        self.inner.get(key).await
+    }
+
+    async fn get_range(&self, key: &str, range: Range<u64>) -> sana::Result<Bytes> {
+        self.inner.get_range(key, range).await
+    }
+
+    async fn put(&self, key: &str, bytes: Bytes) -> sana::Result<ObjectVersion> {
+        self.inner.put(key, bytes).await
+    }
+
+    async fn put_if_absent(&self, key: &str, bytes: Bytes) -> sana::Result<ObjectVersion> {
+        self.inner.put_if_absent(key, bytes).await
+    }
+
+    async fn compare_and_set(
+        &self,
+        key: &str,
+        expected: ObjectVersion,
+        bytes: Bytes,
+    ) -> sana::Result<ObjectVersion> {
+        let should_fail = if key.ends_with("/wal_commit/current") {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            attempt == self.fail_attempt
+        } else {
+            false
+        };
+        if should_fail && !self.fail_after_apply {
+            return Err(Error::Io(std::io::Error::other(
+                "injected WAL commit CAS failure",
+            )));
+        }
+        let result = self.inner.compare_and_set(key, expected, bytes).await;
+        if should_fail && self.fail_after_apply {
+            result?;
+            return Err(Error::Io(std::io::Error::other(
+                "injected ambiguous WAL commit response",
+            )));
+        }
+        result
+    }
+
+    async fn list(&self, prefix: &str) -> sana::Result<Vec<ObjectMeta>> {
+        self.inner.list(prefix).await
+    }
+
+    async fn delete(&self, key: &str) -> sana::Result<()> {
+        self.inner.delete(key).await
+    }
+}
+
 fn doc_with(id: u64, title: &str, score: i64) -> Document {
     let mut d = Document::new(Id::U64(id));
     d.attributes
@@ -116,6 +201,294 @@ async fn commit_cursor_advances_per_append() {
     assert_eq!(c1.seq, 1);
     assert_eq!(c2.seq, 2);
     assert_eq!(ns.commit_cursor().await.unwrap().seq, 2);
+}
+
+#[tokio::test]
+async fn idempotent_retry_survives_reopen_without_consuming_sequence() {
+    let dir = tempfile::tempdir().unwrap();
+    let object_store = store(&dir);
+    let ns = Namespace::create(object_store.clone(), "docs")
+        .await
+        .unwrap();
+    let operations = vec![WalOp::Upsert {
+        id: Id::U64(1),
+        document: doc_with(1, "alpha", 10),
+    }];
+
+    let first = ns
+        .append(operations.clone(), Some("../request/one".into()))
+        .await
+        .unwrap();
+    drop(ns);
+    let reopened = Namespace::open(object_store.clone(), "docs").await.unwrap();
+    let retry = reopened
+        .append(operations, Some("../request/one".into()))
+        .await
+        .unwrap();
+
+    assert_eq!(first, retry);
+    assert_eq!(retry.seq, 1);
+    assert_eq!(reopened.commit_cursor().await.unwrap().seq, 1);
+    assert_eq!(
+        object_store
+            .list("namespaces/docs/wal/")
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn idempotency_key_rejects_a_different_payload() {
+    let dir = tempfile::tempdir().unwrap();
+    let ns = Namespace::create(store(&dir), "docs").await.unwrap();
+    ns.append(
+        vec![WalOp::Upsert {
+            id: Id::U64(1),
+            document: doc_with(1, "alpha", 10),
+        }],
+        Some("request-1".into()),
+    )
+    .await
+    .unwrap();
+
+    let error = ns
+        .append(
+            vec![WalOp::Upsert {
+                id: Id::U64(2),
+                document: doc_with(2, "beta", 20),
+            }],
+            Some("request-1".into()),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::IdempotencyConflict(_)));
+    assert_eq!(ns.commit_cursor().await.unwrap().seq, 1);
+    assert_eq!(ns.lookup(&Id::U64(2)).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn concurrent_identical_idempotent_appends_commit_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let object_store = store(&dir);
+    Namespace::create(object_store.clone(), "docs")
+        .await
+        .unwrap();
+    let first = Namespace::open(object_store.clone(), "docs").await.unwrap();
+    let second = Namespace::open(object_store, "docs").await.unwrap();
+    let operations = vec![WalOp::Upsert {
+        id: Id::U64(1),
+        document: doc_with(1, "alpha", 10),
+    }];
+
+    let (left, right) = tokio::join!(
+        first.append(operations.clone(), Some("same-request".into())),
+        second.append(operations, Some("same-request".into()))
+    );
+    assert_eq!(left.unwrap().seq, 1);
+    assert_eq!(right.unwrap().seq, 1);
+    assert_eq!(first.commit_cursor().await.unwrap().seq, 1);
+}
+
+#[tokio::test]
+async fn concurrent_conflicting_idempotent_appends_choose_one_payload() {
+    let dir = tempfile::tempdir().unwrap();
+    let object_store = store(&dir);
+    Namespace::create(object_store.clone(), "docs")
+        .await
+        .unwrap();
+    let first = Namespace::open(object_store.clone(), "docs").await.unwrap();
+    let second = Namespace::open(object_store, "docs").await.unwrap();
+
+    let (left, right) = tokio::join!(
+        first.append(
+            vec![WalOp::Upsert {
+                id: Id::U64(1),
+                document: doc_with(1, "left", 10),
+            }],
+            Some("conflict".into()),
+        ),
+        second.append(
+            vec![WalOp::Upsert {
+                id: Id::U64(1),
+                document: doc_with(1, "right", 20),
+            }],
+            Some("conflict".into()),
+        )
+    );
+
+    assert!(left.is_ok() ^ right.is_ok());
+    let error = if let Err(error) = left {
+        error
+    } else {
+        right.unwrap_err()
+    };
+    assert!(matches!(error, Error::IdempotencyConflict(_)));
+    assert_eq!(first.commit_cursor().await.unwrap().seq, 1);
+}
+
+#[tokio::test]
+async fn concurrent_namespace_handles_assign_distinct_sequences() {
+    let dir = tempfile::tempdir().unwrap();
+    let object_store = store(&dir);
+    Namespace::create(object_store.clone(), "docs")
+        .await
+        .unwrap();
+    let mut tasks = tokio::task::JoinSet::new();
+    for id in 1..=16 {
+        let namespace = Namespace::open(object_store.clone(), "docs").await.unwrap();
+        tasks.spawn(async move {
+            namespace
+                .upsert(doc_with(id, &format!("doc-{id}"), id as i64))
+                .await
+        });
+    }
+    let mut sequences = Vec::new();
+    while let Some(result) = tasks.join_next().await {
+        sequences.push(result.unwrap().unwrap().seq);
+    }
+    sequences.sort_unstable();
+    assert_eq!(sequences, (1..=16).collect::<Vec<_>>());
+
+    let namespace = Namespace::open(object_store, "docs").await.unwrap();
+    assert_eq!(namespace.replay().await.unwrap().len(), 16);
+}
+
+#[tokio::test]
+async fn pending_idempotent_commit_recovers_after_failure_and_gc() {
+    let dir = tempfile::tempdir().unwrap();
+    let inner = store(&dir);
+    let failing: Arc<dyn ObjectStore> = FailWalCommitCasStore::new(inner.clone(), 2);
+    let ns = Namespace::create(failing, "docs").await.unwrap();
+    let operations = vec![WalOp::Upsert {
+        id: Id::U64(1),
+        document: doc_with(1, "alpha", 10),
+    }];
+
+    let error = ns
+        .append(operations.clone(), Some("recover-me".into()))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Io(_)));
+    assert_eq!(ns.commit_cursor().await.unwrap().seq, 0);
+
+    // A pending staging object and its pre-published dedup record must survive
+    // cleanup, even though the canonical WAL is not committed yet.
+    indexer::gc(&ns, true).await.unwrap();
+
+    let reopened = Namespace::open(inner, "docs").await.unwrap();
+    let cursor = reopened
+        .append(operations, Some("recover-me".into()))
+        .await
+        .unwrap();
+    assert_eq!(cursor.seq, 1);
+    assert_eq!(
+        reopened.lookup(&Id::U64(1)).await.unwrap(),
+        Some(doc_with(1, "alpha", 10))
+    );
+}
+
+#[tokio::test]
+async fn ambiguous_successful_commit_response_retries_without_duplication() {
+    let dir = tempfile::tempdir().unwrap();
+    let inner = store(&dir);
+    let failing: Arc<dyn ObjectStore> = FailWalCommitCasStore::after_apply(inner.clone(), 2);
+    let ns = Namespace::create(failing, "docs").await.unwrap();
+    let operations = vec![WalOp::Upsert {
+        id: Id::U64(1),
+        document: doc_with(1, "alpha", 10),
+    }];
+
+    let error = ns
+        .append(operations.clone(), Some("ambiguous".into()))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Io(_)));
+    assert_eq!(ns.commit_cursor().await.unwrap().seq, 1);
+
+    let reopened = Namespace::open(inner, "docs").await.unwrap();
+    let cursor = reopened
+        .append(operations, Some("ambiguous".into()))
+        .await
+        .unwrap();
+    assert_eq!(cursor.seq, 1);
+    assert_eq!(reopened.commit_cursor().await.unwrap().seq, 1);
+}
+
+#[tokio::test]
+async fn indexed_wal_gc_preserves_idempotency_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let object_store = store(&dir);
+    let ns = Namespace::create(object_store.clone(), "docs")
+        .await
+        .unwrap();
+    let operations = vec![WalOp::Upsert {
+        id: Id::U64(1),
+        document: doc_with(1, "alpha", 10),
+    }];
+    let cursor = ns
+        .append(operations.clone(), Some("keep-marker".into()))
+        .await
+        .unwrap();
+    assert!(indexer::flush(&ns).await.unwrap());
+    indexer::gc(&ns, true).await.unwrap();
+    assert!(
+        object_store
+            .list("namespaces/docs/wal/")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    assert_eq!(
+        ns.append(operations, Some("keep-marker".into()))
+            .await
+            .unwrap(),
+        cursor
+    );
+    assert_eq!(ns.commit_cursor().await.unwrap(), cursor);
+}
+
+#[tokio::test]
+async fn legacy_commit_cursor_is_migrated_on_append() {
+    let dir = tempfile::tempdir().unwrap();
+    let object_store = store(&dir);
+    let ns = Namespace::create(object_store.clone(), "docs")
+        .await
+        .unwrap();
+    object_store
+        .put(
+            "namespaces/docs/wal_commit/current",
+            Bytes::from_static(br#"{"epoch":0,"seq":0}"#),
+        )
+        .await
+        .unwrap();
+
+    let cursor = ns.upsert(doc_with(1, "alpha", 10)).await.unwrap();
+    assert_eq!(cursor.seq, 1);
+    assert_eq!(ns.commit_cursor().await.unwrap().seq, 1);
+}
+
+#[tokio::test]
+async fn idempotency_keys_are_bounded_and_nonempty() {
+    let dir = tempfile::tempdir().unwrap();
+    let ns = Namespace::create(store(&dir), "docs").await.unwrap();
+    let operations = vec![WalOp::Delete { id: Id::U64(1) }];
+
+    assert!(matches!(
+        ns.append(operations.clone(), Some(String::new()))
+            .await
+            .unwrap_err(),
+        Error::InvalidWrite(_)
+    ));
+    assert!(matches!(
+        ns.append(operations, Some("x".repeat(257)))
+            .await
+            .unwrap_err(),
+        Error::InvalidWrite(_)
+    ));
+    assert_eq!(ns.commit_cursor().await.unwrap().seq, 0);
 }
 
 #[tokio::test]

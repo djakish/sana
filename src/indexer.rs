@@ -25,8 +25,8 @@ use crate::manifest::{
     VectorMaintenancePlan, VectorMaintenanceTask,
 };
 use crate::namespace::{
-    Namespace, apply_op, manifest_body_key_for_pointer, manifest_pointer_key, now_ms, op_id,
-    wal_commit_key, wal_key,
+    Namespace, apply_op, idempotency_prefix, manifest_body_key_for_pointer, manifest_pointer_key,
+    now_ms, op_id, wal_commit_key, wal_key,
 };
 use crate::pinning::pinning_key;
 use crate::rabitq;
@@ -782,8 +782,9 @@ pub struct GcReport {
 /// object is kept iff the read path can still reach it: the pointer and its
 /// manifest body, the commit cursor, every doc/attr/vector run (plus version
 /// maps, RaBitQ companions, and append deltas) named by the manifest, and the
-/// unindexed WAL overlay `(indexed_cursor, commit]`. Everything else under the
-/// prefix is orphaned.
+/// unindexed WAL overlay `(indexed_cursor, commit]`. Durable idempotency records
+/// and the staging object for an active WAL reservation are also retained.
+/// Everything else under the prefix is orphaned.
 ///
 /// Assumes single-writer quiescence, like the filesystem store's CAS (D4): a
 /// concurrent reader still holding an older manifest could reference an object
@@ -791,12 +792,15 @@ pub struct GcReport {
 pub async fn gc(ns: &Namespace, apply: bool) -> Result<GcReport> {
     let snapshot = ns.load_manifest_snapshot().await?;
     let manifest = &snapshot.manifest;
-    let commit = ns.commit_cursor().await?;
+    let (commit, pending_staging_key) = ns.wal_gc_state().await?;
 
     let mut live: BTreeSet<String> = BTreeSet::new();
     live.insert(manifest_pointer_key(ns.name()));
     live.insert(wal_commit_key(ns.name()));
     live.insert(pinning_key(ns.name()));
+    if let Some(key) = pending_staging_key {
+        live.insert(key);
+    }
     live.insert(manifest_body_key_for_pointer(ns.name(), &snapshot.pointer));
     live.extend(manifest.referenced_index_keys());
     live.extend(foreign_references_into_namespace(ns).await?);
@@ -814,8 +818,9 @@ pub async fn gc(ns: &Namespace, apply: bool) -> Result<GcReport> {
     let mut orphan_keys = Vec::new();
     let mut orphan_bytes = 0u64;
     let mut live_count = 0usize;
+    let idempotency_prefix = idempotency_prefix(ns.name());
     for object in &objects {
-        if live.contains(&object.key) {
+        if live.contains(&object.key) || object.key.starts_with(&idempotency_prefix) {
             live_count += 1;
         } else {
             orphan_bytes += object.size;
