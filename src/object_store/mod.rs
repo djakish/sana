@@ -33,6 +33,14 @@ impl std::fmt::Display for ObjectVersion {
     }
 }
 
+impl ObjectVersion {
+    /// Verify bytes against either the current SHA-256 version or Sana's
+    /// legacy SipHash-1-3 content version.
+    pub fn matches_content(&self, bytes: &[u8]) -> bool {
+        self == &version_of(bytes) || self == &legacy_version_of(bytes)
+    }
+}
+
 /// Bytes plus the version observed at read time. Returning both in one call
 /// avoids a read-modify-CAS race that a separate `get` + `head` would have.
 #[derive(Clone, Debug)]
@@ -80,11 +88,53 @@ pub trait ObjectStore: Send + Sync {
     async fn delete(&self, key: &str) -> Result<()>;
 }
 
-/// Compute the content-addressed version of an object's bytes. Stable across
-/// runs because `DefaultHasher::new` uses a fixed seed.
+/// Compute the stable SHA-256 content version of an object's bytes.
 pub fn version_of(bytes: &[u8]) -> ObjectVersion {
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(bytes);
+    ObjectVersion(format!("sha256-{digest:x}"))
+}
+
+pub(crate) fn legacy_version_of(bytes: &[u8]) -> ObjectVersion {
     use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
+    use siphasher::sip::SipHasher13;
+
+    let mut h = SipHasher13::new_with_keys(0, 0);
     bytes.hash(&mut h);
     ObjectVersion(format!("{:016x}", h.finish()))
+}
+
+pub(crate) fn version_matches(
+    expected: &ObjectVersion,
+    actual: &ObjectVersion,
+    bytes: &[u8],
+) -> bool {
+    expected == actual || expected.matches_content(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ObjectVersion, legacy_version_of, version_matches, version_of};
+
+    #[test]
+    fn content_versions_are_stable_and_legacy_compatible() {
+        assert_eq!(
+            version_of(b"hello world"),
+            ObjectVersion(
+                "sha256-b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+                    .into()
+            )
+        );
+        assert_eq!(
+            legacy_version_of(b"hello world"),
+            ObjectVersion("846d8f5b292efb98".into())
+        );
+        assert!(version_matches(
+            &legacy_version_of(b"hello world"),
+            &version_of(b"hello world"),
+            b"hello world"
+        ));
+        assert!(!legacy_version_of(b"hello world").matches_content(b"different"));
+    }
 }

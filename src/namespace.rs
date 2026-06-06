@@ -30,7 +30,9 @@ use crate::doc::{DocRecord, decode_id, encode_id};
 use crate::error::{Error, Result};
 use crate::index_queue::{EnqueueOutcome, IndexQueue};
 use crate::manifest::{ManifestPointer, NamespaceManifest};
-use crate::object_store::{GetResult, ObjectStore, ObjectVersion, version_of};
+use crate::object_store::{
+    GetResult, ObjectStore, ObjectVersion, legacy_version_of, version_matches, version_of,
+};
 use crate::query::{
     MultiQuery, MultiQueryResult, Query, QueryOptions, QueryResult, RecallRequest, RecallResult,
 };
@@ -130,8 +132,20 @@ pub(crate) fn now_ms() -> u64 {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct RequestFingerprint {
     version: ObjectVersion,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    legacy_version: Option<ObjectVersion>,
     size_bytes: u64,
     crc32: u32,
+}
+
+impl RequestFingerprint {
+    fn matches(&self, other: &Self) -> bool {
+        self.size_bytes == other.size_bytes
+            && self.crc32 == other.crc32
+            && (self.version == other.version
+                || self.legacy_version.as_ref() == Some(&other.version)
+                || other.legacy_version.as_ref() == Some(&self.version))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -319,6 +333,7 @@ fn request_fingerprint<T: Serialize + ?Sized>(request: &T) -> Result<RequestFing
         postcard::to_allocvec(request).map_err(|error| Error::Codec(error.to_string()))?;
     Ok(RequestFingerprint {
         version: version_of(&encoded),
+        legacy_version: Some(legacy_version_of(&encoded)),
         size_bytes: u64::try_from(encoded.len())
             .map_err(|_| Error::InvalidWrite("write batch exceeds u64 size".into()))?,
         crc32: crc32fast::hash(&encoded),
@@ -1423,7 +1438,11 @@ impl Namespace {
             }
 
             let staged = self.store.get(&pending.staging_key).await?;
-            if staged.version != pending.staging_version {
+            if !version_matches(
+                &pending.staging_version,
+                &staged.version,
+                &staged.bytes,
+            ) {
                 return Err(Error::Corrupt(format!(
                     "pending WAL staging version mismatch at {}",
                     pending.staging_key
@@ -1447,7 +1466,7 @@ impl Namespace {
             if batch.namespace != self.name
                 || batch.sequence != pending.cursor.seq
                 || batch.idempotency_key != pending.idempotency_key
-                || &request_fingerprint(&batch.operations)? != expected_wal_fingerprint
+                || !request_fingerprint(&batch.operations)?.matches(expected_wal_fingerprint)
             {
                 return Err(Error::Corrupt(
                     "pending WAL staging object does not match its reservation".into(),
@@ -1536,7 +1555,7 @@ impl Namespace {
                 "idempotency record kind/outcome mismatch at {object_key}"
             )));
         }
-        if &record.request_fingerprint != fingerprint || record.kind != kind {
+        if !record.request_fingerprint.matches(fingerprint) || record.kind != kind {
             return Err(Error::IdempotencyConflict(key.to_string()));
         }
         if record.cursor > committed {
@@ -1583,7 +1602,7 @@ impl Namespace {
 
     async fn load_write_outcome(&self, object: &ImmutableObjectRef) -> Result<WriteOutcome> {
         let got = self.store.get(&object.key).await?;
-        if got.version != object.version {
+        if !version_matches(&object.version, &got.version, &got.bytes) {
             return Err(Error::Corrupt(format!(
                 "conditional write outcome version mismatch at {}",
                 object.key
@@ -1846,5 +1865,29 @@ pub(crate) fn apply_op(docs: &mut BTreeMap<Id, Document>, op: WalOp) {
                 doc.vectors.insert(k, v);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RequestFingerprint, request_fingerprint};
+    use crate::object_store::legacy_version_of;
+    use crate::value::Id;
+    use crate::wal::WalOp;
+
+    #[test]
+    fn request_fingerprint_matches_legacy_records() {
+        let operations = vec![WalOp::Delete { id: Id::U64(7) }];
+        let current = request_fingerprint(&operations).unwrap();
+        let encoded = postcard::to_allocvec(&operations).unwrap();
+        let legacy = RequestFingerprint {
+            version: legacy_version_of(&encoded),
+            legacy_version: None,
+            size_bytes: current.size_bytes,
+            crc32: current.crc32,
+        };
+
+        assert!(current.matches(&legacy));
+        assert!(legacy.matches(&current));
     }
 }
