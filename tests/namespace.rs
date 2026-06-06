@@ -204,6 +204,62 @@ async fn commit_cursor_advances_per_append() {
 }
 
 #[tokio::test]
+async fn unindexed_wal_bytes_tracks_commits_and_flushes() {
+    let dir = tempfile::tempdir().unwrap();
+    let object_store = store(&dir);
+    let ns = Namespace::create(object_store.clone(), "docs")
+        .await
+        .unwrap();
+    assert_eq!(ns.unindexed_wal_bytes().await.unwrap(), 0);
+
+    let first = ns.upsert(doc_with(1, "alpha", 10)).await.unwrap();
+    let first_size = object_store
+        .get(&format!(
+            "namespaces/docs/wal/{}/{}.wal",
+            first.epoch, first.seq
+        ))
+        .await
+        .unwrap()
+        .bytes
+        .len() as u64;
+    assert_eq!(ns.unindexed_wal_bytes().await.unwrap(), first_size);
+
+    let second = ns.upsert(doc_with(2, "beta", 20)).await.unwrap();
+    let second_size = object_store
+        .get(&format!(
+            "namespaces/docs/wal/{}/{}.wal",
+            second.epoch, second.seq
+        ))
+        .await
+        .unwrap()
+        .bytes
+        .len() as u64;
+    assert_eq!(
+        ns.unindexed_wal_bytes().await.unwrap(),
+        first_size + second_size
+    );
+
+    assert!(indexer::flush(&ns).await.unwrap());
+    assert_eq!(ns.unindexed_wal_bytes().await.unwrap(), 0);
+    assert_eq!(
+        ns.load_manifest().await.unwrap().indexed_wal_bytes,
+        first_size + second_size
+    );
+
+    let third = ns.delete(Id::U64(1)).await.unwrap();
+    let third_size = object_store
+        .get(&format!(
+            "namespaces/docs/wal/{}/{}.wal",
+            third.epoch, third.seq
+        ))
+        .await
+        .unwrap()
+        .bytes
+        .len() as u64;
+    assert_eq!(ns.unindexed_wal_bytes().await.unwrap(), third_size);
+}
+
+#[tokio::test]
 async fn idempotent_retry_survives_reopen_without_consuming_sequence() {
     let dir = tempfile::tempdir().unwrap();
     let object_store = store(&dir);
@@ -468,6 +524,39 @@ async fn legacy_commit_cursor_is_migrated_on_append() {
     let cursor = ns.upsert(doc_with(1, "alpha", 10)).await.unwrap();
     assert_eq!(cursor.seq, 1);
     assert_eq!(ns.commit_cursor().await.unwrap().seq, 1);
+}
+
+#[tokio::test]
+async fn legacy_commit_cursor_reconstructs_only_the_unindexed_overlay() {
+    let dir = tempfile::tempdir().unwrap();
+    let object_store = store(&dir);
+    let ns = Namespace::create(object_store.clone(), "docs")
+        .await
+        .unwrap();
+    ns.upsert(doc_with(1, "alpha", 10)).await.unwrap();
+    ns.upsert(doc_with(2, "beta", 20)).await.unwrap();
+    indexer::flush(&ns).await.unwrap();
+    let cursor = ns.delete(Id::U64(1)).await.unwrap();
+    let unindexed_size = object_store
+        .get(&format!(
+            "namespaces/docs/wal/{}/{}.wal",
+            cursor.epoch, cursor.seq
+        ))
+        .await
+        .unwrap()
+        .bytes
+        .len() as u64;
+
+    object_store
+        .put(
+            "namespaces/docs/wal_commit/current",
+            Bytes::from(serde_json::to_vec(&cursor).unwrap()),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(ns.unindexed_wal_bytes().await.unwrap(), unindexed_size);
+    assert_eq!(ns.commit_cursor().await.unwrap(), cursor);
 }
 
 #[tokio::test]

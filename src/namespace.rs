@@ -142,6 +142,8 @@ struct PendingWalCommit {
     cursor: WalCursor,
     staging_key: String,
     staging_version: ObjectVersion,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    wal_size_bytes: Option<u64>,
     request_fingerprint: RequestFingerprint,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     wal_fingerprint: Option<RequestFingerprint>,
@@ -176,6 +178,8 @@ struct WalCommitState {
     format_version: u32,
     committed: WalCursor,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    committed_wal_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pending: Option<PendingWalCommit>,
 }
 
@@ -184,6 +188,7 @@ impl WalCommitState {
         Self {
             format_version: WAL_COMMIT_FORMAT_VERSION,
             committed,
+            committed_wal_bytes: Some(0),
             pending: None,
         }
     }
@@ -285,7 +290,12 @@ fn decode_commit_state(namespace: &str, bytes: &[u8]) -> Result<WalCommitState> 
         serde_json::from_slice(bytes).map_err(|error| Error::Codec(error.to_string()))?;
     let state = match stored {
         StoredWalCommit::State(state) => *state,
-        StoredWalCommit::Legacy(cursor) => WalCommitState::new(cursor),
+        StoredWalCommit::Legacy(cursor) => WalCommitState {
+            format_version: WAL_COMMIT_FORMAT_VERSION,
+            committed: cursor,
+            committed_wal_bytes: None,
+            pending: None,
+        },
     };
     state.validate(namespace)?;
     Ok(state)
@@ -647,9 +657,136 @@ impl Namespace {
     }
 
     async fn load_commit_state(&self) -> Result<(GetResult, WalCommitState)> {
-        let got = self.store.get(&wal_commit_key(&self.name)).await?;
-        let state = decode_commit_state(&self.name, &got.bytes)?;
-        Ok((got, state))
+        loop {
+            let got = self.store.get(&wal_commit_key(&self.name)).await?;
+            let mut state = decode_commit_state(&self.name, &got.bytes)?;
+            if state.committed_wal_bytes.is_some() {
+                return Ok((got, state));
+            }
+
+            state.committed_wal_bytes = Some(
+                self.reconstruct_committed_wal_bytes(state.committed)
+                    .await?,
+            );
+            match self
+                .store
+                .compare_and_set(
+                    &wal_commit_key(&self.name),
+                    got.version.clone(),
+                    Bytes::from(encode_commit_state(&state)?),
+                )
+                .await
+            {
+                Ok(version) => {
+                    return Ok((
+                        GetResult {
+                            bytes: Bytes::from(encode_commit_state(&state)?),
+                            version,
+                        },
+                        state,
+                    ));
+                }
+                Err(Error::CasMismatch { .. }) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    async fn reconstruct_committed_wal_bytes(&self, committed: WalCursor) -> Result<u64> {
+        let manifest = self.load_manifest().await?;
+        let start = match manifest.indexed_cursor {
+            Some(indexed) if indexed.epoch == committed.epoch => {
+                if indexed.seq > committed.seq {
+                    return Err(Error::Corrupt(format!(
+                        "indexed WAL cursor {indexed:?} is ahead of committed cursor {committed:?}"
+                    )));
+                }
+                if indexed.seq == committed.seq {
+                    return Ok(manifest.indexed_wal_bytes);
+                }
+                indexed.seq.checked_add(1).ok_or_else(|| {
+                    Error::Corrupt("indexed WAL sequence overflow during migration".into())
+                })?
+            }
+            Some(indexed) => {
+                return Err(Error::Corrupt(format!(
+                    "indexed WAL epoch {} differs from committed epoch {}",
+                    indexed.epoch, committed.epoch
+                )));
+            }
+            None => 1,
+        };
+        if start > committed.seq {
+            return Ok(0);
+        }
+
+        let prefix = format!("namespaces/{}/wal/{}/", self.name, committed.epoch);
+        let mut entries = Vec::new();
+        for object in self.store.list(&prefix).await? {
+            let Some(sequence) = object
+                .key
+                .strip_prefix(&prefix)
+                .and_then(|key| key.strip_suffix(".wal"))
+                .and_then(|key| key.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            if (start..=committed.seq).contains(&sequence) {
+                entries.push((sequence, object.size));
+            }
+        }
+        entries.sort_unstable_by_key(|entry| entry.0);
+
+        let mut expected = Some(start);
+        let mut total = manifest.indexed_wal_bytes;
+        for (sequence, size) in entries {
+            if Some(sequence) != expected {
+                return Err(Error::Corrupt(format!(
+                    "missing WAL sequence {} while migrating byte accounting",
+                    expected.expect("a listed sequence cannot follow the committed cursor")
+                )));
+            }
+            total = total
+                .checked_add(size)
+                .ok_or_else(|| Error::Corrupt("committed WAL byte counter overflow".into()))?;
+            expected = if sequence == committed.seq {
+                None
+            } else {
+                Some(sequence.checked_add(1).ok_or_else(|| {
+                    Error::Corrupt("WAL sequence overflow during migration".into())
+                })?)
+            };
+        }
+        if let Some(expected) = expected {
+            return Err(Error::Corrupt(format!(
+                "missing WAL sequence {expected} while migrating byte accounting"
+            )));
+        }
+        Ok(total)
+    }
+
+    pub(crate) async fn wal_commit_stats(&self) -> Result<(WalCursor, u64)> {
+        let (_, state) = self.load_commit_state().await?;
+        let committed_wal_bytes = state
+            .committed_wal_bytes
+            .ok_or_else(|| Error::Corrupt("WAL commit byte counter was not migrated".into()))?;
+        Ok((state.committed, committed_wal_bytes))
+    }
+
+    /// Exact bytes in the committed WAL overlay not yet folded into the
+    /// current manifest's indexes.
+    pub async fn unindexed_wal_bytes(&self) -> Result<u64> {
+        for _ in 0..3 {
+            let manifest = self.load_manifest().await?;
+            let (_, committed_wal_bytes) = self.wal_commit_stats().await?;
+            if let Some(unindexed) = committed_wal_bytes.checked_sub(manifest.indexed_wal_bytes) {
+                return Ok(unindexed);
+            }
+            tokio::task::yield_now().await;
+        }
+        Err(Error::Corrupt(
+            "indexed WAL byte watermark exceeds committed WAL bytes".into(),
+        ))
     }
 
     pub(crate) async fn wal_gc_state(&self) -> Result<(WalCursor, Vec<String>)> {
@@ -1050,6 +1187,8 @@ impl Namespace {
             operations: prepared.operations,
         };
         let encoded = batch.encode()?;
+        let wal_size_bytes = u64::try_from(encoded.len())
+            .map_err(|_| Error::InvalidWrite("encoded WAL batch is too large".into()))?;
         let staging_version = version_of(&encoded);
         let staging_key = wal_staging_key(&self.name, next, &staging_version);
         put_immutable_if_absent(&self.store, &staging_key, Bytes::from(encoded)).await?;
@@ -1074,6 +1213,7 @@ impl Namespace {
             cursor: next,
             staging_key,
             staging_version,
+            wal_size_bytes: Some(wal_size_bytes),
             request_fingerprint: prepared.request_fingerprint,
             wal_fingerprint: Some(wal_fingerprint),
             idempotency_key: prepared.idempotency_key,
@@ -1121,6 +1261,16 @@ impl Namespace {
                     pending.staging_key
                 )));
             }
+            let staged_size = u64::try_from(staged.bytes.len())
+                .map_err(|_| Error::Corrupt("staged WAL object is too large".into()))?;
+            if let Some(expected_size) = pending.wal_size_bytes
+                && staged_size != expected_size
+            {
+                return Err(Error::Corrupt(format!(
+                    "pending WAL staging size mismatch at {}",
+                    pending.staging_key
+                )));
+            }
             let batch = WalBatch::decode(&staged.bytes)?;
             let expected_wal_fingerprint = pending
                 .wal_fingerprint
@@ -1164,6 +1314,15 @@ impl Namespace {
 
             let mut committed = state;
             committed.committed = pending.cursor;
+            committed.committed_wal_bytes = Some(
+                committed
+                    .committed_wal_bytes
+                    .ok_or_else(|| {
+                        Error::Corrupt("WAL commit byte counter was not migrated".into())
+                    })?
+                    .checked_add(staged_size)
+                    .ok_or_else(|| Error::Corrupt("committed WAL byte counter overflow".into()))?,
+            );
             committed.pending = None;
             match self
                 .store

@@ -146,6 +146,11 @@ pub struct NamespaceManifest {
     /// Last WAL position folded into the index (None until first index build).
     #[serde(default)]
     pub indexed_cursor: Option<WalCursor>,
+    /// Cumulative committed WAL bytes folded into this manifest's indexes.
+    /// This is paired with the commit state's cumulative byte counter so
+    /// unindexed WAL size is available without listing the WAL prefix.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub indexed_wal_bytes: u64,
     /// Document-family SST files, ordered newest-first: on a read, the first
     /// file containing a key wins (a tombstone there hides older files).
     #[serde(default)]
@@ -184,6 +189,7 @@ impl NamespaceManifest {
             schema: Schema::default(),
             wal_commit_cursor: None,
             indexed_cursor: None,
+            indexed_wal_bytes: 0,
             doc_ssts: Vec::new(),
             attr_ssts: Vec::new(),
             text_ssts: Vec::new(),

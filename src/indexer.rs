@@ -440,7 +440,7 @@ fn build_sst(records: &BTreeMap<Id, DocRecord>) -> Result<BuiltSst> {
 pub async fn flush(ns: &Namespace) -> Result<bool> {
     let snapshot = ns.load_manifest_snapshot().await?;
     let mut manifest = snapshot.manifest;
-    let commit = ns.commit_cursor().await?;
+    let (commit, committed_wal_bytes) = ns.wal_commit_stats().await?;
     let from_seq = manifest.indexed_cursor.map(|c| c.seq).unwrap_or(0);
     if from_seq >= commit.seq {
         return Ok(false);
@@ -453,6 +453,7 @@ pub async fn flush(ns: &Namespace) -> Result<bool> {
         manifest.updated_at_ms = now_ms();
         manifest.wal_commit_cursor = Some(commit);
         manifest.indexed_cursor = Some(commit);
+        manifest.indexed_wal_bytes = committed_wal_bytes;
         ns.publish_manifest(snapshot.pointer_version, &manifest)
             .await?;
         return Ok(true);
@@ -530,6 +531,7 @@ pub async fn flush(ns: &Namespace) -> Result<bool> {
     manifest.updated_at_ms = now_ms();
     manifest.wal_commit_cursor = Some(commit);
     manifest.indexed_cursor = Some(commit);
+    manifest.indexed_wal_bytes = committed_wal_bytes;
     manifest.doc_ssts.insert(
         0,
         SstMeta {

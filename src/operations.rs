@@ -82,6 +82,7 @@ impl Namespace {
         child_manifest.generation = 0;
         child_manifest.wal_commit_cursor = None;
         child_manifest.indexed_cursor = None;
+        child_manifest.indexed_wal_bytes = 0;
         child_manifest.branch_parent = Some(BranchParent {
             namespace: self.name().to_string(),
             generation: source_generation,
@@ -121,6 +122,7 @@ impl Namespace {
         target_manifest.generation = 0;
         target_manifest.wal_commit_cursor = None;
         target_manifest.indexed_cursor = None;
+        target_manifest.indexed_wal_bytes = 0;
         target_manifest.branch_parent = None;
         target_manifest.created_at_ms = timestamp_ms;
         target_manifest.updated_at_ms = timestamp_ms;
