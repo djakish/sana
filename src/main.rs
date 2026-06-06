@@ -29,6 +29,7 @@ async fn main() -> CliResult {
         Some("compact") => compact(&args).await,
         Some("gc") => gc(&args).await,
         Some("maintain-vectors") => maintain_vectors(&args).await,
+        Some("work-indexing") => work_indexing(&args).await,
         Some("demo") => demo(&args).await,
         _ => {
             usage();
@@ -55,6 +56,7 @@ fn usage() {
     eprintln!("  sana compact <dir> <ns>   # merge SSTs, drop tombstones");
     eprintln!("  sana gc      <dir> <ns> [--apply]   # report (or delete) orphaned objects");
     eprintln!("  sana maintain-vectors <dir> <ns>   # run one vector maintenance pass");
+    eprintln!("  sana work-indexing <dir> <worker-id>   # claim and run one indexing job");
     eprintln!("  sana demo    <dir>");
 }
 
@@ -255,6 +257,25 @@ async fn maintain_vectors(args: &[String]) -> CliResult {
             "nothing to maintain"
         }
     );
+    Ok(())
+}
+
+async fn work_indexing(args: &[String]) -> CliResult {
+    let (dir, worker_id) = (arg(args, 2)?, arg(args, 3)?);
+    match sana::index_queue::run_worker_once(store(dir), worker_id, 30_000, 1_000).await? {
+        Some(run) => println!(
+            "completed job {} for {} through WAL seq {} ({})",
+            run.job_id,
+            run.namespace,
+            run.target_cursor.seq,
+            if run.did_flush {
+                "index published"
+            } else {
+                "already indexed"
+            }
+        ),
+        None => println!("no indexing jobs available"),
+    }
     Ok(())
 }
 

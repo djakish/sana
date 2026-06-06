@@ -24,6 +24,7 @@ use bytes::Bytes;
 
 use crate::doc::{DocRecord, decode_id, encode_id};
 use crate::error::{Error, Result};
+use crate::index_queue::{EnqueueOutcome, IndexQueue};
 use crate::manifest::{ManifestPointer, NamespaceManifest};
 use crate::object_store::{ObjectStore, ObjectVersion, version_of};
 use crate::query::{MultiQuery, MultiQueryResult, Query, QueryResult, RecallRequest, RecallResult};
@@ -408,7 +409,23 @@ impl Namespace {
             )
             .await?;
 
+        // Indexing jobs are advisory. A queue outage must not turn a durable
+        // WAL commit into a reported write failure; reconciliation can enqueue
+        // this cursor again later.
+        let _ = IndexQueue::new(self.store.clone())
+            .enqueue(&self.name, next)
+            .await;
+
         Ok(next)
+    }
+
+    /// Reconcile this namespace's current durable WAL cursor into the indexing
+    /// queue. This is safe to call repeatedly because pending jobs coalesce.
+    pub async fn enqueue_indexing(&self) -> Result<EnqueueOutcome> {
+        let target = self.commit_cursor().await?;
+        IndexQueue::new(self.store.clone())
+            .enqueue(&self.name, target)
+            .await
     }
 
     async fn evolve_schema_for_ops(&self, operations: &[WalOp]) -> Result<()> {

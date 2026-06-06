@@ -8,11 +8,14 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::indexer;
+use crate::namespace::Namespace;
 use crate::namespace::now_ms;
 use crate::object_store::{GetResult, ObjectStore};
 use crate::wal::WalCursor;
@@ -63,6 +66,14 @@ pub struct ClaimedJob {
 pub enum EnqueueOutcome {
     Added { job_id: u64 },
     Coalesced { job_id: u64 },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkerRun {
+    pub job_id: u64,
+    pub namespace: String,
+    pub target_cursor: WalCursor,
+    pub did_flush: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -378,6 +389,70 @@ impl IndexQueue {
     }
 }
 
+/// Claim and execute at most one indexing notification.
+///
+/// The worker heartbeats while the indexer runs. Successful work is completed
+/// only after the manifest has reached the job's target WAL cursor. Failed work
+/// is made available after `retry_delay_ms`.
+pub async fn run_worker_once(
+    store: Arc<dyn ObjectStore>,
+    worker_id: &str,
+    lease_ms: u64,
+    retry_delay_ms: u64,
+) -> Result<Option<WorkerRun>> {
+    let queue = IndexQueue::new(store.clone());
+    let Some(claimed) = queue.claim(worker_id, lease_ms).await? else {
+        return Ok(None);
+    };
+
+    let heartbeat_every_ms = lease_ms.div_ceil(3).max(1);
+    let work = execute_index_job(store, &claimed.job);
+    tokio::pin!(work);
+    let result = loop {
+        tokio::select! {
+            result = &mut work => break result,
+            () = tokio::time::sleep(Duration::from_millis(heartbeat_every_ms)) => {
+                queue.heartbeat(&claimed.handle, lease_ms).await?;
+            }
+        }
+    };
+
+    match result {
+        Ok(did_flush) => {
+            queue.complete(&claimed.handle).await?;
+            Ok(Some(WorkerRun {
+                job_id: claimed.job.id,
+                namespace: claimed.job.namespace.clone(),
+                target_cursor: claimed.job.target_cursor,
+                did_flush,
+            }))
+        }
+        Err(work_error) => {
+            if let Err(queue_error) = queue.fail(&claimed.handle, retry_delay_ms).await {
+                return Err(Error::Corrupt(format!(
+                    "index job {} failed ({work_error}) and could not be returned to the queue: \
+                     {queue_error}",
+                    claimed.job.id
+                )));
+            }
+            Err(work_error)
+        }
+    }
+}
+
+async fn execute_index_job(store: Arc<dyn ObjectStore>, job: &IndexJob) -> Result<bool> {
+    let namespace = Namespace::open(store, &job.namespace).await?;
+    let did_flush = indexer::flush(&namespace).await?;
+    let manifest = namespace.load_manifest().await?;
+    if manifest.indexed_cursor < Some(job.target_cursor) {
+        return Err(Error::Corrupt(format!(
+            "index job {} for namespace {:?} targeted WAL {:?}, but manifest only reached {:?}",
+            job.id, job.namespace, job.target_cursor, manifest.indexed_cursor
+        )));
+    }
+    Ok(did_flush)
+}
+
 fn matching_job_index(queue: &QueueFile, handle: &ClaimHandle) -> Result<usize> {
     let Some(index) = queue.jobs.iter().position(|job| job.id == handle.job_id) else {
         return Err(stale_claim(handle, "job no longer exists"));
@@ -411,6 +486,7 @@ fn stale_claim(handle: &ClaimHandle, reason: &str) -> Error {
 mod tests {
     use super::*;
     use crate::object_store::FsObjectStore;
+    use crate::value::{Document, Id};
 
     fn queue(dir: &tempfile::TempDir) -> IndexQueue {
         IndexQueue::new(Arc::new(FsObjectStore::new(dir.path())))
@@ -556,5 +632,53 @@ mod tests {
         let jobs = queue.jobs().await.unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].target_cursor, WalCursor::new(0, 32));
+    }
+
+    #[tokio::test]
+    async fn worker_flushes_to_target_and_completes_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(FsObjectStore::new(dir.path()));
+        let namespace = Namespace::create(store.clone(), "alpha").await.unwrap();
+        let target = namespace.upsert(Document::new(Id::U64(1))).await.unwrap();
+
+        let run = run_worker_once(store.clone(), "worker", 1_000, 10)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.namespace, "alpha");
+        assert_eq!(run.target_cursor, target);
+        assert!(run.did_flush);
+        assert_eq!(
+            namespace.load_manifest().await.unwrap().indexed_cursor,
+            Some(target)
+        );
+        assert!(queue(&dir).jobs().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn completed_work_is_safe_to_repeat_after_worker_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(FsObjectStore::new(dir.path()));
+        let namespace = Namespace::create(store.clone(), "alpha").await.unwrap();
+        namespace.upsert(Document::new(Id::U64(1))).await.unwrap();
+        let queue = IndexQueue::new(store.clone());
+        let enqueued_at = queue.jobs().await.unwrap()[0].available_at_ms;
+
+        let old = queue
+            .claim_at("old-worker", 10, enqueued_at)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(execute_index_job(store.clone(), &old.job).await.unwrap());
+        let expired_at = old.job.claim.as_ref().unwrap().lease_expires_at_ms;
+
+        let replacement = queue
+            .claim_at("new-worker", 10, expired_at)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!execute_index_job(store, &replacement.job).await.unwrap());
+        queue.complete(&replacement.handle).await.unwrap();
+        assert!(queue.jobs().await.unwrap().is_empty());
     }
 }
