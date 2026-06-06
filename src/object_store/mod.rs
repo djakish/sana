@@ -15,8 +15,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 
+pub mod cache;
 pub mod fs;
 
+pub use cache::{CacheStats, CachingObjectStore};
 pub use fs::FsObjectStore;
 
 /// An opaque object version token. For the filesystem backend this is a hash
