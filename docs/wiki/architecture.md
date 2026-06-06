@@ -160,6 +160,7 @@ namespaces/{ns}/
   wal_staging/{epoch}/*.wal        # immutable bytes for pending reservations
   wal_commit/current               # committed cursor + one CAS-reserved write
   idempotency/{hex-key}.json       # permanent request fingerprint -> cursor
+  idempotency/*.outcome-*.json     # immutable conditional/filter response
   routing/pinning.json             # leased pinned-replica assignments
   index/g/{generation}/
     doc/*.sst
@@ -231,14 +232,15 @@ Write path:
 7. Update the local write-through cache for this node.
 8. Return after the WAL commit is durable.
 
-The reservation stores a content-addressed staging key rather than the request
-body. A crash at any point is recoverable by the next writer, concurrent
-namespace handles cannot overwrite the same sequence, and an ambiguous
-successful CAS response is safe to retry. An idempotency key maps to an
-immutable operation fingerprint and original cursor; a different payload using
-that key is rejected. Completed staging orphans are GC-able, while idempotency
-records are retained. A future broker can group-commit batches behind the same
-state transition when throughput requires it.
+The reservation stores content-addressed staging keys rather than request or
+response bodies. A crash at any point is recoverable by the next writer,
+concurrent namespace handles cannot overwrite the same sequence, and an
+ambiguous successful CAS response is safe to retry. An idempotency key maps to
+an immutable operation fingerprint, original cursor, and optional write-outcome
+object; a different payload using that key is rejected. Completed staging
+orphans are GC-able, while idempotency records/outcomes are retained. A future
+broker can group-commit batches behind the same state transition when
+throughput requires it.
 
 Strong reads use the manifest's indexed cursor plus WAL entries after that
 cursor. Unindexed rows are searched exhaustively and merged with indexed
@@ -634,10 +636,11 @@ Target guarantees:
 - Atomic batches: all operations in one write batch become visible together.
 - Strong reads by default: include all writes committed before the query starts.
 - Eventual reads optional: lower latency, bounded stale overlay.
-- Atomic conditional writes: evaluate predicate and write against one snapshot
-  and commit with CAS.
-- Patch/delete-by-filter: two phase, read committed semantics; identify IDs
-  from a snapshot, then re-evaluate each matching ID before modifying.
+- Atomic conditional writes: implemented for known-ID upsert/patch/delete using
+  literal query `FilterExpr` conditions and one CAS-reserved snapshot.
+- Patch/delete-by-filter: implemented as two-phase Read Committed operations;
+  identify IDs from a snapshot, then re-evaluate each candidate before
+  modifying. `$ref_new` condition operands remain future work.
 - Any node can serve any namespace.
 - Object storage is the only required stateful dependency.
 

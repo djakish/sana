@@ -13,13 +13,13 @@ the next unchecked task under "Current milestone" / "Next up".
 
 - **Current stage:** Stage 10 (Durability hardening and write semantics) —
   **in progress**.
-- **Next up:** Add atomic per-ID conditional upsert/patch/delete against one
-  committed snapshot.
+- **Next up:** Add unindexed-WAL byte accounting and configurable write/query
+  backpressure.
 - **Done:** Stage 0 (Skeleton), Stage 1 (Durable Documents), Stage 2 (SST/LSM),
   Stage 3 (Attributes & Exact Search), Stage 4 (ANN v0), Stage 5 (Native
   Filtering), Stage 6 (SPFresh local rebuild), Stage 7 (Full-text search),
   Stage 8 (RaBitQ & kernels), Stage 9 (Object-store operations).
-- **Tests:** `cargo test` green (164 tests); `cargo clippy --all-targets` clean.
+- **Tests:** `cargo test` green (176 tests); `cargo clippy --all-targets` clean.
 - **Note:** post-Stage-2 and Stage-3–5 code-review fixes applied; remaining
   findings tracked under "Stage 2 — code review follow-ups" and "Stages 3–5 —
   code review follow-ups". Recently fixed limitations: Stage 2 ranged
@@ -47,7 +47,9 @@ the next unchecked task under "Current milestone" / "Next up".
   v2 footer and fully checked metadata arithmetic while v1 files remain
   readable. WAL commits now use recoverable CAS reservations, and durable
   per-key records make exact retries return the original cursor while rejecting
-  conflicting payloads.
+  conflicting payloads. Per-ID conditional writes are serializable against the
+  WAL cursor; patch/delete-by-filter use a candidate snapshot followed by an
+  atomic recheck for Read Committed behavior.
 - **Last updated:** 2026-06-06.
 
 ---
@@ -125,7 +127,10 @@ Known limitations to fix in later stages:
 - ~~No idempotency-key dedup.~~ **Done.** Exact-key records survive WAL GC and
   process restart; equal payloads return the original cursor and unequal
   payloads return `IdempotencyConflict`.
-- Conditional writes are still future work.
+- ~~Conditional and filter-based writes.~~ **Done for literal `FilterExpr`
+  conditions.** Known-ID writes evaluate and commit under one WAL reservation;
+  patch/delete-by-filter use two-phase candidate discovery and recheck.
+  `$ref_new` condition operands remain an API-expression extension.
 - Single WAL epoch only; epoch rotation is unused.
 
 ---
@@ -861,7 +866,7 @@ Planned tasks:
 - [x] Add an SST footer checksum, checked offset arithmetic, and explicit size
       bounds with corruption/oversize regression tests.
 - [x] Make WAL idempotency keys durable and reject conflicting retries.
-- [ ] Add compare-and-set conditional writes and patch/delete-by-filter against
+- [x] Add compare-and-set conditional writes and patch/delete-by-filter against
       one validated snapshot.
 - [ ] Add unindexed-WAL byte accounting and configurable write backpressure.
 - [ ] Add HTTP write/query/metadata/recall/warm-cache endpoints over the same
@@ -895,6 +900,27 @@ Stage 10 decisions / notes:
   reclaiming completed staging orphans. Records currently have no expiry,
   favoring retry correctness over bounded metadata count until retention
   semantics are defined.
+- **D62 — Conditional writes linearize on the WAL reservation.** A known-ID
+  conditional request carries one optional `FilterExpr` per upsert, patch, or
+  delete. The writer reads the committed snapshot, evaluates every condition,
+  and CAS-reserves that exact cursor; a CAS loser re-reads and re-evaluates.
+  Missing upserts apply unconditionally, while missing patches/deletes skip.
+  Duplicate IDs are rejected so all conditions observe one pre-batch snapshot.
+  A zero-row result still commits an empty WAL batch, giving the read a durable
+  serialization point. Applied/skipped IDs and operation counts are stored in a
+  content-addressed outcome object referenced by the small commit state and
+  idempotency record.
+- **D63 — Filter mutations use two-phase Read Committed semantics.** Phase one
+  captures matching IDs from a strong snapshot. Phase two turns those IDs into
+  conditional operations with the original filter and rechecks them under the
+  WAL reservation. Rows that stopped matching are skipped; rows that became
+  eligible after phase one are intentionally missed. Patch and delete defaults
+  match the public limits (50k and 5M); `allow_partial` truncates deterministic
+  ID order and reports `rows_remaining`, while the strict mode changes nothing
+  when over limit. Request-level idempotency persists the original outcome even
+  after matches or limits change. Patch payloads are schema-validated even when
+  phase one finds no rows. Literal query filters are shared directly; `$ref_new`
+  operands remain future work.
 
 ---
 
@@ -966,6 +992,7 @@ src/
   indexer.rs             flush/compaction + attr/text/vector index publication
   operations.rs          branch, physical copy, snapshot export
   pinning.rs             leased pinned-replica control, warming, and routing
+  write.rs               conditional/filter mutation request and result types
 tests/
   common/mod.rs          assert_golden snapshot helper
   fs_object_store.rs     object store behavior (CAS, ranges, list, ...)
@@ -980,6 +1007,7 @@ tests/
   cache_warm.rs          warm planning + cache-resident ANN integration
   operations.rs          branch isolation/GC and cross-store copy/export
   pinning tests live beside the control implementation in src/pinning.rs
+  write.rs               conditional atomicity, retries, and two-phase filters
   text.rs                tokenization, BM25, text SST round-trip
   fixtures/              committed golden snapshots
 ```
