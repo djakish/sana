@@ -88,35 +88,118 @@ fn rabitq_code_generation_packs_cluster_residual_bits() {
         filter_index: VectorFilterIndex::default(),
     };
 
-    let rabitq = index.build_rabitq_codes().unwrap();
+    let rabitq = sana::rabitq::build_index(&index).unwrap();
     assert_eq!(rabitq.column, "embedding");
     assert_eq!(rabitq.dim, dim);
+    assert_eq!(rabitq.padded_dim, 128); // dim 70 rounded up to a power of two
     assert_eq!(rabitq.clusters.len(), 1);
 
     let cluster = &rabitq.clusters[0];
     assert_eq!(cluster.centroid_id, 0);
     assert_eq!(cluster.codes.len(), 2);
 
+    // Non-zero residual: code spans the padded dimension, norm and factor are set.
     let non_zero = &cluster.codes[0];
     assert_eq!(non_zero.id, Id::U64(1));
     assert_eq!(non_zero.local_id, 0);
     assert_eq!(non_zero.version, 7);
-    assert_eq!(non_zero.code_words.len(), 2);
+    assert_eq!(non_zero.code_words.len(), 128 / 64);
     assert!((non_zero.residual_norm - (dim as f32).sqrt()).abs() < 1e-6);
-    assert_eq!(
-        non_zero.positive_bits,
-        non_zero
-            .code_words
-            .iter()
-            .map(|word| word.count_ones())
-            .sum::<u32>()
-    );
+    // The correction factor ⟨ō_q, ō'⟩ lies in (0, 1] for any unit residual.
+    assert!(non_zero.dot_code > 0.0 && non_zero.dot_code <= 1.0 + 1e-6);
 
+    // Zero residual quantizes to the empty code with a zero norm and factor.
     let zero = &cluster.codes[1];
     assert_eq!(zero.id, Id::U64(2));
     assert_eq!(zero.residual_norm, 0.0);
-    assert_eq!(zero.positive_bits, 0);
+    assert_eq!(zero.dot_code, 0.0);
     assert!(zero.code_words.iter().all(|word| *word == 0));
+}
+
+/// The estimator is only useful if its ranking tracks exact L2. Quantize a random
+/// cloud and confirm RaBitQ recovers most of the true nearest neighbours — far
+/// above the ~4% a random ranking would score.
+#[test]
+fn rabitq_estimate_recovers_nearest_neighbours() {
+    let dim = 128usize;
+    let n = 256usize;
+    let mut rng = 0x5151_5151_5151_5151u64;
+    let mut next = || {
+        rng = splitmix(rng);
+        (rng >> 11) as f32 / (1u64 << 53) as f32 * 2.0 - 1.0 // uniform in [-1, 1)
+    };
+
+    let vectors: Vec<(Id, Vec<f32>)> = (0..n)
+        .map(|i| {
+            let v = (0..dim).map(|_| next()).collect::<Vec<_>>();
+            (Id::U64(i as u64), v)
+        })
+        .collect();
+    let query: Vec<f32> = (0..dim).map(|_| next()).collect();
+
+    let entries = vectors
+        .iter()
+        .enumerate()
+        .map(|(local_id, (id, v))| VectorEntry {
+            id: id.clone(),
+            vector: v.clone(),
+            local_id: local_id as u32,
+            version: 1,
+        })
+        .collect::<Vec<_>>();
+    let index = VectorIndex::build(
+        "embedding",
+        DistanceMetric::L2,
+        dim,
+        entries,
+        &BTreeMap::new(),
+    )
+    .unwrap()
+    .unwrap();
+    let rabitq = sana::rabitq::build_index(&index).unwrap();
+
+    let exact: Vec<(Id, f32)> = vectors
+        .iter()
+        .map(|(id, v)| {
+            let d = v.iter().zip(&query).map(|(a, b)| (a - b) * (a - b)).sum();
+            (id.clone(), d)
+        })
+        .collect();
+
+    let mut estimated: Vec<(Id, f32)> = Vec::with_capacity(n);
+    for cluster in &rabitq.clusters {
+        let centroid = &index.centroids[cluster.centroid_id as usize];
+        let residual: Vec<f32> = query.iter().zip(centroid).map(|(q, c)| q - c).collect();
+        let rotated = cluster.rotate_query(&residual, rabitq.padded_dim);
+        for code in &cluster.codes {
+            let est = code.estimate_l2_sq(&rotated);
+            assert!(est.is_finite() && est >= 0.0);
+            estimated.push((code.id.clone(), est));
+        }
+    }
+    assert_eq!(estimated.len(), n);
+
+    let top_k = 10;
+    let truth: std::collections::BTreeSet<Id> = top_ids(exact, top_k);
+    let approx: std::collections::BTreeSet<Id> = top_ids(estimated, top_k);
+    let hits = truth.intersection(&approx).count();
+    assert!(
+        hits as f64 / top_k as f64 >= 0.6,
+        "RaBitQ recall@{top_k} too low: {hits}/{top_k}"
+    );
+}
+
+fn top_ids(mut scored: Vec<(Id, f32)>, k: usize) -> std::collections::BTreeSet<Id> {
+    scored.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    scored.into_iter().take(k).map(|(id, _)| id).collect()
+}
+
+fn splitmix(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    let mut z = x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
 }
 
 #[test]

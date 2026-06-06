@@ -16,7 +16,7 @@ the next unchecked task under "Current milestone" / "Next up".
 - **Done:** Stage 0 (Skeleton), Stage 1 (Durable Documents), Stage 2 (SST/LSM),
   Stage 3 (Attributes & Exact Search), Stage 4 (ANN v0), Stage 5 (Native
   Filtering), Stage 6 (SPFresh local rebuild), Stage 7 (Full-text search).
-- **Tests:** `cargo test` green (108 tests); `cargo clippy --all-targets` clean.
+- **Tests:** `cargo test` green (109 tests); `cargo clippy --all-targets` clean.
 - **Note:** post-Stage-2 and Stage-3–5 code-review fixes applied; remaining
   findings tracked under "Stage 2 — code review follow-ups" and "Stages 3–5 —
   code review follow-ups". Recently fixed limitations: Stage 2 ranged
@@ -27,8 +27,8 @@ the next unchecked task under "Current milestone" / "Next up".
   block-shaped full-snapshot text postings, BM25 query support, rank-safe
   batched block MAXSCORE top-k, and consistent-snapshot multi-query for hybrid
   retrieval. Stage 8 has started with portable scalar batch distance kernels
-  wired into exact and ANN vector scoring, plus per-cluster RaBitQ residual code
-  generation.
+  wired into exact and ANN vector scoring, plus a faithful, recall-tested RaBitQ
+  residual quantizer + L2 estimator in its own `src/rabitq.rs` module.
 - **Last updated:** 2026-06-06.
 
 ---
@@ -645,10 +645,10 @@ paths.
 Planned tasks:
 
 - [x] Add portable scalar batch distance kernels for L2, dot, and cosine.
-- [x] Add per-cluster RaBitQ code generation.
-- [ ] Add quantized query path and error-bound rerank selection.
-- [ ] Add portable bitwise RaBitQ estimator, then SIMD kernels with feature
-      detection.
+- [x] Add per-cluster RaBitQ code generation (faithful: rotation + estimator).
+- [x] Add portable bitwise RaBitQ L2 estimator (unbiased, recall-tested).
+- [ ] Persist a RaBitQ object and wire the quantized query path + rerank.
+- [ ] Add SIMD kernels with feature detection.
 - [ ] Benchmark cache/memory/CPU bottlenecks.
 
 Stage 8 decisions / notes:
@@ -660,11 +660,22 @@ Stage 8 decisions / notes:
   API. RaBitQ can add code-oriented kernels behind this boundary without
   changing query semantics.
 - **D45 — RaBitQ code generation is separate from index persistence.** Stage 8
-  first builds `RabitqIndex` values from an in-memory `VectorIndex`: each vector
-  is encoded as sign bits for its residual from the cluster centroid, with a
-  deterministic per-cluster orthogonal sign transform seed, residual norm,
-  positive-bit count, and live id/local/version metadata. The vector SST format
-  is unchanged until the quantized query path proves the object layout.
+  builds `RabitqIndex` values from an in-memory `VectorIndex` and leaves the
+  vector SST format unchanged until the quantized query path proves the object
+  layout. `RabitqIndex` is therefore not serialized, which let D46 reshape the
+  code without touching any on-disk fixture.
+- **D46 — RaBitQ is faithful to the paper, in its own module.** The first cut
+  was a placeholder: a per-dimension sign flip (recoverable, so it decorrelated
+  nothing) with no normalization, no correction factor, and no estimator — bits
+  nobody decoded. `src/rabitq.rs` now follows Gao & Long (SIGMOD 2024): quantize
+  the *normalized* residual after a fast pseudo-orthonormal rotation (random ±1
+  diagonal then a Walsh–Hadamard transform, padded to a power of two), and store
+  `‖o − c‖` plus the correction factor `⟨ō_q, ō'⟩`. The unbiased estimator
+  `⟨ō, q_r⟩ ≈ ⟨ō_q, q'⟩ / ⟨ō_q, ō'⟩` yields an L2 distance whose ranking is
+  recall-tested against exact L2. Scope is L2 (RaBitQ's design metric); dot and
+  cosine, plus the persisted query path, remain follow-ups. Extracting it out of
+  the 1.5k-line `vector.rs` is the first step of splitting that module along its
+  natural seams (filter bitmaps and maintenance are the next candidates).
 
 ---
 

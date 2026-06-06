@@ -10,6 +10,7 @@ pub mod manifest;
 pub mod namespace;
 pub mod object_store;
 pub mod query;
+pub mod rabitq;
 pub mod schema;
 pub mod sst;
 pub mod text;

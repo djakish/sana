@@ -91,31 +91,6 @@ pub struct VectorHit {
     pub score: f32,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct RabitqIndex {
-    pub column: String,
-    pub dim: usize,
-    pub metric: DistanceMetric,
-    pub clusters: Vec<RabitqCluster>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct RabitqCluster {
-    pub centroid_id: u32,
-    pub transform_seed: u64,
-    pub codes: Vec<RabitqCode>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct RabitqCode {
-    pub id: Id,
-    pub local_id: u32,
-    pub version: u64,
-    pub residual_norm: f32,
-    pub positive_bits: u32,
-    pub code_words: Vec<u64>,
-}
-
 pub trait DistanceKernel {
     fn l2_f32_batch(query: &[f32], candidates: &[&[f32]], out: &mut [f32]) -> Result<()>;
     fn dot_f32_batch(query: &[f32], candidates: &[&[f32]], out: &mut [f32]) -> Result<()>;
@@ -572,34 +547,6 @@ impl VectorIndex {
 
     pub fn row_count(&self) -> usize {
         self.cluster_row_counts().into_iter().sum()
-    }
-
-    pub fn build_rabitq_codes(&self) -> Result<RabitqIndex> {
-        let mut clusters = Vec::with_capacity(self.postings.len());
-        for posting in &self.postings {
-            let centroid_id = posting.centroid_id as usize;
-            let Some(centroid) = self.centroids.get(centroid_id) else {
-                return Err(Error::Corrupt("vector posting id out of bounds".into()));
-            };
-            validate_query_vector(centroid, self.dim, "RaBitQ centroid")?;
-            let transform_seed = rabitq_transform_seed(&self.column, posting.centroid_id);
-            let mut codes = Vec::with_capacity(posting.vectors.len());
-            for entry in &posting.vectors {
-                validate_query_vector(&entry.vector, self.dim, "RaBitQ vector")?;
-                codes.push(encode_rabitq_residual(entry, centroid, transform_seed));
-            }
-            clusters.push(RabitqCluster {
-                centroid_id: posting.centroid_id,
-                transform_seed,
-                codes,
-            });
-        }
-        Ok(RabitqIndex {
-            column: self.column.clone(),
-            dim: self.dim,
-            metric: self.metric,
-            clusters,
-        })
     }
 
     pub fn maintenance_thresholds(&self) -> VectorMaintenanceThresholds {
@@ -1311,60 +1258,6 @@ pub fn vector_to_f32(vector: &VectorValue) -> Vec<f32> {
             .map(|bits| half::f16::from_bits(*bits).to_f32())
             .collect(),
     }
-}
-
-fn encode_rabitq_residual(
-    entry: &VectorEntry,
-    centroid: &[f32],
-    transform_seed: u64,
-) -> RabitqCode {
-    let mut residual_norm_sq = 0.0f32;
-    let mut code_words = vec![0u64; entry.vector.len().div_ceil(64)];
-    let mut positive_bits = 0u32;
-
-    for (dim, (value, centroid_value)) in entry.vector.iter().zip(centroid).enumerate() {
-        let residual = value - centroid_value;
-        residual_norm_sq += residual * residual;
-        let transformed = residual * rabitq_sign(transform_seed, dim);
-        if transformed > 0.0 {
-            code_words[dim / 64] |= 1u64 << (dim % 64);
-            positive_bits += 1;
-        }
-    }
-
-    RabitqCode {
-        id: entry.id.clone(),
-        local_id: entry.local_id,
-        version: entry.version,
-        residual_norm: residual_norm_sq.sqrt(),
-        positive_bits,
-        code_words,
-    }
-}
-
-fn rabitq_transform_seed(column: &str, centroid_id: u32) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in column.as_bytes() {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    splitmix64(hash ^ u64::from(centroid_id))
-}
-
-fn rabitq_sign(seed: u64, dim: usize) -> f32 {
-    if splitmix64(seed ^ dim as u64) & 1 == 0 {
-        1.0
-    } else {
-        -1.0
-    }
-}
-
-fn splitmix64(mut x: u64) -> u64 {
-    x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
-    let mut z = x;
-    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    z ^ (z >> 31)
 }
 
 pub fn score_batch(
