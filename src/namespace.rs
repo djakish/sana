@@ -34,7 +34,10 @@ use crate::query::{MultiQuery, MultiQueryResult, Query, QueryResult, RecallReque
 use crate::sst::SstReader;
 use crate::value::{Document, Id, Value};
 use crate::wal::{WalBatch, WalCursor, WalOp};
-use crate::write::{ConditionalWriteOp, ConditionalWriteResult, WriteOutcome};
+use crate::write::{
+    ConditionalWriteOp, ConditionalWriteResult, DeleteByFilterRequest, PatchByFilterRequest,
+    WriteOutcome,
+};
 
 const WAL_COMMIT_FORMAT_VERSION: u32 = 1;
 const IDEMPOTENCY_FORMAT_VERSION: u32 = 1;
@@ -164,6 +167,8 @@ enum IdempotencyKind {
     #[default]
     Append,
     Conditional,
+    PatchByFilter,
+    DeleteByFilter,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -225,7 +230,7 @@ impl WalCommitState {
                     "ordinary pending WAL contains a conditional outcome".into(),
                 ));
             }
-            if matches!(pending.idempotency_kind, IdempotencyKind::Conditional)
+            if !matches!(pending.idempotency_kind, IdempotencyKind::Append)
                 && pending.conditional_outcome.is_none()
             {
                 return Err(Error::Corrupt(
@@ -713,7 +718,13 @@ impl Namespace {
 
         let append_guard = self.append_lock.lock().await;
         let result = self
-            .conditional_write_locked(writes, idempotency_key, fingerprint)
+            .conditional_write_locked(
+                writes,
+                idempotency_key,
+                fingerprint,
+                IdempotencyKind::Conditional,
+                false,
+            )
             .await?;
         drop(append_guard);
 
@@ -721,6 +732,182 @@ impl Namespace {
             .enqueue(&self.name, result.cursor)
             .await;
         Ok(result)
+    }
+
+    /// Two-phase Read Committed patch: capture matching IDs, then atomically
+    /// recheck only those IDs and patch the rows that still match.
+    pub async fn patch_by_filter(
+        &self,
+        request: PatchByFilterRequest,
+        idempotency_key: Option<String>,
+    ) -> Result<ConditionalWriteResult> {
+        if request.attributes.is_empty() && request.vectors.is_empty() {
+            return Err(Error::InvalidWrite(
+                "patch-by-filter requires at least one patched field".into(),
+            ));
+        }
+        self.validate_filter_mutation_input(request.max_rows, idempotency_key.as_deref())?;
+        self.validate_ops_for_current_schema(&[WalOp::Patch {
+            id: Id::U64(0),
+            attributes: request.attributes.clone(),
+            vectors: request.vectors.clone(),
+        }])
+        .await?;
+        let fingerprint = request_fingerprint(&request)?;
+        let candidates = self.matching_filter_ids(&request.filter).await?;
+        let append_guard = self.append_lock.lock().await;
+        if let Some(result) = self
+            .lookup_write_result(
+                idempotency_key.as_deref(),
+                &fingerprint,
+                IdempotencyKind::PatchByFilter,
+            )
+            .await?
+        {
+            drop(append_guard);
+            return Ok(result);
+        }
+        let (candidates, rows_remaining) = limit_filter_candidates(
+            candidates,
+            request.max_rows,
+            request.allow_partial,
+            "patch-by-filter",
+        )?;
+        let writes = candidates
+            .into_iter()
+            .map(|id| ConditionalWriteOp {
+                operation: WalOp::Patch {
+                    id,
+                    attributes: request.attributes.clone(),
+                    vectors: request.vectors.clone(),
+                },
+                condition: Some(request.filter.clone()),
+            })
+            .collect();
+        let result = self
+            .conditional_write_locked(
+                writes,
+                idempotency_key,
+                fingerprint,
+                IdempotencyKind::PatchByFilter,
+                rows_remaining,
+            )
+            .await?;
+        drop(append_guard);
+        let _ = IndexQueue::new(self.store.clone())
+            .enqueue(&self.name, result.cursor)
+            .await;
+        Ok(result)
+    }
+
+    /// Two-phase Read Committed delete: capture matching IDs, then atomically
+    /// recheck only those IDs and delete the rows that still match.
+    pub async fn delete_by_filter(
+        &self,
+        request: DeleteByFilterRequest,
+        idempotency_key: Option<String>,
+    ) -> Result<ConditionalWriteResult> {
+        self.validate_filter_mutation_input(request.max_rows, idempotency_key.as_deref())?;
+        let fingerprint = request_fingerprint(&request)?;
+        let candidates = self.matching_filter_ids(&request.filter).await?;
+        let append_guard = self.append_lock.lock().await;
+        if let Some(result) = self
+            .lookup_write_result(
+                idempotency_key.as_deref(),
+                &fingerprint,
+                IdempotencyKind::DeleteByFilter,
+            )
+            .await?
+        {
+            drop(append_guard);
+            return Ok(result);
+        }
+        let (candidates, rows_remaining) = limit_filter_candidates(
+            candidates,
+            request.max_rows,
+            request.allow_partial,
+            "delete-by-filter",
+        )?;
+        let writes = candidates
+            .into_iter()
+            .map(|id| ConditionalWriteOp {
+                operation: WalOp::Delete { id },
+                condition: Some(request.filter.clone()),
+            })
+            .collect();
+        let result = self
+            .conditional_write_locked(
+                writes,
+                idempotency_key,
+                fingerprint,
+                IdempotencyKind::DeleteByFilter,
+                rows_remaining,
+            )
+            .await?;
+        drop(append_guard);
+        let _ = IndexQueue::new(self.store.clone())
+            .enqueue(&self.name, result.cursor)
+            .await;
+        Ok(result)
+    }
+
+    fn validate_filter_mutation_input(
+        &self,
+        max_rows: usize,
+        idempotency_key: Option<&str>,
+    ) -> Result<()> {
+        if max_rows == 0 {
+            return Err(Error::InvalidWrite(
+                "filter mutation max_rows must be greater than zero".into(),
+            ));
+        }
+        if let Some(key) = idempotency_key {
+            validate_idempotency_key(key)?;
+        }
+        Ok(())
+    }
+
+    async fn matching_filter_ids(&self, filter: &crate::query::FilterExpr) -> Result<Vec<Id>> {
+        let documents = self.replay().await?;
+        let mut ids = Vec::new();
+        for (id, document) in documents {
+            if crate::query::filter_matches(filter, &document)? {
+                ids.push(id);
+            }
+        }
+        Ok(ids)
+    }
+
+    async fn lookup_write_result(
+        &self,
+        idempotency_key: Option<&str>,
+        fingerprint: &RequestFingerprint,
+        kind: IdempotencyKind,
+    ) -> Result<Option<ConditionalWriteResult>> {
+        let Some(key) = idempotency_key else {
+            return Ok(None);
+        };
+        loop {
+            let (_, state) = self.load_commit_state().await?;
+            if let Some(pending) = state.pending {
+                self.finish_pending(pending).await?;
+                continue;
+            }
+            let Some(record) = self
+                .lookup_idempotency(key, fingerprint, kind, state.committed)
+                .await?
+            else {
+                return Ok(None);
+            };
+            let outcome_ref = record.conditional_outcome.ok_or_else(|| {
+                Error::Corrupt("filter mutation idempotency record has no outcome".into())
+            })?;
+            let outcome = self.load_write_outcome(&outcome_ref).await?;
+            return Ok(Some(ConditionalWriteResult {
+                cursor: record.cursor,
+                outcome,
+            }));
+        }
     }
 
     async fn append_locked(
@@ -769,6 +956,8 @@ impl Namespace {
         writes: Vec<ConditionalWriteOp>,
         idempotency_key: Option<String>,
         fingerprint: RequestFingerprint,
+        idempotency_kind: IdempotencyKind,
+        rows_remaining: bool,
     ) -> Result<ConditionalWriteResult> {
         let all_operations: Vec<WalOp> =
             writes.iter().map(|write| write.operation.clone()).collect();
@@ -781,12 +970,7 @@ impl Namespace {
 
             if let Some(key) = &idempotency_key
                 && let Some(record) = self
-                    .lookup_idempotency(
-                        key,
-                        &fingerprint,
-                        IdempotencyKind::Conditional,
-                        state.committed,
-                    )
+                    .lookup_idempotency(key, &fingerprint, idempotency_kind, state.committed)
                     .await?
             {
                 let outcome_ref = record.conditional_outcome.ok_or_else(|| {
@@ -806,7 +990,8 @@ impl Namespace {
                 .await?;
             let manifest = self.load_manifest().await?;
             let documents = self.replay_at(&manifest, state.committed).await?;
-            let (operations, outcome) = evaluate_conditional_writes(&writes, &documents)?;
+            let (operations, mut outcome) = evaluate_conditional_writes(&writes, &documents)?;
+            outcome.rows_remaining = rows_remaining;
 
             match self
                 .try_reserve(
@@ -816,7 +1001,7 @@ impl Namespace {
                         operations,
                         idempotency_key: idempotency_key.clone(),
                         request_fingerprint: fingerprint.clone(),
-                        idempotency_kind: IdempotencyKind::Conditional,
+                        idempotency_kind,
                         conditional_outcome: Some(outcome.clone()),
                     },
                 )
@@ -1016,8 +1201,7 @@ impl Namespace {
                 "invalid idempotency record at {object_key}"
             )));
         }
-        if (matches!(record.kind, IdempotencyKind::Conditional)
-            && record.conditional_outcome.is_none())
+        if (!matches!(record.kind, IdempotencyKind::Append) && record.conditional_outcome.is_none())
             || (matches!(record.kind, IdempotencyKind::Append)
                 && record.conditional_outcome.is_some())
         {
@@ -1211,6 +1395,23 @@ fn validate_unique_write_ids(writes: &[ConditionalWriteOp]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn limit_filter_candidates(
+    mut candidates: Vec<Id>,
+    max_rows: usize,
+    allow_partial: bool,
+    operation: &str,
+) -> Result<(Vec<Id>, bool)> {
+    let rows_remaining = candidates.len() > max_rows;
+    if rows_remaining && !allow_partial {
+        return Err(Error::InvalidWrite(format!(
+            "{operation} matched {} rows, exceeding max_rows {max_rows}",
+            candidates.len()
+        )));
+    }
+    candidates.truncate(max_rows);
+    Ok((candidates, rows_remaining))
 }
 
 fn evaluate_conditional_writes(
