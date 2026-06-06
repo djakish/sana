@@ -1509,9 +1509,12 @@ impl Namespace {
                 return Err(error);
             }
 
-            self.store
-                .put(&wal_key(&self.name, pending.cursor), staged.bytes.clone())
-                .await?;
+            put_immutable_if_absent(
+                &self.store,
+                &wal_key(&self.name, pending.cursor),
+                staged.bytes.clone(),
+            )
+            .await?;
             if let Some(key) = &pending.idempotency_key {
                 self.write_idempotency_record(key, &pending).await?;
             }

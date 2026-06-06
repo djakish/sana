@@ -660,6 +660,43 @@ async fn flush_and_compact_update_stats() {
 }
 
 #[tokio::test]
+async fn flush_never_overwrites_a_conflicting_generation_object() {
+    let dir = tempfile::tempdir().unwrap();
+    let object_store = store(&dir);
+    let source = Namespace::create(object_store.clone(), "source")
+        .await
+        .unwrap();
+    source.upsert(doc_with(1, "alpha", 10)).await.unwrap();
+    indexer::flush(&source).await.unwrap();
+    let source_key = source.load_manifest().await.unwrap().doc_ssts[0]
+        .key
+        .clone();
+    let file_name = source_key.rsplit('/').next().unwrap();
+
+    let ns = Namespace::create(object_store.clone(), "docs")
+        .await
+        .unwrap();
+    ns.upsert(doc_with(1, "alpha", 10)).await.unwrap();
+    let before = ns.load_manifest().await.unwrap();
+    let key = format!(
+        "namespaces/docs/index/g/{}/doc/{file_name}",
+        before.generation + 1,
+    );
+    object_store
+        .put(&key, Bytes::from_static(b"conflicting bytes"))
+        .await
+        .unwrap();
+
+    let error = indexer::flush(&ns).await.unwrap_err();
+    assert!(matches!(error, Error::Corrupt(_)));
+    assert_eq!(ns.load_manifest().await.unwrap(), before);
+    assert_eq!(
+        object_store.get(&key).await.unwrap().bytes,
+        Bytes::from_static(b"conflicting bytes")
+    );
+}
+
+#[tokio::test]
 async fn size_tiered_compaction_merges_overflowing_level() {
     let dir = tempfile::tempdir().unwrap();
     let ns = Namespace::create(store(&dir), "docs").await.unwrap();

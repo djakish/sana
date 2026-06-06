@@ -26,8 +26,9 @@ use crate::manifest::{
 };
 use crate::namespace::{
     Namespace, apply_op, idempotency_prefix, manifest_body_key_for_pointer, manifest_pointer_key,
-    now_ms, op_id, wal_commit_key, wal_key,
+    now_ms, op_id, put_immutable_if_absent, wal_commit_key, wal_key,
 };
+use crate::object_store::version_of;
 use crate::pinning::pinning_key;
 use crate::rabitq;
 use crate::schema::{ColumnType, DistanceMetric};
@@ -66,6 +67,14 @@ struct VectorColumnPublish<'a> {
     dim: usize,
 }
 
+fn content_addressed_key(key: String, bytes: &[u8]) -> String {
+    let version = version_of(bytes);
+    match key.rsplit_once('.') {
+        Some((stem, extension)) => format!("{stem}-{}.{}", version.0, extension),
+        None => format!("{key}-{}", version.0),
+    }
+}
+
 async fn load_vector_append_segments(
     ns: &Namespace,
     meta: &VectorIndexMeta,
@@ -96,16 +105,22 @@ async fn publish_vector_version_map(
     column: &str,
     version_map: &VectorVersionMap,
 ) -> Result<(String, u64)> {
-    let version_map_key = format!(
+    let version_map_bytes = version_map.encode()?;
+    let version_map_key = content_addressed_key(
+        format!(
         "namespaces/{}/index/g/{}/vector/{}/versions.bin",
         ns.name(),
         generation,
         object_path_component(column)
+        ),
+        &version_map_bytes,
     );
-    let version_map_bytes = version_map.encode()?;
-    ns.store()
-        .put(&version_map_key, Bytes::from(version_map_bytes.clone()))
-        .await?;
+    put_immutable_if_absent(
+        ns.store(),
+        &version_map_key,
+        Bytes::from(version_map_bytes.clone()),
+    )
+    .await?;
     Ok((version_map_key, version_map_bytes.len() as u64))
 }
 
@@ -116,16 +131,19 @@ async fn publish_rabitq_index(
     suffix: &str,
     index: &VectorIndex,
 ) -> Result<(String, u64)> {
-    let key = format!(
-        "namespaces/{}/index/g/{}/vector/{}/{}.rabitq.bin",
-        ns.name(),
-        generation,
-        object_path_component(column),
-        suffix
-    );
     let bytes = rabitq::build_index(index)?.encode()?;
+    let key = content_addressed_key(
+        format!(
+            "namespaces/{}/index/g/{}/vector/{}/{}.rabitq.bin",
+            ns.name(),
+            generation,
+            object_path_component(column),
+            suffix
+        ),
+        &bytes,
+    );
     let size_bytes = bytes.len() as u64;
-    ns.store().put(&key, Bytes::from(bytes)).await?;
+    put_immutable_if_absent(ns.store(), &key, Bytes::from(bytes)).await?;
     Ok((key, size_bytes))
 }
 
@@ -138,15 +156,16 @@ async fn publish_attr_sst(
     let Some(built) = attr::build_attr_sst(docs)? else {
         return Ok(Vec::new());
     };
-    let sst_key = format!(
-        "namespaces/{}/index/g/{}/attr/{}.sst",
-        ns.name(),
-        generation,
-        suffix
+    let sst_key = content_addressed_key(
+        format!(
+            "namespaces/{}/index/g/{}/attr/{}.sst",
+            ns.name(),
+            generation,
+            suffix
+        ),
+        &built.bytes,
     );
-    ns.store()
-        .put(&sst_key, Bytes::from(built.bytes.clone()))
-        .await?;
+    put_immutable_if_absent(ns.store(), &sst_key, Bytes::from(built.bytes.clone())).await?;
     Ok(vec![SstMeta {
         key: sst_key,
         size_bytes: built.bytes.len() as u64,
@@ -166,15 +185,16 @@ async fn publish_text_sst(
     let Some(built) = text::build_text_sst(docs)? else {
         return Ok(Vec::new());
     };
-    let sst_key = format!(
-        "namespaces/{}/index/g/{}/fts/{}.sst",
-        ns.name(),
-        generation,
-        suffix
+    let sst_key = content_addressed_key(
+        format!(
+            "namespaces/{}/index/g/{}/fts/{}.sst",
+            ns.name(),
+            generation,
+            suffix
+        ),
+        &built.bytes,
     );
-    ns.store()
-        .put(&sst_key, Bytes::from(built.bytes.clone()))
-        .await?;
+    put_immutable_if_absent(ns.store(), &sst_key, Bytes::from(built.bytes.clone())).await?;
     Ok(vec![SstMeta {
         key: sst_key,
         size_bytes: built.bytes.len() as u64,
@@ -244,13 +264,16 @@ async fn publish_full_vector_index(
         index.maintenance_thresholds(),
     )?);
     let component = object_path_component(column.name);
-    let key = format!(
-        "namespaces/{}/index/g/{}/vector/{}/ivf.bin",
-        ns.name(),
-        generation,
-        component
+    let key = content_addressed_key(
+        format!(
+            "namespaces/{}/index/g/{}/vector/{}/ivf.bin",
+            ns.name(),
+            generation,
+            component
+        ),
+        &bytes,
     );
-    ns.store().put(&key, Bytes::from(bytes.clone())).await?;
+    put_immutable_if_absent(ns.store(), &key, Bytes::from(bytes.clone())).await?;
     let (rabitq_key, rabitq_size_bytes) =
         publish_rabitq_index(ns, generation, column.name, "base", &index).await?;
     let (version_map_key, version_map_size_bytes) =
@@ -319,14 +342,17 @@ async fn publish_vector_append(
         docs,
     )? {
         let bytes = append.encode()?;
-        let key = format!(
-            "namespaces/{}/index/g/{}/vector/{}/append-{}.ivf.bin",
-            ns.name(),
-            generation,
-            component,
-            generation
+        let key = content_addressed_key(
+            format!(
+                "namespaces/{}/index/g/{}/vector/{}/append-{}.ivf.bin",
+                ns.name(),
+                generation,
+                component,
+                generation
+            ),
+            &bytes,
         );
-        ns.store().put(&key, Bytes::from(bytes.clone())).await?;
+        put_immutable_if_absent(ns.store(), &key, Bytes::from(bytes.clone())).await?;
         let size_bytes = bytes.len() as u64;
         let (rabitq_key, rabitq_size_bytes) = publish_rabitq_index(
             ns,
@@ -500,15 +526,16 @@ pub async fn flush(ns: &Namespace) -> Result<bool> {
 
     let built = build_sst(&records)?;
     let new_gen = snapshot.pointer.generation + 1;
-    let sst_key = format!(
-        "namespaces/{}/index/g/{}/doc/flush-{}.sst",
-        ns.name(),
-        new_gen,
-        commit.seq
+    let sst_key = content_addressed_key(
+        format!(
+            "namespaces/{}/index/g/{}/doc/flush-{}.sst",
+            ns.name(),
+            new_gen,
+            commit.seq
+        ),
+        &built.bytes,
     );
-    ns.store()
-        .put(&sst_key, Bytes::from(built.bytes.clone()))
-        .await?;
+    put_immutable_if_absent(ns.store(), &sst_key, Bytes::from(built.bytes.clone())).await?;
 
     // Exact live-row count after this flush: the new records override the base.
     let mut merged = base;
@@ -627,17 +654,18 @@ async fn tier_doc_ssts(
         }
 
         let built = build_sst(&merged)?;
-        let sst_key = format!(
-            "namespaces/{}/index/g/{}/doc/tier-{}-{}-{}.sst",
-            ns.name(),
-            generation,
-            level + 1,
-            commit_seq,
-            step
+        let sst_key = content_addressed_key(
+            format!(
+                "namespaces/{}/index/g/{}/doc/tier-{}-{}-{}.sst",
+                ns.name(),
+                generation,
+                level + 1,
+                commit_seq,
+                step
+            ),
+            &built.bytes,
         );
-        ns.store()
-            .put(&sst_key, Bytes::from(built.bytes.clone()))
-            .await?;
+        put_immutable_if_absent(ns.store(), &sst_key, Bytes::from(built.bytes.clone())).await?;
         let merged_meta = SstMeta {
             key: sst_key,
             size_bytes: built.bytes.len() as u64,
@@ -688,17 +716,18 @@ async fn tier_attr_ssts(
             continue;
         };
 
-        let sst_key = format!(
-            "namespaces/{}/index/g/{}/attr/tier-{}-{}-{}.sst",
-            ns.name(),
-            generation,
-            level + 1,
-            commit_seq,
-            step
+        let sst_key = content_addressed_key(
+            format!(
+                "namespaces/{}/index/g/{}/attr/tier-{}-{}-{}.sst",
+                ns.name(),
+                generation,
+                level + 1,
+                commit_seq,
+                step
+            ),
+            &built.bytes,
         );
-        ns.store()
-            .put(&sst_key, Bytes::from(built.bytes.clone()))
-            .await?;
+        put_immutable_if_absent(ns.store(), &sst_key, Bytes::from(built.bytes.clone())).await?;
         attr_ssts.insert(
             0,
             SstMeta {
@@ -734,14 +763,15 @@ pub async fn compact(ns: &Namespace) -> Result<bool> {
 
     let built = build_sst(&live)?;
     let new_gen = snapshot.pointer.generation + 1;
-    let sst_key = format!(
-        "namespaces/{}/index/g/{}/doc/compacted.sst",
-        ns.name(),
-        new_gen
+    let sst_key = content_addressed_key(
+        format!(
+            "namespaces/{}/index/g/{}/doc/compacted.sst",
+            ns.name(),
+            new_gen
+        ),
+        &built.bytes,
     );
-    ns.store()
-        .put(&sst_key, Bytes::from(built.bytes.clone()))
-        .await?;
+    put_immutable_if_absent(ns.store(), &sst_key, Bytes::from(built.bytes.clone())).await?;
 
     manifest.generation = new_gen;
     manifest.updated_at_ms = now_ms();
@@ -951,15 +981,18 @@ pub async fn maintain_vectors(ns: &Namespace) -> Result<bool> {
         )? {
             Some((task_idx, task, delta)) => {
                 let bytes = delta.index.encode()?;
-                let key = format!(
-                    "namespaces/{}/index/g/{}/vector/{}/local-rebuild-{}-{}.ivf.bin",
-                    ns.name(),
-                    new_gen,
-                    object_path_component(column),
-                    new_gen,
-                    task_idx
+                let key = content_addressed_key(
+                    format!(
+                        "namespaces/{}/index/g/{}/vector/{}/local-rebuild-{}-{}.ivf.bin",
+                        ns.name(),
+                        new_gen,
+                        object_path_component(column),
+                        new_gen,
+                        task_idx
+                    ),
+                    &bytes,
                 );
-                ns.store().put(&key, Bytes::from(bytes.clone())).await?;
+                put_immutable_if_absent(ns.store(), &key, Bytes::from(bytes.clone())).await?;
                 let (rabitq_key, rabitq_size_bytes) = publish_rabitq_index(
                     ns,
                     new_gen,
@@ -1002,15 +1035,18 @@ pub async fn maintain_vectors(ns: &Namespace) -> Result<bool> {
                 };
 
                 let bytes = delta.index.encode()?;
-                let key = format!(
-                    "namespaces/{}/index/g/{}/vector/{}/reassign-{}-{}.ivf.bin",
-                    ns.name(),
-                    new_gen,
-                    object_path_component(column),
-                    new_gen,
-                    task_idx
+                let key = content_addressed_key(
+                    format!(
+                        "namespaces/{}/index/g/{}/vector/{}/reassign-{}-{}.ivf.bin",
+                        ns.name(),
+                        new_gen,
+                        object_path_component(column),
+                        new_gen,
+                        task_idx
+                    ),
+                    &bytes,
                 );
-                ns.store().put(&key, Bytes::from(bytes.clone())).await?;
+                put_immutable_if_absent(ns.store(), &key, Bytes::from(bytes.clone())).await?;
                 let (rabitq_key, rabitq_size_bytes) = publish_rabitq_index(
                     ns,
                     new_gen,
