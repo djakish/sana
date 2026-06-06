@@ -270,36 +270,14 @@ impl VectorIndex {
         }
         assign_entries(&entries, &centroids, metric, &mut assignments)?;
 
-        let mut postings = (0..cluster_count)
-            .map(|centroid_id| VectorPosting {
-                centroid_id: centroid_id as u32,
-                vectors: Vec::new(),
-            })
-            .collect::<Vec<_>>();
-        let mut addresses = Vec::new();
-        for (mut entry, centroid_id) in entries.into_iter().zip(assignments) {
-            entry.local_id = postings[centroid_id].vectors.len() as u32;
-            addresses.push(VectorAddress {
-                id: entry.id.clone(),
-                cluster_id: centroid_id as u32,
-                local_id: entry.local_id,
-                version: entry.version,
-            });
-            postings[centroid_id].vectors.push(entry);
-        }
-        addresses.sort_by(|a, b| a.id.cmp(&b.id));
-        let filter_index = VectorFilterIndex::build(&postings, docs)?;
-
-        Ok(Some(Self {
-            format_version: VECTOR_FORMAT_VERSION,
-            column,
-            dim,
-            metric,
-            centroids,
-            postings,
-            addresses,
-            filter_index,
-        }))
+        let assigned = entries
+            .into_iter()
+            .zip(assignments)
+            .map(|(entry, cluster_id)| (cluster_id as u32, entry))
+            .collect();
+        Ok(Some(assemble_index(
+            column, metric, dim, centroids, assigned, docs,
+        )?))
     }
 
     pub fn build_append(
@@ -329,36 +307,19 @@ impl VectorIndex {
         let mut assignments = vec![0usize; entries.len()];
         assign_entries(&entries, &centroids, metric, &mut assignments)?;
 
-        let mut postings = (0..centroids.len())
-            .map(|centroid_id| VectorPosting {
-                centroid_id: centroid_id as u32,
-                vectors: Vec::new(),
-            })
-            .collect::<Vec<_>>();
-        let mut addresses = Vec::new();
-        for (mut entry, centroid_id) in entries.into_iter().zip(assignments) {
-            entry.local_id = postings[centroid_id].vectors.len() as u32;
-            addresses.push(VectorAddress {
-                id: entry.id.clone(),
-                cluster_id: centroid_id as u32,
-                local_id: entry.local_id,
-                version: entry.version,
-            });
-            postings[centroid_id].vectors.push(entry);
-        }
-        addresses.sort_by(|a, b| a.id.cmp(&b.id));
-        let filter_index = VectorFilterIndex::build(&postings, docs)?;
-
-        Ok(Some(Self {
-            format_version: VECTOR_FORMAT_VERSION,
-            column: column.into(),
-            dim,
+        let assigned = entries
+            .into_iter()
+            .zip(assignments)
+            .map(|(entry, cluster_id)| (cluster_id as u32, entry))
+            .collect();
+        Ok(Some(assemble_index(
+            column.into(),
             metric,
+            dim,
             centroids,
-            postings,
-            addresses,
-            filter_index,
-        }))
+            assigned,
+            docs,
+        )?))
     }
 
     pub fn encode(&self) -> Result<Vec<u8>> {
@@ -816,44 +777,21 @@ impl VectorIndex {
         entries: Vec<AssignedVectorEntry>,
         docs: &BTreeMap<Id, Document>,
     ) -> Result<VectorIndex> {
-        let mut postings = (0..self.centroids.len())
-            .map(|centroid_id| VectorPosting {
-                centroid_id: centroid_id as u32,
-                vectors: Vec::new(),
-            })
-            .collect::<Vec<_>>();
-        let mut addresses = Vec::new();
-        for assigned in entries {
-            let cluster_id = assigned.cluster_id as usize;
-            let Some(posting) = postings.get_mut(cluster_id) else {
-                return Err(Error::Corrupt(
-                    "assigned vector cluster id out of bounds".into(),
-                ));
-            };
-            let mut entry = assigned.entry;
-            validate_query_vector(&entry.vector, self.dim, "assigned vector")?;
-            entry.local_id = posting.vectors.len() as u32;
-            addresses.push(VectorAddress {
-                id: entry.id.clone(),
-                cluster_id: assigned.cluster_id,
-                local_id: entry.local_id,
-                version: entry.version,
-            });
-            posting.vectors.push(entry);
+        for assigned in &entries {
+            validate_query_vector(&assigned.entry.vector, self.dim, "assigned vector")?;
         }
-        addresses.sort_by(|a, b| a.id.cmp(&b.id));
-        let filter_index = VectorFilterIndex::build(&postings, docs)?;
-
-        Ok(VectorIndex {
-            format_version: VECTOR_FORMAT_VERSION,
-            column: self.column.clone(),
-            dim: self.dim,
-            metric: self.metric,
-            centroids: self.centroids.clone(),
-            postings,
-            addresses,
-            filter_index,
-        })
+        let assigned = entries
+            .into_iter()
+            .map(|assigned| (assigned.cluster_id, assigned.entry))
+            .collect();
+        assemble_index(
+            self.column.clone(),
+            self.metric,
+            self.dim,
+            self.centroids.clone(),
+            assigned,
+            docs,
+        )
     }
 
     pub fn all_filter_mask(&self) -> VectorFilterMask {
@@ -887,6 +825,52 @@ impl VectorIndex {
 struct AssignedVectorEntry {
     cluster_id: u32,
     entry: VectorEntry,
+}
+
+/// Bin cluster-assigned entries into postings, stamp each a `local_id`, collect
+/// id-sorted addresses, and attach the attribute filter index. The three build
+/// paths (full, append, reassigned-delta) share this so they stay identical.
+fn assemble_index(
+    column: String,
+    metric: DistanceMetric,
+    dim: usize,
+    centroids: Vec<Vec<f32>>,
+    assigned: Vec<(u32, VectorEntry)>,
+    docs: &BTreeMap<Id, Document>,
+) -> Result<VectorIndex> {
+    let mut postings = (0..centroids.len())
+        .map(|centroid_id| VectorPosting {
+            centroid_id: centroid_id as u32,
+            vectors: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    let mut addresses = Vec::new();
+    for (cluster_id, mut entry) in assigned {
+        let Some(posting) = postings.get_mut(cluster_id as usize) else {
+            return Err(Error::Corrupt("vector cluster id out of bounds".into()));
+        };
+        entry.local_id = posting.vectors.len() as u32;
+        addresses.push(VectorAddress {
+            id: entry.id.clone(),
+            cluster_id,
+            local_id: entry.local_id,
+            version: entry.version,
+        });
+        posting.vectors.push(entry);
+    }
+    addresses.sort_by(|a, b| a.id.cmp(&b.id));
+    let filter_index = VectorFilterIndex::build(&postings, docs)?;
+
+    Ok(VectorIndex {
+        format_version: VECTOR_FORMAT_VERSION,
+        column,
+        dim,
+        metric,
+        centroids,
+        postings,
+        addresses,
+        filter_index,
+    })
 }
 
 struct ReassignmentCandidate {
