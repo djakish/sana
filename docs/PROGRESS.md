@@ -683,6 +683,17 @@ Stage 8 decisions / notes:
   now own it; callers pass their magic, version, and a label for error messages.
   Pure dedup: the byte layout and every error string are unchanged, so the
   golden WAL fixture still matches.
+- **D48 — `vector.rs` split along its seams into a directory module.** The
+  1.3k-line file became `vector/{mod,filter,maintenance}.rs`: `filter.rs` owns
+  the per-value cluster/row bitmap and the mask algebra (and the three
+  `VectorIndex` mask methods); `maintenance.rs` owns LIRE split/merge planning,
+  reassignment, and local rebuilds; `mod.rs` keeps the IVF core (build, k-means,
+  framing, search) and the shared `assemble_index`. Pure code movement — no
+  on-disk or API change. Submodules reach `mod.rs`'s private helpers (`score`,
+  `assemble_index`, …) because child modules can see ancestors' private items;
+  only `VectorFilterIndex::build`, which the parent's `assemble_index` calls,
+  needed `pub(super)`. Public paths (`sana::vector::*`) are preserved by
+  re-exports.
 
 ---
 
