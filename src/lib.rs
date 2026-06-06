@@ -2,6 +2,7 @@
 //! attributes. See `docs/wiki/architecture.md` for the full design and
 //! `docs/PROGRESS.md` for the staged build status and decision log.
 
+pub mod api;
 pub mod attr;
 pub mod backpressure;
 pub mod cache_warm;

@@ -1,0 +1,310 @@
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use axum::Router;
+use axum::body::{Body, to_bytes};
+use axum::http::{Method, Request, StatusCode};
+use axum::response::Response;
+use sana::api::{
+    QueryRequest, QueryResponse, RecallApiRequest, WriteRequest, WriteResponse, router,
+};
+use sana::indexer;
+use sana::metadata::{IndexStatus, NamespaceMetadata};
+use sana::namespace::Namespace;
+use sana::object_store::{FsObjectStore, ObjectStore};
+use sana::query::{FilterExpr, MultiQuery, Query, QueryOptions, RecallRequest};
+use sana::value::{Document, Id, Value, VectorValue};
+use sana::wal::WalOp;
+use sana::write::{ConditionalWriteOp, DeleteByFilterRequest, PatchByFilterRequest, WriteOptions};
+use tower::ServiceExt;
+
+fn store(dir: &tempfile::TempDir) -> Arc<dyn ObjectStore> {
+    Arc::new(FsObjectStore::new(dir.path()))
+}
+
+fn document(id: u64) -> Document {
+    let mut document = Document::new(Id::U64(id));
+    document
+        .attributes
+        .insert("title".into(), Value::String("alpha".into()));
+    document
+        .vectors
+        .insert("embedding".into(), VectorValue::F32(vec![1.0, 0.0]));
+    document
+}
+
+async fn request(app: &Router, method: Method, uri: &str, body: Option<Vec<u8>>) -> Response {
+    let mut builder = Request::builder().method(method).uri(uri);
+    if body.is_some() {
+        builder = builder.header("content-type", "application/json");
+    }
+    app.clone()
+        .oneshot(builder.body(Body::from(body.unwrap_or_default())).unwrap())
+        .await
+        .unwrap()
+}
+
+async fn json_body<T: serde::de::DeserializeOwned>(response: Response) -> T {
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+#[tokio::test]
+async fn http_write_query_metadata_recall_and_warm_cache_round_trip() {
+    let dir = tempfile::tempdir().unwrap();
+    let object_store = store(&dir);
+    let app = router(object_store.clone());
+
+    let write = WriteRequest::Append {
+        operations: vec![WalOp::Upsert {
+            id: Id::U64(1),
+            document: document(1),
+        }],
+        idempotency_key: Some("api-write-1".into()),
+        options: WriteOptions::default(),
+    };
+    let response = request(
+        &app,
+        Method::POST,
+        "/v2/namespaces/docs",
+        Some(serde_json::to_vec(&write).unwrap()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let write_response: WriteResponse = json_body(response).await;
+    assert_eq!(write_response.cursor.seq, 1);
+
+    let response = request(&app, Method::GET, "/v1/namespaces/docs/metadata", None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let metadata: NamespaceMetadata = json_body(response).await;
+    assert_eq!(metadata.index.status, IndexStatus::Updating);
+    assert!(metadata.index.unindexed_bytes > 0);
+
+    let query = QueryRequest::Single {
+        query: Box::new(Query::all()),
+        options: QueryOptions::default(),
+    };
+    let response = request(
+        &app,
+        Method::POST,
+        "/v2/namespaces/docs/query",
+        Some(serde_json::to_vec(&query).unwrap()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    match json_body::<QueryResponse>(response).await {
+        QueryResponse::Single(result) => assert_eq!(result.rows[0].id, Id::U64(1)),
+        QueryResponse::Multi(_) => panic!("expected single-query response"),
+    }
+
+    let multi_query = QueryRequest::Multi {
+        query: MultiQuery {
+            queries: vec![Query::all(), Query::all()],
+        },
+        options: QueryOptions::default(),
+    };
+    let response = request(
+        &app,
+        Method::POST,
+        "/v2/namespaces/docs/query",
+        Some(serde_json::to_vec(&multi_query).unwrap()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    match json_body::<QueryResponse>(response).await {
+        QueryResponse::Multi(result) => assert_eq!(result.results.len(), 2),
+        QueryResponse::Single(_) => panic!("expected multi-query response"),
+    }
+
+    let blocked_query = QueryRequest::Single {
+        query: Box::new(Query::all()),
+        options: QueryOptions {
+            max_unindexed_wal_bytes: 0,
+        },
+    };
+    let response = request(
+        &app,
+        Method::POST,
+        "/v2/namespaces/docs/query",
+        Some(serde_json::to_vec(&blocked_query).unwrap()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let error: serde_json::Value = json_body(response).await;
+    assert_eq!(error["error"]["code"], "backpressure");
+
+    let namespace = Namespace::open(object_store, "docs").await.unwrap();
+    indexer::flush(&namespace).await.unwrap();
+
+    let recall = RecallApiRequest {
+        request: RecallRequest {
+            num: 1,
+            top_k: 1,
+            column: Some("embedding".into()),
+            probes: Some(1),
+            metric: None,
+            filter: None,
+        },
+        options: QueryOptions::default(),
+    };
+    let response = request(
+        &app,
+        Method::POST,
+        "/v1/namespaces/docs/_debug/recall",
+        Some(serde_json::to_vec(&recall).unwrap()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let recall: sana::query::RecallResult = json_body(response).await;
+    assert_eq!(recall.sampled, 1);
+    assert_eq!(recall.avg_recall, 1.0);
+
+    let response = request(
+        &app,
+        Method::GET,
+        "/v1/namespaces/docs/hint_cache_warm?max_bytes=1048576&max_concurrency=2",
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let warm: serde_json::Value = json_body(response).await;
+    assert_eq!(warm["status"], "ACCEPTED");
+
+    let response = request(&app, Method::GET, "/v1/namespaces/docs/metadata", None).await;
+    let metadata: NamespaceMetadata = json_body(response).await;
+    assert_eq!(metadata.index.status, IndexStatus::UpToDate);
+    assert_eq!(metadata.index.unindexed_bytes, 0);
+}
+
+#[tokio::test]
+async fn http_conditional_and_filter_writes_return_outcomes() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = router(store(&dir));
+
+    let append = WriteRequest::Append {
+        operations: vec![WalOp::Upsert {
+            id: Id::U64(1),
+            document: document(1),
+        }],
+        idempotency_key: None,
+        options: WriteOptions::default(),
+    };
+    let response = request(
+        &app,
+        Method::POST,
+        "/v2/namespaces/docs",
+        Some(serde_json::to_vec(&append).unwrap()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let title_is_alpha = FilterExpr::Eq {
+        column: "title".into(),
+        value: Value::String("alpha".into()),
+    };
+    let conditional = WriteRequest::Conditional {
+        writes: vec![ConditionalWriteOp {
+            operation: WalOp::Patch {
+                id: Id::U64(1),
+                attributes: BTreeMap::from([("version".into(), Value::Int(2))]),
+                vectors: BTreeMap::new(),
+            },
+            condition: Some(title_is_alpha.clone()),
+        }],
+        idempotency_key: None,
+        options: WriteOptions::default(),
+    };
+    let response = request(
+        &app,
+        Method::POST,
+        "/v2/namespaces/docs",
+        Some(serde_json::to_vec(&conditional).unwrap()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let result: WriteResponse = json_body(response).await;
+    assert_eq!(result.outcome.unwrap().rows_patched, 1);
+
+    let patch = WriteRequest::PatchByFilter {
+        request: PatchByFilterRequest {
+            filter: title_is_alpha,
+            attributes: BTreeMap::from([("state".into(), Value::String("ready".into()))]),
+            vectors: BTreeMap::new(),
+            max_rows: 10,
+            allow_partial: false,
+        },
+        idempotency_key: None,
+        options: WriteOptions::default(),
+    };
+    let response = request(
+        &app,
+        Method::POST,
+        "/v2/namespaces/docs",
+        Some(serde_json::to_vec(&patch).unwrap()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let result: WriteResponse = json_body(response).await;
+    assert_eq!(result.outcome.unwrap().rows_patched, 1);
+
+    let delete = WriteRequest::DeleteByFilter {
+        request: DeleteByFilterRequest {
+            filter: FilterExpr::Eq {
+                column: "state".into(),
+                value: Value::String("ready".into()),
+            },
+            max_rows: 10,
+            allow_partial: false,
+        },
+        idempotency_key: None,
+        options: WriteOptions::default(),
+    };
+    let response = request(
+        &app,
+        Method::POST,
+        "/v2/namespaces/docs",
+        Some(serde_json::to_vec(&delete).unwrap()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let result: WriteResponse = json_body(response).await;
+    assert_eq!(result.outcome.unwrap().rows_deleted, 1);
+}
+
+#[tokio::test]
+async fn http_errors_use_stable_status_and_json_envelopes() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = router(store(&dir));
+
+    let response = request(&app, Method::GET, "/v1/namespaces/missing/metadata", None).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let error: serde_json::Value = json_body(response).await;
+    assert_eq!(error["error"]["code"], "not_found");
+
+    let invalid = WriteRequest::Append {
+        operations: Vec::new(),
+        idempotency_key: None,
+        options: WriteOptions::default(),
+    };
+    let response = request(
+        &app,
+        Method::POST,
+        "/v2/namespaces/docs",
+        Some(serde_json::to_vec(&invalid).unwrap()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: serde_json::Value = json_body(response).await;
+    assert_eq!(error["error"]["code"], "invalid_request");
+
+    let response = request(
+        &app,
+        Method::POST,
+        "/v2/namespaces/docs/query",
+        Some(b"{not-json".to_vec()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error: serde_json::Value = json_body(response).await;
+    assert_eq!(error["error"]["code"], "invalid_json");
+}

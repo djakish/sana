@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use sana::namespace::Namespace;
-use sana::object_store::{FsObjectStore, ObjectStore};
+use sana::object_store::{CachingObjectStore, FsObjectStore, ObjectStore};
 use sana::query::{MultiQuery, Query, RecallRequest};
 use sana::value::{Document, Id, Value};
 
@@ -37,6 +37,7 @@ async fn main() -> CliResult {
         Some("pin") => pin(&args).await,
         Some("unpin") => unpin(&args).await,
         Some("pin-status") => pin_status(&args).await,
+        Some("serve") => serve(&args).await,
         Some("demo") => demo(&args).await,
         _ => {
             usage();
@@ -71,6 +72,7 @@ fn usage() {
     eprintln!("  sana pin <dir> <ns> [replicas]");
     eprintln!("  sana unpin <dir> <ns>");
     eprintln!("  sana pin-status <dir> <ns>");
+    eprintln!("  sana serve <dir> [address] [cache-bytes]");
     eprintln!("  sana demo    <dir>");
 }
 
@@ -387,6 +389,25 @@ async fn pin_status(args: &[String]) -> CliResult {
         ),
         None => println!("{namespace_name}: not pinned"),
     }
+    Ok(())
+}
+
+async fn serve(args: &[String]) -> CliResult {
+    let dir = arg(args, 2)?;
+    let address = args
+        .get(3)
+        .map(String::as_str)
+        .unwrap_or("127.0.0.1:8080")
+        .parse()?;
+    let cache_bytes = args
+        .get(4)
+        .map(|value| value.parse::<usize>())
+        .transpose()?
+        .unwrap_or(256 * 1024 * 1024);
+    let backing: Arc<dyn ObjectStore> = Arc::new(FsObjectStore::new(dir));
+    let cached: Arc<dyn ObjectStore> = Arc::new(CachingObjectStore::new(backing, cache_bytes));
+    println!("serving Sana on http://{address} with {cache_bytes} cache bytes");
+    sana::api::serve(cached, address).await?;
     Ok(())
 }
 
