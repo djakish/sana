@@ -31,6 +31,7 @@ async fn main() -> CliResult {
         Some("maintain-vectors") => maintain_vectors(&args).await,
         Some("reconcile-indexing") => reconcile_indexing(&args).await,
         Some("work-indexing") => work_indexing(&args).await,
+        Some("branch") => branch(&args).await,
         Some("demo") => demo(&args).await,
         _ => {
             usage();
@@ -59,6 +60,7 @@ fn usage() {
     eprintln!("  sana maintain-vectors <dir> <ns>   # run one vector maintenance pass");
     eprintln!("  sana reconcile-indexing <dir>   # restore missed indexing notifications");
     eprintln!("  sana work-indexing <dir> <worker-id>   # claim and run one indexing job");
+    eprintln!("  sana branch <dir> <source-ns> <child-ns>   # zero-copy indexed snapshot");
     eprintln!("  sana demo    <dir>");
 }
 
@@ -290,6 +292,22 @@ async fn reconcile_indexing(args: &[String]) -> CliResult {
         report.lagging_namespaces,
         report.notifications_added,
         report.notifications_coalesced
+    );
+    Ok(())
+}
+
+async fn branch(args: &[String]) -> CliResult {
+    let (dir, source_name, child_name) = (arg(args, 2)?, arg(args, 3)?, arg(args, 4)?);
+    let source = Namespace::open(store(dir), source_name).await?;
+    let child = source.branch(child_name).await?;
+    let parent = child
+        .load_manifest()
+        .await?
+        .branch_parent
+        .expect("branch operation sets parent metadata");
+    println!(
+        "branched {source_name} generation {} to {child_name}",
+        parent.generation
     );
     Ok(())
 }

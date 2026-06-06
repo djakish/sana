@@ -19,7 +19,7 @@ use bytes::Bytes;
 
 use crate::attr;
 use crate::doc::{DocRecord, decode_id, encode_id};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::manifest::{
     NamespaceManifest, SstMeta, VectorAppendKind, VectorAppendMeta, VectorIndexMeta,
     VectorMaintenancePlan, VectorMaintenanceTask,
@@ -796,29 +796,8 @@ pub async fn gc(ns: &Namespace, apply: bool) -> Result<GcReport> {
     live.insert(manifest_pointer_key(ns.name()));
     live.insert(wal_commit_key(ns.name()));
     live.insert(manifest_body_key_for_pointer(ns.name(), &snapshot.pointer));
-    for meta in manifest
-        .doc_ssts
-        .iter()
-        .chain(&manifest.attr_ssts)
-        .chain(&manifest.text_ssts)
-    {
-        live.insert(meta.key.clone());
-    }
-    for vmeta in manifest.vector_indexes.values() {
-        live.insert(vmeta.key.clone());
-        if let Some(key) = &vmeta.rabitq_key {
-            live.insert(key.clone());
-        }
-        if let Some(key) = &vmeta.version_map_key {
-            live.insert(key.clone());
-        }
-        for append in &vmeta.append_indexes {
-            live.insert(append.key.clone());
-            if let Some(key) = &append.rabitq_key {
-                live.insert(key.clone());
-            }
-        }
-    }
+    live.extend(manifest.referenced_index_keys());
+    live.extend(foreign_references_into_namespace(ns).await?);
     // The unindexed WAL overlay the read path still merges: `(indexed_cursor,
     // commit]`. WAL at or before `indexed_cursor` is already in the SSTs.
     let from = manifest.indexed_cursor.map(|c| c.seq + 1).unwrap_or(1);
@@ -854,6 +833,44 @@ pub async fn gc(ns: &Namespace, apply: bool) -> Result<GcReport> {
         live_count,
         applied: apply,
     })
+}
+
+async fn foreign_references_into_namespace(ns: &Namespace) -> Result<BTreeSet<String>> {
+    const POINTER_SUFFIX: &str = "/manifest/current";
+
+    let namespace_names: BTreeSet<String> = ns
+        .store()
+        .list("namespaces/")
+        .await?
+        .into_iter()
+        .filter_map(|object| {
+            object
+                .key
+                .strip_prefix("namespaces/")
+                .and_then(|key| key.strip_suffix(POINTER_SUFFIX))
+                .filter(|name| *name != ns.name())
+                .map(str::to_string)
+        })
+        .collect();
+    let mut loads = tokio::task::JoinSet::new();
+    for name in namespace_names {
+        let store = ns.store().clone();
+        loads.spawn(async move { Namespace::open(store, &name).await?.load_manifest().await });
+    }
+
+    let prefix = format!("namespaces/{}/", ns.name());
+    let mut references = BTreeSet::new();
+    while let Some(result) = loads.join_next().await {
+        let manifest = result
+            .map_err(|error| Error::Corrupt(format!("GC branch scan join error: {error}")))??;
+        references.extend(
+            manifest
+                .referenced_index_keys()
+                .into_iter()
+                .filter(|key| key.starts_with(&prefix)),
+        );
+    }
+    Ok(references)
 }
 
 /// Execute one bounded vector maintenance pass from the manifest's planned

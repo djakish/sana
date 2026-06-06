@@ -12,6 +12,7 @@ pub mod indexer;
 pub mod manifest;
 pub mod namespace;
 pub mod object_store;
+pub mod operations;
 pub mod query;
 pub mod rabitq;
 pub mod schema;

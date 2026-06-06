@@ -212,6 +212,35 @@ impl NamespaceManifest {
         }
         Ok(m)
     }
+
+    /// Immutable index objects directly reachable from this manifest.
+    pub fn referenced_index_keys(&self) -> std::collections::BTreeSet<String> {
+        let mut keys = std::collections::BTreeSet::new();
+        for meta in self
+            .doc_ssts
+            .iter()
+            .chain(&self.attr_ssts)
+            .chain(&self.text_ssts)
+        {
+            keys.insert(meta.key.clone());
+        }
+        for meta in self.vector_indexes.values() {
+            keys.insert(meta.key.clone());
+            if let Some(key) = &meta.rabitq_key {
+                keys.insert(key.clone());
+            }
+            if let Some(key) = &meta.version_map_key {
+                keys.insert(key.clone());
+            }
+            for append in &meta.append_indexes {
+                keys.insert(append.key.clone());
+                if let Some(key) = &append.rabitq_key {
+                    keys.insert(key.clone());
+                }
+            }
+        }
+        keys
+    }
 }
 
 /// The tiny object at `manifest/current`: it names the live generation. Reading
