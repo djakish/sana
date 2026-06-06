@@ -29,6 +29,9 @@ pub enum Error {
     #[error("invalid query: {0}")]
     InvalidQuery(String),
 
+    #[error("invalid indexing queue claim: {0}")]
+    InvalidQueueClaim(String),
+
     #[error("corrupt data: {0}")]
     Corrupt(String),
 

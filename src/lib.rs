@@ -6,6 +6,7 @@ pub mod attr;
 pub mod doc;
 pub mod error;
 pub mod frame;
+pub mod index_queue;
 pub mod indexer;
 pub mod manifest;
 pub mod namespace;
