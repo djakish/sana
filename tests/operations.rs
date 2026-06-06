@@ -3,7 +3,8 @@ use std::sync::Arc;
 use sana::error::Error;
 use sana::indexer;
 use sana::namespace::Namespace;
-use sana::object_store::{FsObjectStore, ObjectStore};
+use sana::object_store::{FsObjectStore, ObjectStore, version_of};
+use sana::operations::SnapshotExportCatalog;
 use sana::value::{Document, Id, Value};
 
 fn store(dir: &tempfile::TempDir) -> Arc<dyn ObjectStore> {
@@ -108,4 +109,87 @@ async fn source_gc_preserves_objects_referenced_by_branch() {
         child_docs[&Id::U64(1)].attributes["title"],
         Value::String("one".into())
     );
+}
+
+#[tokio::test]
+async fn physical_copy_to_another_store_is_independent_and_writable() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let target_dir = tempfile::tempdir().unwrap();
+    let source_store = store(&source_dir);
+    let target_store = store(&target_dir);
+    let source = Namespace::create(source_store.clone(), "source")
+        .await
+        .unwrap();
+    source.upsert(doc(1, "one")).await.unwrap();
+    source.upsert(doc(2, "two")).await.unwrap();
+    indexer::flush(&source).await.unwrap();
+    let expected = source.replay().await.unwrap();
+
+    let report = source
+        .copy_to(target_store.clone(), "copied")
+        .await
+        .unwrap();
+    assert!(report.object_count > 0);
+    assert!(report.copied_bytes > 0);
+    let copied = Namespace::open(target_store, "copied").await.unwrap();
+    assert_eq!(copied.replay().await.unwrap(), expected);
+    assert!(
+        copied
+            .load_manifest()
+            .await
+            .unwrap()
+            .branch_parent
+            .is_none()
+    );
+    assert!(
+        copied
+            .load_manifest()
+            .await
+            .unwrap()
+            .referenced_index_keys()
+            .iter()
+            .all(|key| key.starts_with("namespaces/copied/index/g/0/copy/"))
+    );
+
+    for object in source_store.list("namespaces/source/").await.unwrap() {
+        source_store.delete(&object.key).await.unwrap();
+    }
+    assert_eq!(copied.replay().await.unwrap(), expected);
+    copied.upsert(doc(3, "three")).await.unwrap();
+    assert_eq!(copied.replay().await.unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn export_writes_deterministic_catalog_last_and_is_idempotent() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let export_dir = tempfile::tempdir().unwrap();
+    let source = Namespace::create(store(&source_dir), "source")
+        .await
+        .unwrap();
+    source.upsert(doc(1, "one")).await.unwrap();
+    source.upsert(doc(2, "two")).await.unwrap();
+    indexer::flush(&source).await.unwrap();
+    let export_store = store(&export_dir);
+
+    let first = source
+        .export_to(export_store.clone(), "exports/snapshot")
+        .await
+        .unwrap();
+    let catalog_bytes = export_store.get(&first.catalog_key).await.unwrap().bytes;
+    let catalog = SnapshotExportCatalog::decode(&catalog_bytes).unwrap();
+    assert_eq!(catalog.source_namespace, "source");
+    assert_eq!(catalog.source_generation, first.source_generation);
+    assert_eq!(catalog.objects.len(), first.object_count);
+    assert_eq!(catalog.manifest, source.load_manifest().await.unwrap());
+    for object in &catalog.objects {
+        let exported = export_store.get(&object.export_key).await.unwrap();
+        assert_eq!(exported.bytes.len() as u64, object.size_bytes);
+        assert_eq!(version_of(&exported.bytes), object.checksum);
+    }
+
+    let repeated = source
+        .export_to(export_store, "exports/snapshot/")
+        .await
+        .unwrap();
+    assert_eq!(repeated, first);
 }

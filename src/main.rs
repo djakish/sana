@@ -32,6 +32,8 @@ async fn main() -> CliResult {
         Some("reconcile-indexing") => reconcile_indexing(&args).await,
         Some("work-indexing") => work_indexing(&args).await,
         Some("branch") => branch(&args).await,
+        Some("copy") => copy(&args).await,
+        Some("export") => export(&args).await,
         Some("demo") => demo(&args).await,
         _ => {
             usage();
@@ -61,6 +63,8 @@ fn usage() {
     eprintln!("  sana reconcile-indexing <dir>   # restore missed indexing notifications");
     eprintln!("  sana work-indexing <dir> <worker-id>   # claim and run one indexing job");
     eprintln!("  sana branch <dir> <source-ns> <child-ns>   # zero-copy indexed snapshot");
+    eprintln!("  sana copy <source-dir> <source-ns> <target-dir> <target-ns>");
+    eprintln!("  sana export <source-dir> <ns> <target-dir> <prefix>");
     eprintln!("  sana demo    <dir>");
 }
 
@@ -308,6 +312,30 @@ async fn branch(args: &[String]) -> CliResult {
     println!(
         "branched {source_name} generation {} to {child_name}",
         parent.generation
+    );
+    Ok(())
+}
+
+async fn copy(args: &[String]) -> CliResult {
+    let (source_dir, source_name, target_dir, target_name) =
+        (arg(args, 2)?, arg(args, 3)?, arg(args, 4)?, arg(args, 5)?);
+    let source = Namespace::open(store(source_dir), source_name).await?;
+    let report = source.copy_to(store(target_dir), target_name).await?;
+    println!(
+        "copied {source_name} generation {} to {target_name}: {} object(s), {} bytes",
+        report.source_generation, report.object_count, report.copied_bytes
+    );
+    Ok(())
+}
+
+async fn export(args: &[String]) -> CliResult {
+    let (source_dir, namespace_name, target_dir, prefix) =
+        (arg(args, 2)?, arg(args, 3)?, arg(args, 4)?, arg(args, 5)?);
+    let namespace = Namespace::open(store(source_dir), namespace_name).await?;
+    let report = namespace.export_to(store(target_dir), prefix).await?;
+    println!(
+        "exported {namespace_name} generation {} to {}: {} object(s), {} bytes",
+        report.source_generation, report.catalog_key, report.object_count, report.copied_bytes
     );
     Ok(())
 }

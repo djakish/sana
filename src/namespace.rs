@@ -78,16 +78,16 @@ fn decode_cursor(bytes: &[u8]) -> Result<WalCursor> {
     serde_json::from_slice(bytes).map_err(|e| Error::Codec(e.to_string()))
 }
 
-async fn put_immutable_if_absent(
+pub(crate) async fn put_immutable_if_absent(
     store: &Arc<dyn ObjectStore>,
     key: &str,
-    bytes: Vec<u8>,
+    bytes: Bytes,
 ) -> Result<()> {
-    match store.put_if_absent(key, Bytes::from(bytes.clone())).await {
+    match store.put_if_absent(key, bytes.clone()).await {
         Ok(_) => Ok(()),
         Err(Error::AlreadyExists(_)) => {
             let existing = store.get(key).await?;
-            if existing.bytes.as_ref() == bytes.as_slice() {
+            if existing.bytes == bytes {
                 Ok(())
             } else {
                 Err(Error::Corrupt(format!(
@@ -153,11 +153,11 @@ impl Namespace {
         let encoded_manifest = manifest.encode()?;
         let body_version = version_of(&encoded_manifest);
         let body_key = manifest_content_body_key(name, 0, &body_version);
-        put_immutable_if_absent(&store, &body_key, encoded_manifest).await?;
+        put_immutable_if_absent(&store, &body_key, Bytes::from(encoded_manifest)).await?;
 
         let cursor_key = wal_commit_key(name);
         let encoded_cursor = encode_cursor(&WalCursor::new(0, 0))?;
-        put_immutable_if_absent(&store, &cursor_key, encoded_cursor).await?;
+        put_immutable_if_absent(&store, &cursor_key, Bytes::from(encoded_cursor)).await?;
 
         // The pointer is the existence sentinel; create it last and atomically.
         match store
