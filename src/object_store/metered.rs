@@ -14,7 +14,7 @@ use bytes::Bytes;
 
 use super::{GetResult, ObjectMeta, ObjectStore, ObjectVersion};
 use crate::error::{Error, Result};
-use crate::metrics::{Metrics, ObjectStoreMetrics};
+use crate::metrics::{Metrics, add, incr};
 
 pub struct MeteredObjectStore {
     inner: Arc<dyn ObjectStore>,
@@ -31,34 +31,34 @@ impl MeteredObjectStore {
 impl ObjectStore for MeteredObjectStore {
     async fn get(&self, key: &str) -> Result<GetResult> {
         let os = &self.metrics.object_store;
-        ObjectStoreMetrics::incr(&os.gets);
+        incr(&os.gets);
         let result = os.request_latency.time(self.inner.get(key)).await?;
-        ObjectStoreMetrics::add(&os.get_bytes, result.bytes.len() as u64);
+        add(&os.get_bytes, result.bytes.len() as u64);
         Ok(result)
     }
 
     async fn get_range(&self, key: &str, range: Range<u64>) -> Result<Bytes> {
         let os = &self.metrics.object_store;
-        ObjectStoreMetrics::incr(&os.get_ranges);
+        incr(&os.get_ranges);
         let bytes = os
             .request_latency
             .time(self.inner.get_range(key, range))
             .await?;
-        ObjectStoreMetrics::add(&os.range_bytes, bytes.len() as u64);
+        add(&os.range_bytes, bytes.len() as u64);
         Ok(bytes)
     }
 
     async fn put(&self, key: &str, bytes: Bytes) -> Result<ObjectVersion> {
         let os = &self.metrics.object_store;
-        ObjectStoreMetrics::incr(&os.puts);
-        ObjectStoreMetrics::add(&os.put_bytes, bytes.len() as u64);
+        incr(&os.puts);
+        add(&os.put_bytes, bytes.len() as u64);
         os.request_latency.time(self.inner.put(key, bytes)).await
     }
 
     async fn put_if_absent(&self, key: &str, bytes: Bytes) -> Result<ObjectVersion> {
         let os = &self.metrics.object_store;
-        ObjectStoreMetrics::incr(&os.puts_if_absent);
-        ObjectStoreMetrics::add(&os.put_bytes, bytes.len() as u64);
+        incr(&os.puts_if_absent);
+        add(&os.put_bytes, bytes.len() as u64);
         os.request_latency
             .time(self.inner.put_if_absent(key, bytes))
             .await
@@ -71,8 +71,8 @@ impl ObjectStore for MeteredObjectStore {
         bytes: Bytes,
     ) -> Result<ObjectVersion> {
         let os = &self.metrics.object_store;
-        ObjectStoreMetrics::incr(&os.compare_and_sets);
-        ObjectStoreMetrics::add(&os.put_bytes, bytes.len() as u64);
+        incr(&os.compare_and_sets);
+        add(&os.put_bytes, bytes.len() as u64);
         match os
             .request_latency
             .time(self.inner.compare_and_set(key, expected, bytes))
@@ -81,7 +81,7 @@ impl ObjectStore for MeteredObjectStore {
             Ok(version) => Ok(version),
             Err(error) => {
                 if matches!(error, Error::CasMismatch { .. }) {
-                    ObjectStoreMetrics::incr(&os.cas_mismatches);
+                    incr(&os.cas_mismatches);
                 }
                 Err(error)
             }
@@ -90,13 +90,13 @@ impl ObjectStore for MeteredObjectStore {
 
     async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>> {
         let os = &self.metrics.object_store;
-        ObjectStoreMetrics::incr(&os.lists);
+        incr(&os.lists);
         os.request_latency.time(self.inner.list(prefix)).await
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
         let os = &self.metrics.object_store;
-        ObjectStoreMetrics::incr(&os.deletes);
+        incr(&os.deletes);
         os.request_latency.time(self.inner.delete(key)).await
     }
 }

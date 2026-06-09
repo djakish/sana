@@ -8,9 +8,10 @@
 //! `Relaxed`: counters are independent and a metrics scrape never needs a
 //! consistent cross-counter view.
 
+use std::collections::BTreeMap;
 use std::future::Future;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -28,7 +29,10 @@ const BUCKETS: usize = BUCKET_BOUNDS_US.len() + 1;
 #[derive(Debug, Default)]
 pub struct Metrics {
     pub object_store: ObjectStoreMetrics,
+    pub cache: CacheMetrics,
     pub latency: LatencyMetrics,
+    pub search: SearchMetrics,
+    pub index_lag: IndexLagMetrics,
 }
 
 impl Metrics {
@@ -39,9 +43,24 @@ impl Metrics {
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
             object_store: self.object_store.snapshot(),
+            cache: self.cache.snapshot(),
             latency: self.latency.snapshot(),
+            search: self.search.snapshot(),
+            index_lag: self.index_lag.snapshot(),
         }
     }
+}
+
+pub fn incr(counter: &AtomicU64) {
+    counter.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn add(counter: &AtomicU64, amount: u64) {
+    counter.fetch_add(amount, Ordering::Relaxed);
+}
+
+pub fn set(gauge: &AtomicU64, value: u64) {
+    gauge.store(value, Ordering::Relaxed);
 }
 
 /// Backend object-store traffic, counted below the cache so only true round
@@ -65,14 +84,6 @@ pub struct ObjectStoreMetrics {
 }
 
 impl ObjectStoreMetrics {
-    pub fn incr(counter: &AtomicU64) {
-        counter.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn add(counter: &AtomicU64, amount: u64) {
-        counter.fetch_add(amount, Ordering::Relaxed);
-    }
-
     fn snapshot(&self) -> ObjectStoreSnapshot {
         let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
         ObjectStoreSnapshot {
@@ -89,6 +100,103 @@ impl ObjectStoreMetrics {
             put_bytes: load(&self.put_bytes),
             request_latency: self.request_latency.snapshot(),
         }
+    }
+}
+
+/// Mirror of the immutable-object cache's internal stats. The cache's
+/// mutex-guarded state is the source of truth; it *sets* these after each
+/// operation rather than incrementing them, so one cache per registry.
+#[derive(Debug, Default)]
+pub struct CacheMetrics {
+    pub hits: AtomicU64,
+    pub misses: AtomicU64,
+    pub bypasses: AtomicU64,
+    pub evictions: AtomicU64,
+    pub admission_rejections: AtomicU64,
+    pub capacity_bytes: AtomicU64,
+    pub resident_bytes: AtomicU64,
+    pub entries: AtomicU64,
+}
+
+impl CacheMetrics {
+    fn snapshot(&self) -> CacheSnapshot {
+        let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        CacheSnapshot {
+            hits: load(&self.hits),
+            misses: load(&self.misses),
+            bypasses: load(&self.bypasses),
+            evictions: load(&self.evictions),
+            admission_rejections: load(&self.admission_rejections),
+            capacity_bytes: load(&self.capacity_bytes),
+            resident_bytes: load(&self.resident_bytes),
+            entries: load(&self.entries),
+        }
+    }
+}
+
+/// Vector-ANN and full-text work counters, recorded by the query executor.
+#[derive(Debug, Default)]
+pub struct SearchMetrics {
+    /// ANN queries served from published vector segments (not exact fallback).
+    pub ann_queries: AtomicU64,
+    /// Posting candidates returned by segment scans before liveness filtering.
+    pub ann_candidates: AtomicU64,
+    /// RaBitQ code estimations performed (L2 quantized path only).
+    pub ann_estimated: AtomicU64,
+    /// Candidates exact-reranked after the confidence-bound prune.
+    pub ann_reranked: AtomicU64,
+    /// Candidates eliminated by the RaBitQ lower bound without a rerank.
+    pub ann_pruned: AtomicU64,
+    /// Text queries executed (indexed or exhaustive path).
+    pub text_queries: AtomicU64,
+    /// Posting blocks decoded and scored by block MAXSCORE.
+    pub text_blocks_read: AtomicU64,
+    /// Posting blocks skipped by the rank-safe block upper bound.
+    pub text_blocks_skipped: AtomicU64,
+}
+
+impl SearchMetrics {
+    fn snapshot(&self) -> SearchSnapshot {
+        let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        SearchSnapshot {
+            ann_queries: load(&self.ann_queries),
+            ann_candidates: load(&self.ann_candidates),
+            ann_estimated: load(&self.ann_estimated),
+            ann_reranked: load(&self.ann_reranked),
+            ann_pruned: load(&self.ann_pruned),
+            text_queries: load(&self.text_queries),
+            text_blocks_read: load(&self.text_blocks_read),
+            text_blocks_skipped: load(&self.text_blocks_skipped),
+        }
+    }
+}
+
+/// Per-namespace indexing lag, refreshed by each reconciliation scan. The map
+/// is replaced wholesale so deleted namespaces drop out of the scrape.
+#[derive(Debug, Default)]
+pub struct IndexLagMetrics {
+    samples: Mutex<BTreeMap<String, IndexLagSample>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct IndexLagSample {
+    pub unindexed_bytes: u64,
+    pub unindexed_batches: u64,
+}
+
+impl IndexLagMetrics {
+    pub fn record(&self, samples: BTreeMap<String, IndexLagSample>) {
+        *self
+            .samples
+            .lock()
+            .expect("index-lag mutex is never poisoned") = samples;
+    }
+
+    fn snapshot(&self) -> BTreeMap<String, IndexLagSample> {
+        self.samples
+            .lock()
+            .expect("index-lag mutex is never poisoned")
+            .clone()
     }
 }
 
@@ -177,10 +285,13 @@ impl Histogram {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct MetricsSnapshot {
     pub object_store: ObjectStoreSnapshot,
+    pub cache: CacheSnapshot,
     pub latency: LatencySnapshot,
+    pub search: SearchSnapshot,
+    pub index_lag: BTreeMap<String, IndexLagSample>,
 }
 
 impl MetricsSnapshot {
@@ -196,8 +307,41 @@ impl MetricsSnapshot {
             "Wall-clock latency of backend object-store requests.",
             &[(None, &self.object_store.request_latency)],
         );
+        for series in self.cache.series() {
+            series.render(&mut out);
+        }
         self.latency.render(&mut out);
+        for series in self.search.series() {
+            series.render(&mut out);
+        }
+        self.render_index_lag(&mut out);
         out
+    }
+
+    fn render_index_lag(&self, out: &mut String) {
+        use std::fmt::Write;
+        // Namespace names are validated to [A-Za-z0-9-_.], so label values
+        // need no escaping.
+        type LagValue = fn(&IndexLagSample) -> u64;
+        let families: [(&str, &str, LagValue); 2] = [
+            (
+                "sana_namespace_unindexed_bytes",
+                "Committed WAL bytes not yet absorbed by the index, per namespace.",
+                |sample| sample.unindexed_bytes,
+            ),
+            (
+                "sana_namespace_unindexed_batches",
+                "Committed WAL batches not yet absorbed by the index, per namespace.",
+                |sample| sample.unindexed_batches,
+            ),
+        ];
+        for (name, help, value) in families {
+            let _ = writeln!(out, "# HELP {name} {help}");
+            let _ = writeln!(out, "# TYPE {name} gauge");
+            for (namespace, sample) in &self.index_lag {
+                let _ = writeln!(out, "{name}{{namespace=\"{namespace}\"}} {}", value(sample));
+            }
+        }
     }
 }
 
@@ -285,19 +429,152 @@ impl HistogramSnapshot {
 struct Series {
     name: &'static str,
     help: &'static str,
+    kind: &'static str,
     value: u64,
 }
 
 impl Series {
     fn new(name: &'static str, help: &'static str, value: u64) -> Self {
-        Self { name, help, value }
+        Self {
+            name,
+            help,
+            kind: "counter",
+            value,
+        }
+    }
+
+    fn gauge(name: &'static str, help: &'static str, value: u64) -> Self {
+        Self {
+            name,
+            help,
+            kind: "gauge",
+            value,
+        }
     }
 
     fn render(&self, out: &mut String) {
         use std::fmt::Write;
         let _ = writeln!(out, "# HELP {} {}", self.name, self.help);
-        let _ = writeln!(out, "# TYPE {} counter", self.name);
+        let _ = writeln!(out, "# TYPE {} {}", self.name, self.kind);
         let _ = writeln!(out, "{} {}", self.name, self.value);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct CacheSnapshot {
+    pub hits: u64,
+    pub misses: u64,
+    pub bypasses: u64,
+    pub evictions: u64,
+    pub admission_rejections: u64,
+    pub capacity_bytes: u64,
+    pub resident_bytes: u64,
+    pub entries: u64,
+}
+
+impl CacheSnapshot {
+    fn series(&self) -> [Series; 8] {
+        [
+            Series::new(
+                "sana_cache_hits_total",
+                "Immutable-object cache hits.",
+                self.hits,
+            ),
+            Series::new(
+                "sana_cache_misses_total",
+                "Immutable-object cache misses.",
+                self.misses,
+            ),
+            Series::new(
+                "sana_cache_bypasses_total",
+                "Reads of mutable keys that bypass the cache.",
+                self.bypasses,
+            ),
+            Series::new(
+                "sana_cache_evictions_total",
+                "Entries evicted to fit the byte capacity.",
+                self.evictions,
+            ),
+            Series::new(
+                "sana_cache_admission_rejections_total",
+                "Objects too large to ever fit the cache.",
+                self.admission_rejections,
+            ),
+            Series::gauge(
+                "sana_cache_capacity_bytes",
+                "Configured cache byte capacity.",
+                self.capacity_bytes,
+            ),
+            Series::gauge(
+                "sana_cache_resident_bytes",
+                "Bytes currently resident in the cache.",
+                self.resident_bytes,
+            ),
+            Series::gauge(
+                "sana_cache_entries",
+                "Objects currently resident in the cache.",
+                self.entries,
+            ),
+        ]
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct SearchSnapshot {
+    pub ann_queries: u64,
+    pub ann_candidates: u64,
+    pub ann_estimated: u64,
+    pub ann_reranked: u64,
+    pub ann_pruned: u64,
+    pub text_queries: u64,
+    pub text_blocks_read: u64,
+    pub text_blocks_skipped: u64,
+}
+
+impl SearchSnapshot {
+    fn series(&self) -> [Series; 8] {
+        [
+            Series::new(
+                "sana_search_ann_queries_total",
+                "ANN queries served from published vector segments.",
+                self.ann_queries,
+            ),
+            Series::new(
+                "sana_search_ann_candidates_total",
+                "Posting candidates returned by ANN segment scans.",
+                self.ann_candidates,
+            ),
+            Series::new(
+                "sana_search_ann_estimated_total",
+                "RaBitQ code estimations performed.",
+                self.ann_estimated,
+            ),
+            Series::new(
+                "sana_search_ann_reranked_total",
+                "ANN candidates exact-reranked after pruning.",
+                self.ann_reranked,
+            ),
+            Series::new(
+                "sana_search_ann_pruned_total",
+                "ANN candidates eliminated by the RaBitQ lower bound.",
+                self.ann_pruned,
+            ),
+            Series::new(
+                "sana_search_text_queries_total",
+                "Full-text queries executed.",
+                self.text_queries,
+            ),
+            Series::new(
+                "sana_search_text_blocks_read_total",
+                "Text posting blocks decoded and scored.",
+                self.text_blocks_read,
+            ),
+            Series::new(
+                "sana_search_text_blocks_skipped_total",
+                "Text posting blocks skipped by block MAXSCORE.",
+                self.text_blocks_skipped,
+            ),
+        ]
     }
 }
 
@@ -411,9 +688,9 @@ mod tests {
     #[test]
     fn snapshot_reflects_increments() {
         let metrics = Metrics::shared();
-        ObjectStoreMetrics::incr(&metrics.object_store.gets);
-        ObjectStoreMetrics::incr(&metrics.object_store.gets);
-        ObjectStoreMetrics::add(&metrics.object_store.get_bytes, 4096);
+        incr(&metrics.object_store.gets);
+        incr(&metrics.object_store.gets);
+        add(&metrics.object_store.get_bytes, 4096);
 
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.object_store.gets, 2);
@@ -431,8 +708,34 @@ mod tests {
         assert!(text.contains("# TYPE sana_object_store_cas_mismatches_total counter"));
         assert!(text.contains("\nsana_object_store_cas_mismatches_total 7\n"));
         // Every family is emitted, even at zero.
-        assert_eq!(text.matches(" counter\n").count(), 11);
+        assert_eq!(text.matches(" counter\n").count(), 24);
+        assert_eq!(text.matches(" gauge\n").count(), 5);
         assert_eq!(text.matches(" histogram\n").count(), 5);
+    }
+
+    #[test]
+    fn index_lag_renders_labeled_gauges_and_replaces_wholesale() {
+        let metrics = Metrics::default();
+        metrics.index_lag.record(BTreeMap::from([
+            (
+                "docs".to_string(),
+                IndexLagSample {
+                    unindexed_bytes: 42,
+                    unindexed_batches: 2,
+                },
+            ),
+            ("empty".to_string(), IndexLagSample::default()),
+        ]));
+        let text = metrics.snapshot().to_prometheus();
+        assert!(text.contains("# TYPE sana_namespace_unindexed_bytes gauge"));
+        assert!(text.contains("sana_namespace_unindexed_bytes{namespace=\"docs\"} 42\n"));
+        assert!(text.contains("sana_namespace_unindexed_batches{namespace=\"docs\"} 2\n"));
+        assert!(text.contains("sana_namespace_unindexed_bytes{namespace=\"empty\"} 0\n"));
+
+        // A later scan without "docs" drops its series from the scrape.
+        metrics.index_lag.record(BTreeMap::new());
+        let text = metrics.snapshot().to_prometheus();
+        assert!(!text.contains("namespace=\"docs\""));
     }
 
     #[test]

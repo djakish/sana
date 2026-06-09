@@ -6,7 +6,7 @@
 //! fences a timed-out worker from completing work after another worker takes
 //! over.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,8 +14,10 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::backpressure::unindexed_wal_bytes;
 use crate::error::{Error, Result};
 use crate::indexer;
+use crate::metrics::IndexLagSample;
 use crate::namespace::{Namespace, now_ms, validate_namespace_name};
 use crate::object_store::{GetResult, ObjectStore};
 use crate::wal::WalCursor;
@@ -87,6 +89,9 @@ pub struct ReconcileReport {
     pub lagging_namespaces: usize,
     pub notifications_added: usize,
     pub notifications_coalesced: usize,
+    /// Exact per-namespace indexing lag observed by this scan, for every
+    /// scanned namespace (zero-lag entries included so gauges reset).
+    pub lag: BTreeMap<String, IndexLagSample>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -758,18 +763,19 @@ pub async fn reconcile_unindexed_with_broker(
         let store = store.clone();
         reads.spawn(async move {
             let namespace = Namespace::open(store, &namespace_name).await?;
-            let indexed = namespace.load_manifest().await?.indexed_cursor;
+            let manifest = namespace.load_manifest().await?;
             // Manifest first, then the monotonic commit cursor: a concurrent
             // flush may advance the manifest between reads, but it cannot be
             // ahead of a commit cursor captured afterward.
-            let commit = namespace.commit_cursor().await?;
-            Ok::<_, Error>((namespace_name, commit, indexed))
+            let (commit, committed_wal_bytes) = namespace.wal_commit_stats().await?;
+            let bytes = unindexed_wal_bytes(&manifest, committed_wal_bytes)?;
+            Ok::<_, Error>((namespace_name, commit, manifest.indexed_cursor, bytes))
         });
     }
 
     let mut lagging = Vec::new();
     while let Some(result) = reads.join_next().await {
-        let (namespace, commit, indexed) =
+        let (namespace, commit, indexed, unindexed_bytes) =
             result.map_err(|error| Error::Corrupt(format!("reconcile join error: {error}")))??;
         if indexed.is_some_and(|cursor| cursor > commit) {
             return Err(Error::Corrupt(format!(
@@ -777,6 +783,13 @@ pub async fn reconcile_unindexed_with_broker(
             )));
         }
         let indexed = indexed.unwrap_or_else(|| WalCursor::new(commit.epoch, 0));
+        report.lag.insert(
+            namespace.clone(),
+            IndexLagSample {
+                unindexed_bytes,
+                unindexed_batches: commit.seq.saturating_sub(indexed.seq),
+            },
+        );
         if indexed < commit {
             lagging.push((namespace, commit));
         }
@@ -1396,15 +1409,14 @@ mod tests {
 
         store.delete(INDEX_QUEUE_KEY).await.unwrap();
         let report = reconcile_unindexed(store.clone()).await.unwrap();
-        assert_eq!(
-            report,
-            ReconcileReport {
-                scanned_namespaces: 2,
-                lagging_namespaces: 1,
-                notifications_added: 1,
-                notifications_coalesced: 0,
-            }
-        );
+        assert_eq!(report.scanned_namespaces, 2);
+        assert_eq!(report.lagging_namespaces, 1);
+        assert_eq!(report.notifications_added, 1);
+        assert_eq!(report.notifications_coalesced, 0);
+        let alpha_lag = report.lag["alpha"];
+        assert_eq!(alpha_lag.unindexed_batches, 1);
+        assert!(alpha_lag.unindexed_bytes > 0);
+        assert_eq!(report.lag["beta"], IndexLagSample::default());
         let jobs = IndexQueue::new(store.clone()).jobs().await.unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].namespace, "alpha");

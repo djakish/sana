@@ -18,6 +18,7 @@ use crate::backpressure::{DEFAULT_MAX_UNINDEXED_WAL_BYTES, enforce_limit, uninde
 use crate::doc::encode_id;
 use crate::error::{Error, Result};
 use crate::manifest::{NamespaceManifest, VectorIndexMeta};
+use crate::metrics::{add, incr};
 use crate::namespace::{Namespace, op_id};
 use crate::object_store::ObjectStore;
 use crate::rabitq::RabitqIndex;
@@ -428,6 +429,7 @@ async fn execute_text(
     aggregates: &[Aggregate],
 ) -> Result<QueryResult> {
     validate_text_query(manifest, text_query)?;
+    incr(&ns.metrics().search.text_queries);
 
     let effective_limit = limit.unwrap_or(text_query.k).min(text_query.k);
     let top_k = if filter.is_none() && aggregates.is_empty() {
@@ -477,13 +479,19 @@ async fn text_hits_and_docs(
             .await?;
         let rank_start = Instant::now();
         let hits = match top_k {
-            Some(k) => text::search_sst_top_k(
-                &reader,
-                &text_query.column,
-                &text_query.query,
-                k,
-                text_query.params,
-            )?,
+            Some(k) => {
+                let outcome = text::search_sst_top_k_with_stats(
+                    &reader,
+                    &text_query.column,
+                    &text_query.query,
+                    k,
+                    text_query.params,
+                )?;
+                let search = &ns.metrics().search;
+                add(&search.text_blocks_read, outcome.stats.blocks_read);
+                add(&search.text_blocks_skipped, outcome.stats.blocks_skipped);
+                outcome.hits
+            }
             None => text::search_sst(
                 &reader,
                 &text_query.column,
@@ -737,23 +745,24 @@ async fn execute_ann_vector(
         if metric == DistanceMetric::L2
             && let Some(quantized) = &segment.rabitq
         {
-            ann_hits.extend(
-                quantized
-                    .search_l2_with_filter(
-                        &segment.index,
-                        &query.vector,
-                        segment_k,
-                        query.probes,
-                        mask.as_ref(),
-                        |id, version| {
-                            !touched.contains(id)
-                                && version_map
-                                    .as_ref()
-                                    .is_none_or(|versions| versions.is_live(id, version))
-                        },
-                    )?
-                    .hits,
-            );
+            let outcome = quantized.search_l2_with_filter(
+                &segment.index,
+                &query.vector,
+                segment_k,
+                query.probes,
+                mask.as_ref(),
+                |id, version| {
+                    !touched.contains(id)
+                        && version_map
+                            .as_ref()
+                            .is_none_or(|versions| versions.is_live(id, version))
+                },
+            )?;
+            let search = &ns.metrics().search;
+            add(&search.ann_estimated, outcome.stats.estimated);
+            add(&search.ann_reranked, outcome.stats.reranked);
+            add(&search.ann_pruned, outcome.stats.pruned);
+            ann_hits.extend(outcome.hits);
         } else {
             ann_hits.extend(segment.index.search_with_filter(
                 &query.vector,
@@ -765,6 +774,9 @@ async fn execute_ann_vector(
         }
     }
     latency.query_rank.observe(rank_start.elapsed());
+    let search = &ns.metrics().search;
+    incr(&search.ann_queries);
+    add(&search.ann_candidates, ann_hits.len() as u64);
 
     // The documents we need: live ANN hits (not superseded by the overlay) plus
     // every overlay-touched id, resolved in one SST pass rather than per id.

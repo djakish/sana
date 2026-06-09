@@ -408,7 +408,8 @@ async fn serve(args: &[String]) -> CliResult {
     let metrics = Metrics::shared();
     let backing: Arc<dyn ObjectStore> = Arc::new(FsObjectStore::new(dir));
     let metered: Arc<dyn ObjectStore> = Arc::new(MeteredObjectStore::new(backing, metrics.clone()));
-    let cached: Arc<dyn ObjectStore> = Arc::new(CachingObjectStore::new(metered, cache_bytes));
+    let cached: Arc<dyn ObjectStore> =
+        Arc::new(CachingObjectStore::new(metered, cache_bytes).with_metrics(metrics.clone()));
     println!("serving Sana on http://{address} with {cache_bytes} cache bytes");
     sana::api::serve_with_shutdown(cached, address, metrics, shutdown_signal()).await?;
     Ok(())

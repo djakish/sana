@@ -1321,3 +1321,53 @@ async fn recall_requires_published_vector_index() {
 
     assert!(matches!(err, Error::InvalidQuery(_)));
 }
+
+#[tokio::test]
+async fn search_metrics_count_ann_and_text_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let metrics = sana::metrics::Metrics::shared();
+    let ns = Namespace::create(store(&dir), "docs")
+        .await
+        .unwrap()
+        .with_metrics(metrics.clone());
+    ns.upsert(doc(1, "blue sky", 1, &["v"], [1.0, 0.0]))
+        .await
+        .unwrap();
+    ns.upsert(doc(2, "red sun", 2, &["v"], [0.0, 1.0]))
+        .await
+        .unwrap();
+    indexer::flush(&ns).await.unwrap();
+
+    let ann = Query {
+        approx_vector: Some(ApproxVectorQuery {
+            column: "embedding".into(),
+            vector: vec![1.0, 0.0],
+            k: 1,
+            probes: Some(16),
+            metric: Some(DistanceMetric::L2),
+        }),
+        ..Query::all()
+    };
+    let result = ns.query(ann).await.unwrap();
+    assert_eq!(result.rows[0].id, Id::U64(1));
+
+    let text = Query {
+        text: Some(TextQuery {
+            column: "title".into(),
+            query: "blue".into(),
+            k: 5,
+            params: Bm25Params::default(),
+        }),
+        ..Query::all()
+    };
+    let result = ns.query(text).await.unwrap();
+    assert_eq!(result.rows[0].id, Id::U64(1));
+
+    let search = metrics.snapshot().search;
+    assert_eq!(search.ann_queries, 1);
+    assert!(search.ann_candidates >= 1, "scan returned candidates");
+    assert!(search.ann_estimated >= 1, "L2 path estimated codes");
+    assert!(search.ann_reranked >= 1, "survivors were exact-reranked");
+    assert_eq!(search.text_queries, 1);
+    assert!(search.text_blocks_read >= 1, "MAXSCORE decoded blocks");
+}

@@ -282,10 +282,13 @@ pub async fn serve_with_shutdown(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(address).await?;
-    let server = axum::serve(listener, router_with_metrics(store.clone(), metrics))
-        .with_graceful_shutdown(shutdown)
-        .into_future();
-    let worker = run_index_worker(store);
+    let server = axum::serve(
+        listener,
+        router_with_metrics(store.clone(), metrics.clone()),
+    )
+    .with_graceful_shutdown(shutdown)
+    .into_future();
+    let worker = run_index_worker(store, metrics);
     run_server_and_worker(server, worker).await
 }
 
@@ -301,7 +304,7 @@ async fn run_server_and_worker(
     }
 }
 
-async fn run_index_worker(store: Arc<dyn ObjectStore>) {
+async fn run_index_worker(store: Arc<dyn ObjectStore>, metrics: Arc<Metrics>) {
     const LEASE_MS: u64 = 30_000;
     const HEARTBEAT_MS: u64 = 1_000;
     const IDLE_POLL_MS: u64 = 100;
@@ -312,8 +315,10 @@ async fn run_index_worker(store: Arc<dyn ObjectStore>) {
     let mut next_reconcile = tokio::time::Instant::now();
     loop {
         if tokio::time::Instant::now() >= next_reconcile {
-            if let Err(error) = crate::index_queue::reconcile_unindexed(store.clone()).await {
-                eprintln!("index reconciliation failed: {error}");
+            // The reconcile scan doubles as the per-namespace lag observation.
+            match crate::index_queue::reconcile_unindexed(store.clone()).await {
+                Ok(report) => metrics.index_lag.record(report.lag),
+                Err(error) => eprintln!("index reconciliation failed: {error}"),
             }
             next_reconcile = tokio::time::Instant::now()
                 + std::time::Duration::from_millis(RECONCILE_INTERVAL_MS);

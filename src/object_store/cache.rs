@@ -14,6 +14,7 @@ use bytes::Bytes;
 
 use super::{GetResult, ObjectMeta, ObjectStore, ObjectVersion, version_of};
 use crate::error::{Error, Result};
+use crate::metrics::{Metrics, set};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CacheStats {
@@ -144,6 +145,7 @@ impl CacheState {
 pub struct CachingObjectStore {
     inner: Arc<dyn ObjectStore>,
     state: tokio::sync::Mutex<CacheState>,
+    metrics: Option<Arc<Metrics>>,
 }
 
 impl CachingObjectStore {
@@ -151,7 +153,36 @@ impl CachingObjectStore {
         Self {
             inner,
             state: tokio::sync::Mutex::new(CacheState::new(capacity_bytes)),
+            metrics: None,
         }
+    }
+
+    /// Mirror cache stats into a shared registry after every cache operation.
+    /// The mutex-guarded state stays the source of truth; the registry holds a
+    /// copy for `/metrics`, so attach at most one cache per registry.
+    pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        set(
+            &metrics.cache.capacity_bytes,
+            self.state.get_mut().capacity_bytes as u64,
+        );
+        self.metrics = Some(metrics);
+        self
+    }
+
+    fn mirror(&self, state: &CacheState) {
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        let stats = state.stats();
+        let cache = &metrics.cache;
+        set(&cache.hits, stats.hits);
+        set(&cache.misses, stats.misses);
+        set(&cache.bypasses, stats.bypasses);
+        set(&cache.evictions, stats.evictions);
+        set(&cache.admission_rejections, stats.admission_rejections);
+        set(&cache.capacity_bytes, stats.capacity_bytes as u64);
+        set(&cache.resident_bytes, stats.resident_bytes as u64);
+        set(&cache.entries, stats.entries as u64);
     }
 
     pub async fn stats(&self) -> CacheStats {
@@ -159,27 +190,40 @@ impl CachingObjectStore {
     }
 
     pub async fn clear(&self) {
-        self.state.lock().await.clear();
+        let mut state = self.state.lock().await;
+        state.clear();
+        self.mirror(&state);
     }
 
     async fn cached(&self, key: &str) -> Option<GetResult> {
-        self.state.lock().await.get(key)
+        let mut state = self.state.lock().await;
+        let result = state.get(key);
+        self.mirror(&state);
+        result
     }
 
     async fn insert(&self, key: &str, result: &GetResult) {
-        self.state.lock().await.insert(key.to_string(), result);
+        let mut state = self.state.lock().await;
+        state.insert(key.to_string(), result);
+        self.mirror(&state);
     }
 
     async fn invalidate(&self, key: &str) {
-        self.state.lock().await.invalidate(key);
+        let mut state = self.state.lock().await;
+        state.invalidate(key);
+        self.mirror(&state);
     }
 
     async fn record_miss(&self) {
-        self.state.lock().await.record_miss();
+        let mut state = self.state.lock().await;
+        state.record_miss();
+        self.mirror(&state);
     }
 
     async fn record_bypass(&self) {
-        self.state.lock().await.record_bypass();
+        let mut state = self.state.lock().await;
+        state.record_bypass();
+        self.mirror(&state);
     }
 }
 
@@ -402,6 +446,28 @@ mod tests {
         assert_eq!(stats.entries, 0);
         assert_eq!(stats.misses, 2);
         assert_eq!(stats.admission_rejections, 2);
+    }
+
+    #[tokio::test]
+    async fn metrics_mirror_tracks_cache_stats() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner: Arc<dyn ObjectStore> = Arc::new(FsObjectStore::new(dir.path()));
+        let key = "namespaces/a/index/g/1/doc.sst";
+        inner.put(key, Bytes::from_static(b"index")).await.unwrap();
+        let metrics = Metrics::shared();
+        let cache = CachingObjectStore::new(inner, 1024).with_metrics(metrics.clone());
+
+        cache.get(key).await.unwrap(); // miss, then insert
+        cache.get(key).await.unwrap(); // hit
+        let _ = cache.get("namespaces/a/manifest/current").await; // bypass
+
+        let snapshot = metrics.snapshot().cache;
+        assert_eq!(snapshot.hits, 1);
+        assert_eq!(snapshot.misses, 1);
+        assert_eq!(snapshot.bypasses, 1);
+        assert_eq!(snapshot.entries, 1);
+        assert_eq!(snapshot.resident_bytes, 5);
+        assert_eq!(snapshot.capacity_bytes, 1024);
     }
 
     #[tokio::test]

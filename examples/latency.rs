@@ -37,7 +37,8 @@ async fn main() {
     let metrics = Metrics::shared();
     let backing: Arc<dyn ObjectStore> = Arc::new(FsObjectStore::new(&dir));
     let metered: Arc<dyn ObjectStore> = Arc::new(MeteredObjectStore::new(backing, metrics.clone()));
-    let store: Arc<dyn ObjectStore> = Arc::new(CachingObjectStore::new(metered, 256 * 1024 * 1024));
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(CachingObjectStore::new(metered, 256 * 1024 * 1024).with_metrics(metrics.clone()));
 
     println!("sana latency harness");
     println!("  dir={dir}");

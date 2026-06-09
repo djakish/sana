@@ -11,17 +11,18 @@ the next unchecked task under "Current milestone" / "Next up".
 
 ## Status snapshot
 
-- **Current stage:** Stage 11 (Observability) — MVP plus write/query/backend
-  **latency histograms split by phase** landed.
-- **Next up:** Index-lag and unindexed-byte gauges per namespace, cache
-  hit-ratio surfacing (fold cache-read timing in there too), and vector
-  probe/candidate/rerank + FTS blocks-skipped counters.
+- **Current stage:** Stage 11 (Observability) — **done.** Metrics registry,
+  object-store traffic + latency, phase latency histograms, cache stats,
+  per-namespace index-lag gauges, and ANN/FTS work counters all scrape from
+  `GET /metrics`.
+- **Next up:** Stage 12 — a real S3 backend behind `ObjectStore`, then
+  automatic background maintenance in `sana serve`.
 - **Done:** Stage 0 (Skeleton), Stage 1 (Durable Documents), Stage 2 (SST/LSM),
   Stage 3 (Attributes & Exact Search), Stage 4 (ANN v0), Stage 5 (Native
   Filtering), Stage 6 (SPFresh local rebuild), Stage 7 (Full-text search),
   Stage 8 (RaBitQ & kernels), Stage 9 (Object-store operations), Stage 10
   (Durability hardening and write semantics).
-- **Tests:** `cargo test` green (209 tests); `cargo clippy --all-targets` clean.
+- **Tests:** `cargo test` green (212 tests); `cargo clippy --all-targets` clean.
 - **Note:** post-Stage-2 and Stage-3–5 code-review fixes applied; remaining
   findings tracked under "Stage 2 — code review follow-ups" and "Stages 3–5 —
   code review follow-ups". Recently fixed limitations: Stage 2 ranged
@@ -68,7 +69,7 @@ the next unchecked task under "Current milestone" / "Next up".
   the write/query paths at their dominant phase seams (write plan/commit/notify,
   query plan/candidates/overlay/rank/materialize), attached per-request via
   `Namespace::with_metrics`.
-- **Last updated:** 2026-06-09.
+- **Last updated:** 2026-06-10.
 
 ---
 
@@ -1011,11 +1012,13 @@ Planned tasks:
       query plan/candidates/overlay/rank/materialize, plus a backend
       object-store request histogram in the metered decorator (cache-read
       timing rides with the cache-stats task below).
-- [ ] Index-lag and unindexed-byte gauges per namespace and index family.
-- [ ] Surface cache hit ratio / temperature (the cache already tracks
-      `CacheStats`; route it into the registry or the endpoint, and time
-      cache-served reads there).
-- [ ] Vector probe/candidate/rerank counts and FTS blocks-skipped counters.
+- [x] Index-lag and unindexed-byte gauges per namespace (`reconcile_unindexed`
+      now reports exact per-namespace lag; the serve worker records it).
+- [x] Surface cache hit ratio / temperature: the cache mirrors its stats into
+      `CacheMetrics` after every operation (hits/misses/bypasses/evictions as
+      counters, capacity/resident/entries as gauges).
+- [x] Vector candidate/estimate/rerank/prune counts (from `RabitqSearchStats`)
+      and FTS blocks-read/skipped counters (from `TextSearchStats`).
 
 Stage 11 decisions / notes:
 
@@ -1054,6 +1057,17 @@ Stage 11 decisions / notes:
   `sana_object_store_request_seconds`, so "object reads" are measured below the
   cache; timing cache-served reads belongs to the cache-stats task. Rejected
   requests record nothing; failures inside a timed span still record it.
+- **D71 — Remaining Stage 11 metrics reuse state that already exists.** The
+  cache *mirrors* its mutex-guarded `CacheStats` into atomic gauges after each
+  operation (the state stays the source of truth, so attach one cache per
+  registry). Per-namespace lag rides the reconciliation scan: `ReconcileReport`
+  now carries exact `unindexed_bytes`/`unindexed_batches` for every scanned
+  namespace, and the serve worker replaces the labeled gauge map wholesale each
+  pass so deleted namespaces drop out. ANN and FTS counters surface the
+  `RabitqSearchStats` and `TextSearchStats` the search paths already computed;
+  the only behavior change is the text MAXSCORE path calling the `_with_stats`
+  variant. `MetricsSnapshot` consequently holds a map and is `Clone`, not
+  `Copy`.
 
 ---
 
