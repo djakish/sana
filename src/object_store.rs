@@ -18,9 +18,11 @@ use crate::error::Result;
 
 pub mod cache;
 pub mod fs;
+pub mod metered;
 
 pub use cache::{CacheStats, CachingObjectStore};
 pub use fs::FsObjectStore;
+pub use metered::MeteredObjectStore;
 
 /// An opaque object version token. For the filesystem backend this is a hash
 /// of the object's contents; for S3/GCS it will wrap an ETag or generation.
@@ -97,8 +99,8 @@ pub fn version_of(bytes: &[u8]) -> ObjectVersion {
 }
 
 pub(crate) fn legacy_version_of(bytes: &[u8]) -> ObjectVersion {
-    use std::hash::{Hash, Hasher};
     use siphasher::sip::SipHasher13;
+    use std::hash::{Hash, Hasher};
 
     let mut h = SipHasher13::new_with_keys(0, 0);
     bytes.hash(&mut h);
@@ -122,8 +124,7 @@ mod tests {
         assert_eq!(
             version_of(b"hello world"),
             ObjectVersion(
-                "sha256-b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
-                    .into()
+                "sha256-b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9".into()
             )
         );
         assert_eq!(

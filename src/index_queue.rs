@@ -16,8 +16,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{Error, Result};
 use crate::indexer;
-use crate::namespace::Namespace;
-use crate::namespace::now_ms;
+use crate::namespace::{Namespace, now_ms, validate_namespace_name};
 use crate::object_store::{GetResult, ObjectStore};
 use crate::wal::WalCursor;
 
@@ -133,9 +132,9 @@ impl QueueFile {
                     job.id
                 )));
             }
-            if job.namespace.is_empty() {
+            if validate_namespace_name(&job.namespace).is_err() {
                 return Err(Error::Corrupt(format!(
-                    "indexing queue job {} has an empty namespace",
+                    "indexing queue job {} has an invalid namespace",
                     job.id
                 )));
             }
@@ -220,11 +219,7 @@ impl QueueFile {
         target_cursor: WalCursor,
         timestamp_ms: u64,
     ) -> Result<Mutation<EnqueueOutcome>> {
-        if namespace.is_empty() {
-            return Err(Error::InvalidWrite(
-                "indexing queue namespace cannot be empty".into(),
-            ));
-        }
+        validate_namespace_name(namespace)?;
 
         if let Some(job) = self
             .jobs
@@ -385,6 +380,7 @@ impl IndexQueue {
         target_cursor: WalCursor,
         timestamp_ms: u64,
     ) -> Result<EnqueueOutcome> {
+        validate_namespace_name(namespace)?;
         self.mutate(|queue| queue.enqueue(namespace, target_cursor, timestamp_ms))
             .await
     }
@@ -597,6 +593,7 @@ impl IndexQueueBroker {
         namespace: &str,
         target_cursor: WalCursor,
     ) -> Result<EnqueueOutcome> {
+        validate_namespace_name(namespace)?;
         match self
             .request(BrokerOperation::Enqueue {
                 namespace: namespace.to_string(),
@@ -1065,6 +1062,21 @@ mod tests {
         assert_eq!(jobs.len(), 2);
         assert!(jobs[0].claim.is_some());
         assert!(jobs[1].claim.is_none());
+    }
+
+    #[tokio::test]
+    async fn enqueue_rejects_invalid_namespace_before_creating_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let object_store: Arc<dyn ObjectStore> = Arc::new(FsObjectStore::new(dir.path()));
+        let error = IndexQueue::new(object_store.clone())
+            .enqueue("../invalid", WalCursor::new(0, 1))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidWrite(_)));
+        assert!(matches!(
+            object_store.get(INDEX_QUEUE_KEY).await,
+            Err(Error::NotFound(_))
+        ));
     }
 
     #[tokio::test]

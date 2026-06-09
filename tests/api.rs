@@ -7,11 +7,13 @@ use axum::http::{Method, Request, StatusCode};
 use axum::response::Response;
 use sana::api::{
     QueryRequest, QueryResponse, RecallApiRequest, WriteRequest, WriteResponse, router,
+    router_with_metrics,
 };
 use sana::indexer;
 use sana::metadata::{IndexStatus, NamespaceMetadata};
+use sana::metrics::Metrics;
 use sana::namespace::Namespace;
-use sana::object_store::{FsObjectStore, ObjectStore};
+use sana::object_store::{FsObjectStore, MeteredObjectStore, ObjectStore};
 use sana::query::{FilterExpr, MultiQuery, Query, QueryOptions, RecallRequest};
 use sana::value::{Document, Id, Value, VectorValue};
 use sana::wal::WalOp;
@@ -336,4 +338,119 @@ async fn http_errors_use_stable_status_and_json_envelopes() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let error: serde_json::Value = json_body(response).await;
     assert_eq!(error["error"]["code"], "invalid_request");
+}
+
+#[tokio::test]
+async fn metrics_endpoint_reports_object_store_traffic() {
+    let dir = tempfile::tempdir().unwrap();
+    let metrics = Metrics::shared();
+    let metered: Arc<dyn ObjectStore> =
+        Arc::new(MeteredObjectStore::new(store(&dir), metrics.clone()));
+    let app = router_with_metrics(metered, metrics.clone());
+
+    let before = metrics.snapshot().object_store;
+    assert_eq!(before.puts_if_absent, 0);
+
+    let write = WriteRequest::Append {
+        operations: vec![WalOp::Upsert {
+            id: Id::U64(1),
+            document: document(1),
+        }],
+        idempotency_key: None,
+        options: WriteOptions::default(),
+    };
+    let response = request(
+        &app,
+        Method::POST,
+        "/v2/namespaces/metered",
+        Some(serde_json::to_vec(&write).unwrap()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = request(&app, Method::GET, "/metrics", None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/plain; version=0.0.4")
+    );
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+
+    assert!(text.contains("# TYPE sana_object_store_puts_if_absent_total counter"));
+    let after = metrics.snapshot().object_store;
+    assert!(
+        after.puts_if_absent > 0,
+        "the write committed via put-if-absent"
+    );
+    assert!(text.contains(&format!(
+        "\nsana_object_store_puts_if_absent_total {}\n",
+        after.puts_if_absent
+    )));
+}
+
+#[tokio::test]
+async fn metrics_endpoint_reports_write_and_query_latency() {
+    let dir = tempfile::tempdir().unwrap();
+    let metrics = Metrics::shared();
+    let metered: Arc<dyn ObjectStore> =
+        Arc::new(MeteredObjectStore::new(store(&dir), metrics.clone()));
+    let app = router_with_metrics(metered, metrics.clone());
+
+    let write = WriteRequest::Append {
+        operations: vec![WalOp::Upsert {
+            id: Id::U64(1),
+            document: document(1),
+        }],
+        idempotency_key: None,
+        options: WriteOptions::default(),
+    };
+    let response = request(
+        &app,
+        Method::POST,
+        "/v2/namespaces/timed",
+        Some(serde_json::to_vec(&write).unwrap()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let query = QueryRequest::Single {
+        query: Box::new(Query::all()),
+        options: QueryOptions::default(),
+    };
+    let response = request(
+        &app,
+        Method::POST,
+        "/v2/namespaces/timed/query",
+        Some(serde_json::to_vec(&query).unwrap()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // One append: commit + notify phases and one total; no plan phase (that is
+    // filter-mutation candidate discovery). One unfiltered query: plan, rank,
+    // and full-scan materialize; no candidate or overlay seam was crossed.
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.latency.write_total.count(), 1);
+    assert_eq!(snapshot.latency.write_plan.count(), 0);
+    assert_eq!(snapshot.latency.write_commit.count(), 1);
+    assert_eq!(snapshot.latency.write_notify.count(), 1);
+    assert_eq!(snapshot.latency.query_total.count(), 1);
+    assert_eq!(snapshot.latency.query_plan.count(), 1);
+    assert_eq!(snapshot.latency.query_rank.count(), 1);
+    assert_eq!(snapshot.latency.query_materialize.count(), 1);
+    assert!(snapshot.object_store.request_latency.count() > 0);
+
+    let response = request(&app, Method::GET, "/metrics", None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(text.contains("# TYPE sana_write_seconds histogram"));
+    assert!(text.contains("\nsana_write_seconds_count 1\n"));
+    assert!(text.contains("sana_write_phase_seconds_count{phase=\"commit\"} 1\n"));
+    assert!(text.contains("sana_query_phase_seconds_count{phase=\"plan\"} 1\n"));
+    assert!(text.contains("sana_object_store_request_seconds_bucket{le=\"+Inf\"}"));
 }

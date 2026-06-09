@@ -9,6 +9,7 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
@@ -269,8 +270,11 @@ pub async fn execute_with_options(
     query: Query,
     options: QueryOptions,
 ) -> Result<QueryResult> {
+    let start = Instant::now();
     let (manifest, commit) = load_strong_snapshot(ns, options).await?;
-    execute_with_snapshot(ns, &manifest, commit, query).await
+    let result = execute_with_snapshot(ns, &manifest, commit, query).await?;
+    ns.metrics().latency.query_total.observe(start.elapsed());
+    Ok(result)
 }
 
 pub async fn execute_multi(ns: &Namespace, request: MultiQuery) -> Result<MultiQueryResult> {
@@ -292,11 +296,14 @@ pub async fn execute_multi_with_options(
             "multi-query supports at most {MAX_MULTI_QUERIES} queries"
         )));
     }
+    let start = Instant::now();
     let (manifest, commit) = load_strong_snapshot(ns, options).await?;
     let mut results = Vec::with_capacity(request.queries.len());
     for query in request.queries {
         results.push(execute_with_snapshot(ns, &manifest, commit, query).await?);
     }
+    // Phases record per subquery; the total is one observation per request.
+    ns.metrics().latency.query_total.observe(start.elapsed());
     Ok(MultiQueryResult { results })
 }
 
@@ -304,13 +311,19 @@ async fn load_strong_snapshot(
     ns: &Namespace,
     options: QueryOptions,
 ) -> Result<(NamespaceManifest, WalCursor)> {
-    let manifest = ns.load_manifest().await?;
-    let (commit, committed_wal_bytes) = ns.wal_commit_stats().await?;
-    enforce_limit(
-        unindexed_wal_bytes(&manifest, committed_wal_bytes)?,
-        options.max_unindexed_wal_bytes,
-    )?;
-    Ok((manifest, commit))
+    ns.metrics()
+        .latency
+        .query_plan
+        .time(async {
+            let manifest = ns.load_manifest().await?;
+            let (commit, committed_wal_bytes) = ns.wal_commit_stats().await?;
+            enforce_limit(
+                unindexed_wal_bytes(&manifest, committed_wal_bytes)?,
+                options.max_unindexed_wal_bytes,
+            )?;
+            Ok((manifest, commit))
+        })
+        .await
 }
 
 async fn execute_with_snapshot(
@@ -373,6 +386,7 @@ async fn execute_with_snapshot(
 
     let aggregates = compute_aggregates(&query.aggregates, &candidates)?;
 
+    let rank_start = Instant::now();
     if let Some(vector_query) = &query.exact_vector {
         finish_exact_vector(&mut candidates, manifest, vector_query)?;
     } else if let Some(vector_query) = &query.approx_vector {
@@ -389,6 +403,10 @@ async fn execute_with_snapshot(
     } else {
         candidates.sort_by(|a, b| a.id.cmp(&b.id));
     }
+    ns.metrics()
+        .latency
+        .query_rank
+        .observe(rank_start.elapsed());
 
     if let Some(limit) = query.limit {
         candidates.truncate(limit);
@@ -449,10 +467,15 @@ async fn text_hits_and_docs(
     text_query: &TextQuery,
     top_k: Option<usize>,
 ) -> Result<(Vec<text::TextHit>, BTreeMap<Id, Document>)> {
+    let latency = &ns.metrics().latency;
     if manifest.indexed_cursor == Some(commit)
         && let Some(meta) = manifest.text_ssts.first()
     {
-        let reader = ns.load_sst(&meta.key).await?;
+        let reader = latency
+            .query_candidates
+            .time(ns.load_sst(&meta.key))
+            .await?;
+        let rank_start = Instant::now();
         let hits = match top_k {
             Some(k) => text::search_sst_top_k(
                 &reader,
@@ -468,22 +491,31 @@ async fn text_hits_and_docs(
                 text_query.params,
             )?,
         };
+        latency.query_rank.observe(rank_start.elapsed());
         let ids: BTreeSet<Id> = hits.iter().map(|hit| hit.id.clone()).collect();
         let docs = if ids.is_empty() {
             BTreeMap::new()
         } else {
-            ns.resolve_ids(manifest, &[], &ids).await?
+            latency
+                .query_materialize
+                .time(ns.resolve_ids(manifest, &[], &ids))
+                .await?
         };
         return Ok((hits, docs));
     }
 
-    let docs = ns.replay_at(manifest, commit).await?;
+    let docs = latency
+        .query_materialize
+        .time(ns.replay_at(manifest, commit))
+        .await?;
+    let rank_start = Instant::now();
     let hits = text::score_documents(
         &docs,
         &text_query.column,
         &text_query.query,
         text_query.params,
     )?;
+    latency.query_rank.observe(rank_start.elapsed());
     Ok((hits, docs))
 }
 
@@ -672,12 +704,19 @@ async fn execute_ann_vector(
     // Search the base index plus every append delta. New segments have a
     // separately framed RaBitQ companion, fetched only for L2; old manifests
     // and other metrics simply take the exact segment path.
+    let latency = &ns.metrics().latency;
     let load_rabitq = metric == DistanceMetric::L2;
+    let candidates_start = Instant::now();
     let segments = fetch_vector_segments(ns, meta, load_rabitq).await?;
     let version_map = load_vector_version_map(ns, meta).await?;
-    let overlay = ns.read_overlay_ops(manifest.indexed_cursor, commit).await?;
+    latency.query_candidates.observe(candidates_start.elapsed());
+    let overlay = latency
+        .query_overlay
+        .time(ns.read_overlay_ops(manifest.indexed_cursor, commit))
+        .await?;
     let touched: BTreeSet<Id> = overlay.iter().map(|op| op_id(op).clone()).collect();
 
+    let rank_start = Instant::now();
     let mut ann_hits = Vec::new();
     for segment in &segments {
         let mask = match plan_native_filter(&segment.index, filter)? {
@@ -725,6 +764,7 @@ async fn execute_ann_vector(
             )?);
         }
     }
+    latency.query_rank.observe(rank_start.elapsed());
 
     // The documents we need: live ANN hits (not superseded by the overlay) plus
     // every overlay-touched id, resolved in one SST pass rather than per id.
@@ -739,7 +779,10 @@ async fn execute_ann_vector(
         .collect();
     let mut needed: BTreeSet<Id> = live_hits.iter().map(|hit| hit.id.clone()).collect();
     needed.extend(touched.iter().cloned());
-    let resolved = ns.resolve_ids(manifest, &overlay, &needed).await?;
+    let resolved = latency
+        .query_materialize
+        .time(ns.resolve_ids(manifest, &overlay, &needed))
+        .await?;
 
     let mut rows = Vec::new();
     for hit in live_hits {
@@ -928,10 +971,17 @@ async fn materialize_candidates(
     commit: WalCursor,
     filter: Option<&FilterExpr>,
 ) -> Result<Vec<QueryRow>> {
+    let latency = &ns.metrics().latency;
     if let Some(filter) = filter
-        && let Some(mut ids) = indexed_filter_candidate_ids(ns, manifest, filter).await?
+        && let Some(mut ids) = latency
+            .query_candidates
+            .time(indexed_filter_candidate_ids(ns, manifest, filter))
+            .await?
     {
-        let overlay = ns.read_overlay_ops(manifest.indexed_cursor, commit).await?;
+        let overlay = latency
+            .query_overlay
+            .time(ns.read_overlay_ops(manifest.indexed_cursor, commit))
+            .await?;
         for op in &overlay {
             ids.insert(op_id(op).clone());
         }
@@ -939,7 +989,10 @@ async fn materialize_candidates(
         // Resolve every candidate in one pass (each doc SST read once) instead of
         // one `ns.lookup` per id, which would re-read the manifest, cursor, SSTs,
         // and overlay for each candidate.
-        let resolved = ns.resolve_ids(manifest, &overlay, &ids).await?;
+        let resolved = latency
+            .query_materialize
+            .time(ns.resolve_ids(manifest, &overlay, &ids))
+            .await?;
         let mut rows = Vec::new();
         for id in ids {
             let Some(document) = resolved.get(&id) else {
@@ -956,7 +1009,10 @@ async fn materialize_candidates(
         return Ok(rows);
     }
 
-    let docs = ns.replay_at(manifest, commit).await?;
+    let docs = latency
+        .query_materialize
+        .time(ns.replay_at(manifest, commit))
+        .await?;
     let mut rows = Vec::new();
     for (id, document) in docs {
         if matches_filter(filter, &document)? {

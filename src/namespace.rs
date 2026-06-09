@@ -20,7 +20,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -30,6 +30,7 @@ use crate::doc::{DocRecord, decode_id, encode_id};
 use crate::error::{Error, Result};
 use crate::index_queue::{EnqueueOutcome, IndexQueue};
 use crate::manifest::{ManifestPointer, NamespaceManifest};
+use crate::metrics::Metrics;
 use crate::object_store::{
     GetResult, ObjectStore, ObjectVersion, legacy_version_of, version_matches, version_of,
 };
@@ -212,6 +213,11 @@ impl WalCommitState {
         }
     }
 
+    fn committed_byte_count(&self) -> Result<u64> {
+        self.committed_wal_bytes
+            .ok_or_else(|| Error::Corrupt("WAL commit byte counter was not migrated".into()))
+    }
+
     fn validate(&self, namespace: &str) -> Result<()> {
         if self.format_version != WAL_COMMIT_FORMAT_VERSION {
             return Err(Error::Corrupt(format!(
@@ -392,6 +398,7 @@ pub struct Namespace {
     store: Arc<dyn ObjectStore>,
     name: String,
     append_lock: tokio::sync::Mutex<()>,
+    metrics: Arc<Metrics>,
 }
 
 /// Pointer object version (to CAS against), the current pointer, and the body.
@@ -484,7 +491,20 @@ impl Namespace {
             store,
             name: name.to_string(),
             append_lock: tokio::sync::Mutex::new(()),
+            metrics: Metrics::shared(),
         }
+    }
+
+    /// Record write/query latencies into a shared registry (the one `/metrics`
+    /// renders). A handle without an attached registry records into a private
+    /// one that nobody scrapes, so unattached use stays free of plumbing.
+    pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    pub(crate) fn metrics(&self) -> &Metrics {
+        &self.metrics
     }
 
     pub fn name(&self) -> &str {
@@ -731,19 +751,20 @@ impl Namespace {
                 self.reconstruct_committed_wal_bytes(state.committed)
                     .await?,
             );
+            let encoded = Bytes::from(encode_commit_state(&state)?);
             match self
                 .store
                 .compare_and_set(
                     &wal_commit_key(&self.name),
                     got.version.clone(),
-                    Bytes::from(encode_commit_state(&state)?),
+                    encoded.clone(),
                 )
                 .await
             {
                 Ok(version) => {
                     return Ok((
                         GetResult {
-                            bytes: Bytes::from(encode_commit_state(&state)?),
+                            bytes: encoded,
                             version,
                         },
                         state,
@@ -830,10 +851,28 @@ impl Namespace {
 
     pub(crate) async fn wal_commit_stats(&self) -> Result<(WalCursor, u64)> {
         let (_, state) = self.load_commit_state().await?;
-        let committed_wal_bytes = state
-            .committed_wal_bytes
-            .ok_or_else(|| Error::Corrupt("WAL commit byte counter was not migrated".into()))?;
-        Ok((state.committed, committed_wal_bytes))
+        Ok((state.committed, state.committed_byte_count()?))
+    }
+
+    /// Outstanding unindexed WAL bytes for `state`, or `None` when the commit
+    /// state has since changed under us (the caller should reload and retry).
+    async fn current_unindexed_bytes(
+        &self,
+        manifest: &NamespaceManifest,
+        state: &WalCommitState,
+        expected_version: &ObjectVersion,
+    ) -> Result<Option<u64>> {
+        match unindexed_wal_bytes(manifest, state.committed_byte_count()?) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) => {
+                let latest = self.store.get(&wal_commit_key(&self.name)).await?;
+                if latest.version != *expected_version {
+                    Ok(None)
+                } else {
+                    Err(error)
+                }
+            }
+        }
     }
 
     /// Exact bytes in the committed WAL overlay not yet folded into the
@@ -883,6 +922,7 @@ impl Namespace {
         idempotency_key: Option<String>,
         options: WriteOptions,
     ) -> Result<WalCursor> {
+        let start = Instant::now();
         if operations.is_empty() {
             return Err(Error::InvalidWrite("write batch cannot be empty".into()));
         }
@@ -897,24 +937,28 @@ impl Namespace {
                 Some(options.max_unindexed_wal_bytes)
             };
 
+        let latency = &self.metrics.latency;
         let append_guard = self.append_lock.lock().await;
-        let committed = self
-            .append_locked(
+        let committed = latency
+            .write_commit
+            .time(self.append_locked(
                 operations,
                 idempotency_key,
                 fingerprint,
                 max_unindexed_wal_bytes,
-            )
+            ))
             .await?;
         drop(append_guard);
 
         // Indexing jobs are advisory. A queue outage must not turn a durable
         // WAL commit into a reported write failure; reconciliation can enqueue
         // this cursor again later.
-        let _ = IndexQueue::new(self.store.clone())
-            .enqueue(&self.name, committed)
+        let _ = latency
+            .write_notify
+            .time(IndexQueue::new(self.store.clone()).enqueue(&self.name, committed))
             .await;
 
+        latency.write_total.observe(start.elapsed());
         Ok(committed)
     }
 
@@ -936,6 +980,7 @@ impl Namespace {
         idempotency_key: Option<String>,
         options: WriteOptions,
     ) -> Result<ConditionalWriteResult> {
+        let start = Instant::now();
         if writes.is_empty() {
             return Err(Error::InvalidWrite(
                 "conditional write batch cannot be empty".into(),
@@ -947,22 +992,26 @@ impl Namespace {
         validate_unique_write_ids(&writes)?;
         let fingerprint = request_fingerprint(&writes)?;
 
+        let latency = &self.metrics.latency;
         let append_guard = self.append_lock.lock().await;
-        let result = self
-            .conditional_write_locked(
+        let result = latency
+            .write_commit
+            .time(self.conditional_write_locked(
                 writes,
                 idempotency_key,
                 fingerprint,
                 IdempotencyKind::Conditional,
                 false,
                 options.max_unindexed_wal_bytes,
-            )
+            ))
             .await?;
         drop(append_guard);
 
-        let _ = IndexQueue::new(self.store.clone())
-            .enqueue(&self.name, result.cursor)
+        let _ = latency
+            .write_notify
+            .time(IndexQueue::new(self.store.clone()).enqueue(&self.name, result.cursor))
             .await;
+        latency.write_total.observe(start.elapsed());
         Ok(result)
     }
 
@@ -983,6 +1032,7 @@ impl Namespace {
         idempotency_key: Option<String>,
         options: WriteOptions,
     ) -> Result<ConditionalWriteResult> {
+        let start = Instant::now();
         if request.attributes.is_empty() && request.vectors.is_empty() {
             return Err(Error::InvalidWrite(
                 "patch-by-filter requires at least one patched field".into(),
@@ -996,6 +1046,7 @@ impl Namespace {
         }])
         .await?;
         let fingerprint = request_fingerprint(&request)?;
+        let latency = &self.metrics.latency;
         {
             let append_guard = self.append_lock.lock().await;
             if let Some(result) = self
@@ -1007,11 +1058,13 @@ impl Namespace {
                 .await?
             {
                 drop(append_guard);
+                latency.write_total.observe(start.elapsed());
                 return Ok(result);
             }
         }
-        let candidates = self
-            .matching_filter_ids(&request.filter, options.max_unindexed_wal_bytes)
+        let candidates = latency
+            .write_plan
+            .time(self.matching_filter_ids(&request.filter, options.max_unindexed_wal_bytes))
             .await?;
         let append_guard = self.append_lock.lock().await;
         if let Some(result) = self
@@ -1023,6 +1076,7 @@ impl Namespace {
             .await?
         {
             drop(append_guard);
+            latency.write_total.observe(start.elapsed());
             return Ok(result);
         }
         let (candidates, rows_remaining) = limit_filter_candidates(
@@ -1042,20 +1096,23 @@ impl Namespace {
                 condition: Some(request.filter.clone()),
             })
             .collect();
-        let result = self
-            .conditional_write_locked(
+        let result = latency
+            .write_commit
+            .time(self.conditional_write_locked(
                 writes,
                 idempotency_key,
                 fingerprint,
                 IdempotencyKind::PatchByFilter,
                 rows_remaining,
                 options.max_unindexed_wal_bytes,
-            )
+            ))
             .await?;
         drop(append_guard);
-        let _ = IndexQueue::new(self.store.clone())
-            .enqueue(&self.name, result.cursor)
+        let _ = latency
+            .write_notify
+            .time(IndexQueue::new(self.store.clone()).enqueue(&self.name, result.cursor))
             .await;
+        latency.write_total.observe(start.elapsed());
         Ok(result)
     }
 
@@ -1076,8 +1133,10 @@ impl Namespace {
         idempotency_key: Option<String>,
         options: WriteOptions,
     ) -> Result<ConditionalWriteResult> {
+        let start = Instant::now();
         self.validate_filter_mutation_input(request.max_rows, idempotency_key.as_deref())?;
         let fingerprint = request_fingerprint(&request)?;
+        let latency = &self.metrics.latency;
         {
             let append_guard = self.append_lock.lock().await;
             if let Some(result) = self
@@ -1089,11 +1148,13 @@ impl Namespace {
                 .await?
             {
                 drop(append_guard);
+                latency.write_total.observe(start.elapsed());
                 return Ok(result);
             }
         }
-        let candidates = self
-            .matching_filter_ids(&request.filter, options.max_unindexed_wal_bytes)
+        let candidates = latency
+            .write_plan
+            .time(self.matching_filter_ids(&request.filter, options.max_unindexed_wal_bytes))
             .await?;
         let append_guard = self.append_lock.lock().await;
         if let Some(result) = self
@@ -1105,6 +1166,7 @@ impl Namespace {
             .await?
         {
             drop(append_guard);
+            latency.write_total.observe(start.elapsed());
             return Ok(result);
         }
         let (candidates, rows_remaining) = limit_filter_candidates(
@@ -1120,20 +1182,23 @@ impl Namespace {
                 condition: Some(request.filter.clone()),
             })
             .collect();
-        let result = self
-            .conditional_write_locked(
+        let result = latency
+            .write_commit
+            .time(self.conditional_write_locked(
                 writes,
                 idempotency_key,
                 fingerprint,
                 IdempotencyKind::DeleteByFilter,
                 rows_remaining,
                 options.max_unindexed_wal_bytes,
-            )
+            ))
             .await?;
         drop(append_guard);
-        let _ = IndexQueue::new(self.store.clone())
-            .enqueue(&self.name, result.cursor)
+        let _ = latency
+            .write_notify
+            .time(IndexQueue::new(self.store.clone()).enqueue(&self.name, result.cursor))
             .await;
+        latency.write_total.observe(start.elapsed());
         Ok(result)
     }
 
@@ -1288,18 +1353,11 @@ impl Namespace {
             self.validate_ops_for_current_schema(&all_operations)
                 .await?;
             let manifest = self.load_manifest().await?;
-            let committed_wal_bytes = state
-                .committed_wal_bytes
-                .ok_or_else(|| Error::Corrupt("WAL commit byte counter was not migrated".into()))?;
-            let current_unindexed = match unindexed_wal_bytes(&manifest, committed_wal_bytes) {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    let latest = self.store.get(&wal_commit_key(&self.name)).await?;
-                    if latest.version != current.version {
-                        continue;
-                    }
-                    return Err(error);
-                }
+            let Some(current_unindexed) = self
+                .current_unindexed_bytes(&manifest, &state, &current.version)
+                .await?
+            else {
+                continue;
             };
             enforce_limit(current_unindexed, max_unindexed_wal_bytes)?;
             let documents = self.replay_at(&manifest, state.committed).await?;
@@ -1368,18 +1426,11 @@ impl Namespace {
             .map_err(|_| Error::InvalidWrite("encoded WAL batch is too large".into()))?;
         if let Some(limit_bytes) = prepared.max_unindexed_wal_bytes {
             let manifest = self.load_manifest().await?;
-            let committed_wal_bytes = state
-                .committed_wal_bytes
-                .ok_or_else(|| Error::Corrupt("WAL commit byte counter was not migrated".into()))?;
-            let current_unindexed = match unindexed_wal_bytes(&manifest, committed_wal_bytes) {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    let latest = self.store.get(&wal_commit_key(&self.name)).await?;
-                    if latest.version != current.version {
-                        return Ok(None);
-                    }
-                    return Err(error);
-                }
+            let Some(current_unindexed) = self
+                .current_unindexed_bytes(&manifest, &state, &current.version)
+                .await?
+            else {
+                return Ok(None);
             };
             let projected_unindexed =
                 current_unindexed
@@ -1455,11 +1506,7 @@ impl Namespace {
             }
 
             let staged = self.store.get(&pending.staging_key).await?;
-            if !version_matches(
-                &pending.staging_version,
-                &staged.version,
-                &staged.bytes,
-            ) {
+            if !version_matches(&pending.staging_version, &staged.version, &staged.bytes) {
                 return Err(Error::Corrupt(format!(
                     "pending WAL staging version mismatch at {}",
                     pending.staging_key
@@ -1523,10 +1570,7 @@ impl Namespace {
             committed.committed = pending.cursor;
             committed.committed_wal_bytes = Some(
                 committed
-                    .committed_wal_bytes
-                    .ok_or_else(|| {
-                        Error::Corrupt("WAL commit byte counter was not migrated".into())
-                    })?
+                    .committed_byte_count()?
                     .checked_add(staged_size)
                     .ok_or_else(|| Error::Corrupt("committed WAL byte counter overflow".into()))?,
             );

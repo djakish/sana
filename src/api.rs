@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cache_warm::CacheWarmOptions;
 use crate::error::Error;
+use crate::metrics::Metrics;
 use crate::namespace::Namespace;
 use crate::object_store::ObjectStore;
 use crate::query::{
@@ -34,6 +35,7 @@ const QUERY_SLOT_WAIT: Duration = Duration::from_millis(800);
 struct ApiState {
     store: Arc<dyn ObjectStore>,
     query_limiter: Arc<QueryLimiter>,
+    metrics: Arc<Metrics>,
 }
 
 struct QueryLimiter {
@@ -64,8 +66,7 @@ impl QueryLimiter {
             match namespaces.get(namespace).and_then(Weak::upgrade) {
                 Some(semaphore) => semaphore,
                 None => {
-                    let semaphore =
-                        Arc::new(tokio::sync::Semaphore::new(self.max_slots));
+                    let semaphore = Arc::new(tokio::sync::Semaphore::new(self.max_slots));
                     namespaces.insert(namespace.to_string(), Arc::downgrade(&semaphore));
                     semaphore
                 }
@@ -244,8 +245,13 @@ impl IntoResponse for ApiError {
 }
 
 pub fn router(store: Arc<dyn ObjectStore>) -> Router {
+    router_with_metrics(store, Metrics::shared())
+}
+
+pub fn router_with_metrics(store: Arc<dyn ObjectStore>, metrics: Arc<Metrics>) -> Router {
     Router::new()
         .route("/healthz", get(health))
+        .route("/metrics", get(metrics_endpoint))
         .route("/v2/namespaces/{namespace}", post(write))
         .route("/v2/namespaces/{namespace}/query", post(query))
         .route("/v1/namespaces/{namespace}/metadata", get(metadata))
@@ -261,20 +267,22 @@ pub fn router(store: Arc<dyn ObjectStore>) -> Router {
                 MAX_CONCURRENT_QUERY_SLOTS,
                 QUERY_SLOT_WAIT,
             )),
+            metrics,
         })
 }
 
 pub async fn serve(store: Arc<dyn ObjectStore>, address: SocketAddr) -> std::io::Result<()> {
-    serve_with_shutdown(store, address, std::future::pending()).await
+    serve_with_shutdown(store, address, Metrics::shared(), std::future::pending()).await
 }
 
 pub async fn serve_with_shutdown(
     store: Arc<dyn ObjectStore>,
     address: SocketAddr,
+    metrics: Arc<Metrics>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(address).await?;
-    let server = axum::serve(listener, router(store.clone()))
+    let server = axum::serve(listener, router_with_metrics(store.clone(), metrics))
         .with_graceful_shutdown(shutdown)
         .into_future();
     let worker = run_index_worker(store);
@@ -311,13 +319,8 @@ async fn run_index_worker(store: Arc<dyn ObjectStore>) {
                 + std::time::Duration::from_millis(RECONCILE_INTERVAL_MS);
         }
 
-        match crate::index_queue::run_worker_once(
-            store.clone(),
-            &worker_id,
-            LEASE_MS,
-            HEARTBEAT_MS,
-        )
-        .await
+        match crate::index_queue::run_worker_once(store.clone(), &worker_id, LEASE_MS, HEARTBEAT_MS)
+            .await
         {
             Ok(Some(_)) => {}
             Ok(None) => {
@@ -335,13 +338,23 @@ async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "status": "ok" }))
 }
 
+async fn metrics_endpoint(State(state): State<ApiState>) -> Response {
+    (
+        [("content-type", "text/plain; version=0.0.4")],
+        state.metrics.snapshot().to_prometheus(),
+    )
+        .into_response()
+}
+
 async fn write(
     State(state): State<ApiState>,
     Path(namespace): Path<String>,
     request: Result<Json<WriteRequest>, JsonRejection>,
 ) -> Result<Json<WriteResponse>, ApiError> {
     let Json(request) = request.map_err(json_rejection)?;
-    let namespace = Namespace::create_or_open(state.store, &namespace).await?;
+    let namespace = Namespace::create_or_open(state.store, &namespace)
+        .await?
+        .with_metrics(state.metrics.clone());
     let response = match request {
         WriteRequest::Append {
             operations,
@@ -402,7 +415,9 @@ async fn query(
     request: Result<Json<QueryRequest>, JsonRejection>,
 ) -> Result<Json<QueryResponse>, ApiError> {
     let Json(request) = request.map_err(json_rejection)?;
-    let namespace_handle = Namespace::open(state.store, &namespace).await?;
+    let namespace_handle = Namespace::open(state.store, &namespace)
+        .await?
+        .with_metrics(state.metrics.clone());
     let _permit = state
         .query_limiter
         .acquire(&namespace, query_request_slots(&request))
@@ -411,13 +426,11 @@ async fn query(
         QueryRequest::Single { query, options } => {
             QueryResponse::Single(namespace_handle.query_with_options(*query, options).await?)
         }
-        QueryRequest::Multi { query, options } => {
-            QueryResponse::Multi(
-                namespace_handle
-                    .multi_query_with_options(query, options)
-                    .await?,
-            )
-        }
+        QueryRequest::Multi { query, options } => QueryResponse::Multi(
+            namespace_handle
+                .multi_query_with_options(query, options)
+                .await?,
+        ),
     };
     Ok(Json(response))
 }
@@ -436,7 +449,9 @@ async fn recall(
     request: Result<Json<RecallApiRequest>, JsonRejection>,
 ) -> Result<Json<RecallResult>, ApiError> {
     let Json(request) = request.map_err(json_rejection)?;
-    let namespace_handle = Namespace::open(state.store, &namespace).await?;
+    let namespace_handle = Namespace::open(state.store, &namespace)
+        .await?
+        .with_metrics(state.metrics.clone());
     let _permit = state.query_limiter.acquire(&namespace, 4).await?;
     Ok(Json(
         namespace_handle

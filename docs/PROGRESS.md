@@ -11,16 +11,17 @@ the next unchecked task under "Current milestone" / "Next up".
 
 ## Status snapshot
 
-- **Current stage:** Stage 10 (Durability hardening and write semantics) —
-  **complete**.
-- **Next up:** Run a final production-readiness review across service lifecycle,
-  indexing worker operation, and remaining documented storage limitations.
+- **Current stage:** Stage 11 (Observability) — MVP plus write/query/backend
+  **latency histograms split by phase** landed.
+- **Next up:** Index-lag and unindexed-byte gauges per namespace, cache
+  hit-ratio surfacing (fold cache-read timing in there too), and vector
+  probe/candidate/rerank + FTS blocks-skipped counters.
 - **Done:** Stage 0 (Skeleton), Stage 1 (Durable Documents), Stage 2 (SST/LSM),
   Stage 3 (Attributes & Exact Search), Stage 4 (ANN v0), Stage 5 (Native
   Filtering), Stage 6 (SPFresh local rebuild), Stage 7 (Full-text search),
   Stage 8 (RaBitQ & kernels), Stage 9 (Object-store operations), Stage 10
   (Durability hardening and write semantics).
-- **Tests:** `cargo test` green (187 tests); `cargo clippy --all-targets` clean.
+- **Tests:** `cargo test` green (209 tests); `cargo clippy --all-targets` clean.
 - **Note:** post-Stage-2 and Stage-3–5 code-review fixes applied; remaining
   findings tracked under "Stage 2 — code review follow-ups" and "Stages 3–5 —
   code review follow-ups". Recently fixed limitations: Stage 2 ranged
@@ -59,8 +60,15 @@ the next unchecked task under "Current milestone" / "Next up".
   and cache-warm routes over the same library methods, with structured
   400/404/409/429/500 errors and a cache-backed `sana serve` command. The
   service runs a durable indexing worker and periodic reconciliation loop, so
-  ordinary deployments index accepted writes without a second process.
-- **Last updated:** 2026-06-06.
+  ordinary deployments index accepted writes without a second process. A
+  dependency-free in-process metrics registry now counts true object-store
+  traffic through a `MeteredObjectStore` decorator wrapped *below* the cache, and
+  `sana serve` exposes it as Prometheus text at `GET /metrics`. Dependency-free
+  fixed-bucket latency histograms now time backend object-store round trips and
+  the write/query paths at their dominant phase seams (write plan/commit/notify,
+  query plan/candidates/overlay/rank/materialize), attached per-request via
+  `Namespace::with_metrics`.
+- **Last updated:** 2026-06-09.
 
 ---
 
@@ -92,6 +100,9 @@ the next unchecked task under "Current milestone" / "Next up".
 - [x] **Stage 10 — Durability hardening and write semantics.** Corruption-safe
       SST metadata, idempotent/conditional writes, bounded write backpressure,
       and a service-facing HTTP/metadata surface.
+- [ ] **Stage 11 — Observability.** In-process metrics registry, object-store
+      traffic metering, and a Prometheus `/metrics` endpoint (MVP done; latency
+      histograms, index-lag gauges, and cache stats still to come).
 
 ---
 
@@ -981,6 +992,71 @@ Stage 10 decisions / notes:
 
 ---
 
+## Current milestone: Stage 11 — Observability
+
+Goal: make the engine measurable. The architecture lists required metrics "from
+the beginning"; this stage adds the in-process plumbing and a scrape surface,
+starting with the dominant cost in an object-store-native database — backend
+traffic — and growing into latency, lag, and cache metrics.
+
+Planned tasks:
+
+- [x] Add a dependency-free in-process metrics registry (`src/metrics.rs`):
+      atomic counters, a `Copy` snapshot, and a Prometheus text renderer.
+- [x] Count true object-store traffic with a `MeteredObjectStore` decorator
+      placed below the cache, so cache hits never inflate backend counts.
+- [x] Expose a Prometheus `GET /metrics` endpoint and wire the metered stack
+      into `sana serve`.
+- [x] Write/query latency histograms split by phase: write plan/commit/notify,
+      query plan/candidates/overlay/rank/materialize, plus a backend
+      object-store request histogram in the metered decorator (cache-read
+      timing rides with the cache-stats task below).
+- [ ] Index-lag and unindexed-byte gauges per namespace and index family.
+- [ ] Surface cache hit ratio / temperature (the cache already tracks
+      `CacheStats`; route it into the registry or the endpoint, and time
+      cache-served reads there).
+- [ ] Vector probe/candidate/rerank counts and FTS blocks-skipped counters.
+
+Stage 11 decisions / notes:
+
+- **D68 — Metrics are an in-process registry, not a dependency.** `src/metrics.rs`
+  holds plain `AtomicU64` counters behind an `Arc<Metrics>`, exposes a `Copy`
+  `MetricsSnapshot`, and renders the Prometheus text format by hand. This keeps
+  the D10 minimal-dependency posture (no `prometheus`/`metrics` crate) while
+  emitting the lingua-franca scrape format. Reads are `Relaxed`: counters are
+  independent and a scrape never needs a consistent cross-counter view.
+- **D69 — Meter below the cache.** `MeteredObjectStore` is an `ObjectStore`
+  decorator that counts each request (including failures), success byte volumes,
+  and every compare-and-set rejection. `sana serve` builds the stack as
+  `Caching(Metered(Fs))` so a cache hit, which never reaches the backend, is not
+  counted as an object-store round trip — the counters measure true egress to
+  durable storage. The shared `Arc<Metrics>` is threaded into the router so
+  `/metrics` reports exactly what the decorator observed. A live `sana serve`
+  smoke test confirmed a write advances `puts_if_absent`/`compare_and_sets` and
+  byte counters, and that the embedded indexing worker contributes traffic too.
+- **D70 — Latency histograms are fixed-bucket atomics recorded at existing
+  seams.** `metrics::Histogram` is eighteen `AtomicU64` buckets (100µs doubling
+  to ~6.6s, plus `+Inf`) and a microsecond sum, rendered as a Prometheus
+  histogram; no timer dependency, `Relaxed` ordering like the counters.
+  `Namespace` carries an `Arc<Metrics>` — a fresh private registry by default,
+  swapped via `with_metrics` so API handlers and the latency example attach the
+  scraped one without threading a parameter through every constructor. Phases
+  are recorded where the code already has seams, and they are the *dominant
+  spans, not a partition*: totals are end-to-end, phases need not sum to them,
+  and a phase that does not occur (e.g. `plan` for a plain append) records
+  nothing. Writes record `plan` (filter-mutation candidate discovery),
+  `commit` (the locked stage/CAS/publish region, excluding lock wait), and
+  `notify` (advisory enqueue); queries record `plan` (manifest + commit-state
+  snapshot), `candidates` (attribute/text/vector index reads), `overlay`
+  (unindexed WAL read), `rank` (ANN scan, BM25, exact rerank, or sort), and
+  `materialize` (id→document resolution or the full-scan fallback). The metered
+  decorator times every backend round trip into
+  `sana_object_store_request_seconds`, so "object reads" are measured below the
+  cache; timing cache-served reads belongs to the cache-stats task. Rejected
+  requests record nothing; failures inside a timed span still record it.
+
+---
+
 ## Decision log
 
 Decisions I (the implementer) made; the user delegated architectural calls.
@@ -1033,10 +1109,12 @@ src/
   error.rs               shared Error / Result
   value.rs               Id, Value, VectorValue, Document
   schema.rs              ScalarType, ColumnType, Schema, ...
+  object_store.rs        ObjectStore trait, ObjectVersion, version_of
   object_store/
-    mod.rs               ObjectStore trait, ObjectVersion, version_of
     fs.rs                FsObjectStore (filesystem backend)
     cache.rs             immutable-object byte-bounded LRU decorator
+    metered.rs           ObjectStore decorator that counts backend traffic
+  metrics.rs             in-process metrics registry + Prometheus rendering
   manifest.rs            NamespaceManifest, ManifestPointer, SstMeta (+ codecs)
   metadata.rs            service-facing namespace/index/pinning metadata
   wal.rs                 WalCursor, WalOp, WalBatch (+ binary codec)
@@ -1045,7 +1123,11 @@ src/
   attr.rs                attribute postings SST encoding/query helpers
   text.rs                tokenizer, BM25 stats/scoring, text postings SST helpers
   query.rs               logical query types + exact/ANN/text/native filtering + recall
-  vector/                 IVF, SIMD kernels, native filters, maintenance
+  vector.rs              IVF core: build, k-means, framing, search
+  vector/
+    filter.rs            per-value cluster/row bitmaps + mask algebra
+    kernels.rs           scalar + runtime-SIMD distance kernels
+    maintenance.rs       SPFresh split/merge/reassign + local rebuild
   namespace.rs           Namespace: create/append + SST-aware replay/lookup
   cache_warm.rs          manifest-driven warm plan and prefetch report
   index_queue.rs          durable queue, group-commit broker, leased worker

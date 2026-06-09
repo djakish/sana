@@ -49,6 +49,22 @@ fn vector_family_bytes(meta: &VectorIndexMeta) -> u64 {
             .sum::<u64>()
 }
 
+/// Sum of every index family the manifest references, once all are assembled.
+fn manifest_logical_bytes(manifest: &NamespaceManifest) -> u64 {
+    manifest
+        .doc_ssts
+        .iter()
+        .chain(&manifest.attr_ssts)
+        .chain(&manifest.text_ssts)
+        .map(|meta| meta.size_bytes)
+        .sum::<u64>()
+        + manifest
+            .vector_indexes
+            .values()
+            .map(vector_family_bytes)
+            .sum::<u64>()
+}
+
 fn maintenance_plan_if_not_empty(plan: VectorMaintenancePlan) -> Option<VectorMaintenancePlan> {
     (!plan.tasks.is_empty()).then_some(plan)
 }
@@ -108,10 +124,10 @@ async fn publish_vector_version_map(
     let version_map_bytes = version_map.encode()?;
     let version_map_key = content_addressed_key(
         format!(
-        "namespaces/{}/index/g/{}/vector/{}/versions.bin",
-        ns.name(),
-        generation,
-        object_path_component(column)
+            "namespaces/{}/index/g/{}/vector/{}/versions.bin",
+            ns.name(),
+            generation,
+            object_path_component(column)
         ),
         &version_map_bytes,
     );
@@ -593,18 +609,7 @@ pub async fn flush(ns: &Namespace) -> Result<bool> {
         .collect();
     manifest.vector_indexes = vector_indexes;
     manifest.approx_row_count = row_count;
-    manifest.approx_logical_bytes = manifest
-        .doc_ssts
-        .iter()
-        .chain(&manifest.attr_ssts)
-        .chain(&manifest.text_ssts)
-        .map(|m| m.size_bytes)
-        .sum::<u64>()
-        + manifest
-            .vector_indexes
-            .values()
-            .map(vector_family_bytes)
-            .sum::<u64>();
+    manifest.approx_logical_bytes = manifest_logical_bytes(&manifest);
 
     ns.publish_manifest(snapshot.pointer_version, &manifest)
         .await?;
@@ -613,6 +618,18 @@ pub async fn flush(ns: &Namespace) -> Result<bool> {
 
 /// Number of runs at one level that triggers a size-tiered merge into the next.
 const TIER_TRIGGER: usize = 4;
+
+/// The lowest level holding at least [`TIER_TRIGGER`] runs, if any.
+fn level_over_tier_trigger(ssts: &[SstMeta]) -> Option<u32> {
+    let mut counts: BTreeMap<u32, usize> = BTreeMap::new();
+    for meta in ssts {
+        *counts.entry(meta.level).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .find(|&(_, count)| count >= TIER_TRIGGER)
+        .map(|(level, _)| level)
+}
 
 /// Size-tiered minor compaction over `doc_ssts`. While some level holds at least
 /// [`TIER_TRIGGER`] runs, merge that level's runs (newest-wins) into a single
@@ -633,11 +650,7 @@ async fn tier_doc_ssts(
 ) -> Result<()> {
     let mut step = 0u32;
     loop {
-        let mut counts: BTreeMap<u32, usize> = BTreeMap::new();
-        for meta in doc_ssts.iter() {
-            *counts.entry(meta.level).or_default() += 1;
-        }
-        let Some((&level, _)) = counts.iter().find(|&(_, &count)| count >= TIER_TRIGGER) else {
+        let Some(level) = level_over_tier_trigger(doc_ssts) else {
             return Ok(());
         };
 
@@ -699,11 +712,7 @@ async fn tier_attr_ssts(
 ) -> Result<()> {
     let mut step = 0u32;
     loop {
-        let mut counts: BTreeMap<u32, usize> = BTreeMap::new();
-        for meta in attr_ssts.iter() {
-            *counts.entry(meta.level).or_default() += 1;
-        }
-        let Some((&level, _)) = counts.iter().find(|&(_, &count)| count >= TIER_TRIGGER) else {
+        let Some(level) = level_over_tier_trigger(attr_ssts) else {
             return Ok(());
         };
 
@@ -786,14 +795,6 @@ pub async fn compact(ns: &Namespace) -> Result<bool> {
         .keys()
         .map(|column| (column.clone(), new_gen))
         .collect();
-    manifest.approx_logical_bytes = built.bytes.len() as u64
-        + manifest.attr_ssts.iter().map(|m| m.size_bytes).sum::<u64>()
-        + manifest.text_ssts.iter().map(|m| m.size_bytes).sum::<u64>()
-        + manifest
-            .vector_indexes
-            .values()
-            .map(vector_family_bytes)
-            .sum::<u64>();
     manifest.doc_ssts = vec![SstMeta {
         key: sst_key,
         size_bytes: built.bytes.len() as u64,
@@ -802,6 +803,7 @@ pub async fn compact(ns: &Namespace) -> Result<bool> {
         max_id: built.max_id,
         level: 0,
     }];
+    manifest.approx_logical_bytes = manifest_logical_bytes(&manifest);
 
     ns.publish_manifest(snapshot.pointer_version, &manifest)
         .await?;

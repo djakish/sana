@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cache_warm::{CacheWarmOptions, CacheWarmReport};
 use crate::error::{Error, Result};
-use crate::namespace::{Namespace, manifest_pointer_key, now_ms};
+use crate::namespace::{Namespace, manifest_pointer_key, now_ms, validate_namespace_name};
 use crate::object_store::{GetResult, ObjectStore};
 
 pub const PINNING_FORMAT_VERSION: u32 = 1;
@@ -468,6 +468,7 @@ impl PinningController {
     }
 
     async fn ensure_namespace(&self, namespace: &str) -> Result<()> {
+        validate_namespace_name(namespace)?;
         match self.store.get(&manifest_pointer_key(namespace)).await {
             Ok(_) => Ok(()),
             Err(Error::NotFound(_)) => Err(Error::NotFound(format!("namespace {namespace}"))),
@@ -480,6 +481,7 @@ impl PinningController {
         namespace: &str,
         mut operation: impl FnMut(&mut PinningFile) -> Result<Mutation<T>>,
     ) -> Result<T> {
+        validate_namespace_name(namespace)?;
         for attempt in 0..MAX_CAS_ATTEMPTS {
             let (snapshot, mut state) = self.load_or_create(namespace).await?;
             let value = match operation(&mut state)? {
@@ -847,5 +849,17 @@ mod tests {
         indexer::gc(&namespace, true).await.unwrap();
         let metadata = controller.metadata("alpha").await.unwrap().unwrap();
         assert_eq!(metadata.replicas, 1);
+    }
+
+    #[tokio::test]
+    async fn pinning_rejects_invalid_namespace_before_storage_access() {
+        let dir = tempfile::tempdir().unwrap();
+        let object_store: Arc<dyn ObjectStore> = Arc::new(FsObjectStore::new(dir.path()));
+        let error = PinningController::new(object_store.clone())
+            .configure("../invalid", Some(1))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidWrite(_)));
+        assert!(object_store.list("").await.unwrap().is_empty());
     }
 }

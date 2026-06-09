@@ -43,8 +43,14 @@ fn record_round_trips() {
     doc.attributes
         .insert("title".into(), Value::String("x".into()));
     let present = DocRecord::Present(doc);
-    assert_eq!(DocRecord::decode(&present.encode().unwrap()).unwrap(), present);
+    assert_eq!(
+        DocRecord::decode(&present.encode().unwrap()).unwrap(),
+        present
+    );
 
     let deleted = DocRecord::Deleted;
-    assert_eq!(DocRecord::decode(&deleted.encode().unwrap()).unwrap(), deleted);
+    assert_eq!(
+        DocRecord::decode(&deleted.encode().unwrap()).unwrap(),
+        deleted
+    );
 }

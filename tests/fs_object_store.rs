@@ -35,14 +35,20 @@ async fn get_missing_is_not_found() {
 async fn put_if_absent_rejects_existing() {
     let (_dir, store) = store();
     let key = "a/b/c";
-    store.put_if_absent(key, Bytes::from_static(b"1")).await.unwrap();
+    store
+        .put_if_absent(key, Bytes::from_static(b"1"))
+        .await
+        .unwrap();
     let err = store
         .put_if_absent(key, Bytes::from_static(b"2"))
         .await
         .unwrap_err();
     assert!(matches!(err, Error::AlreadyExists(_)));
     // original content is untouched
-    assert_eq!(store.get(key).await.unwrap().bytes, Bytes::from_static(b"1"));
+    assert_eq!(
+        store.get(key).await.unwrap().bytes,
+        Bytes::from_static(b"1")
+    );
 }
 
 #[tokio::test]
@@ -56,7 +62,10 @@ async fn cas_succeeds_on_matching_version_and_advances() {
         .await
         .unwrap();
     assert_ne!(v0, v1);
-    assert_eq!(store.get(key).await.unwrap().bytes, Bytes::from_static(b"v1"));
+    assert_eq!(
+        store.get(key).await.unwrap().bytes,
+        Bytes::from_static(b"v1")
+    );
 }
 
 #[tokio::test]
@@ -75,17 +84,17 @@ async fn cas_fails_on_stale_version() {
         .await
         .unwrap_err();
     assert!(matches!(err, Error::CasMismatch { .. }));
-    assert_eq!(store.get(key).await.unwrap().bytes, Bytes::from_static(b"v1"));
+    assert_eq!(
+        store.get(key).await.unwrap().bytes,
+        Bytes::from_static(b"v1")
+    );
 }
 
 #[tokio::test]
 async fn independent_handles_share_one_cas_lock() {
     let dir = tempdir().unwrap();
     let initial = FsObjectStore::new(dir.path());
-    let expected = initial
-        .put("ptr", Bytes::from_static(b"v0"))
-        .await
-        .unwrap();
+    let expected = initial.put("ptr", Bytes::from_static(b"v0")).await.unwrap();
 
     let barrier = Arc::new(tokio::sync::Barrier::new(16));
     let mut tasks = Vec::new();
@@ -136,8 +145,14 @@ async fn get_range_reads_subslice() {
         .await
         .unwrap();
 
-    assert_eq!(store.get_range(key, 2..5).await.unwrap(), Bytes::from_static(b"234"));
-    assert_eq!(store.get_range(key, 0..10).await.unwrap(), Bytes::from_static(b"0123456789"));
+    assert_eq!(
+        store.get_range(key, 2..5).await.unwrap(),
+        Bytes::from_static(b"234")
+    );
+    assert_eq!(
+        store.get_range(key, 0..10).await.unwrap(),
+        Bytes::from_static(b"0123456789")
+    );
     let err = store.get_range(key, 8..12).await.unwrap_err();
     assert!(matches!(err, Error::InvalidRange { .. }));
 }
@@ -146,7 +161,10 @@ async fn get_range_reads_subslice() {
 async fn list_returns_sorted_prefixed_keys() {
     let (_dir, store) = store();
     store.put("ns/a/1", Bytes::from_static(b"x")).await.unwrap();
-    store.put("ns/a/2", Bytes::from_static(b"yy")).await.unwrap();
+    store
+        .put("ns/a/2", Bytes::from_static(b"yy"))
+        .await
+        .unwrap();
     store.put("ns/b/1", Bytes::from_static(b"z")).await.unwrap();
 
     let listed = store.list("ns/a/").await.unwrap();
@@ -163,12 +181,18 @@ async fn delete_is_idempotent() {
     store.put(key, Bytes::from_static(b"x")).await.unwrap();
     store.delete(key).await.unwrap();
     store.delete(key).await.unwrap(); // second delete is a no-op
-    assert!(matches!(store.get(key).await.unwrap_err(), Error::NotFound(_)));
+    assert!(matches!(
+        store.get(key).await.unwrap_err(),
+        Error::NotFound(_)
+    ));
 }
 
 #[tokio::test]
 async fn rejects_path_traversal_keys() {
     let (_dir, store) = store();
-    let err = store.put("../escape", Bytes::from_static(b"x")).await.unwrap_err();
+    let err = store
+        .put("../escape", Bytes::from_static(b"x"))
+        .await
+        .unwrap_err();
     assert!(matches!(err, Error::Corrupt(_)));
 }

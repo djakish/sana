@@ -4,8 +4,9 @@
 
 use std::sync::Arc;
 
+use sana::metrics::Metrics;
 use sana::namespace::Namespace;
-use sana::object_store::{CachingObjectStore, FsObjectStore, ObjectStore};
+use sana::object_store::{CachingObjectStore, FsObjectStore, MeteredObjectStore, ObjectStore};
 use sana::query::{MultiQuery, Query, RecallRequest};
 use sana::value::{Document, Id, Value};
 
@@ -404,10 +405,12 @@ async fn serve(args: &[String]) -> CliResult {
         .map(|value| value.parse::<usize>())
         .transpose()?
         .unwrap_or(256 * 1024 * 1024);
+    let metrics = Metrics::shared();
     let backing: Arc<dyn ObjectStore> = Arc::new(FsObjectStore::new(dir));
-    let cached: Arc<dyn ObjectStore> = Arc::new(CachingObjectStore::new(backing, cache_bytes));
+    let metered: Arc<dyn ObjectStore> = Arc::new(MeteredObjectStore::new(backing, metrics.clone()));
+    let cached: Arc<dyn ObjectStore> = Arc::new(CachingObjectStore::new(metered, cache_bytes));
     println!("serving Sana on http://{address} with {cache_bytes} cache bytes");
-    sana::api::serve_with_shutdown(cached, address, shutdown_signal()).await?;
+    sana::api::serve_with_shutdown(cached, address, metrics, shutdown_signal()).await?;
     Ok(())
 }
 

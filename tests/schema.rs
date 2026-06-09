@@ -137,10 +137,9 @@ async fn ids_columns_and_vectors_enforce_schema_limits_before_wal_commit() {
     }
 
     let mut oversized = Document::new(Id::U64(1));
-    oversized.vectors.insert(
-        "embedding".into(),
-        VectorValue::F32(vec![0.0; 10_753]),
-    );
+    oversized
+        .vectors
+        .insert("embedding".into(), VectorValue::F32(vec![0.0; 10_753]));
     let error = ns.upsert(oversized).await.unwrap_err();
     assert!(matches!(error, Error::InvalidSchema(_)));
 
