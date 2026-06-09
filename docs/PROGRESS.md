@@ -15,8 +15,10 @@ the next unchecked task under "Current milestone" / "Next up".
   `S3ObjectStore` speaks real S3 with server-enforced conditional writes
   (verified live against MinIO), and `sana serve` now runs policy-driven
   compaction, vector maintenance, and two-pass deferred GC on its own.
-- **Next up:** user docs (`docs/guide.md`), a usage example, benchmark notes,
-  and the project page.
+- **Next up:** the engine is feature-complete for its educational goal; docs,
+  a library example, benchmark notes, and the project page ship with it.
+  Future work, should it continue: a turbopuffer wire-compatibility layer,
+  WAL epoch rotation, IAM-role S3 credentials, reader-watermark GC.
 - **Done:** Stage 0 (Skeleton), Stage 1 (Durable Documents), Stage 2 (SST/LSM),
   Stage 3 (Attributes & Exact Search), Stage 4 (ANN v0), Stage 5 (Native
   Filtering), Stage 6 (SPFresh local rebuild), Stage 7 (Full-text search),

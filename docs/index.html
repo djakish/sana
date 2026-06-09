@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sana — object-storage-native search</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0; padding: 4rem 1.5rem;
+    background: #101014; color: #d8d8e0;
+    font: 16px/1.6 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    display: flex; justify-content: center;
+  }
+  main { max-width: 44rem; }
+  h1 { font-size: 2.2rem; margin: 0; color: #fff; letter-spacing: 0.04em; }
+  .tagline { color: #9a9ab0; margin: 0.4rem 0 2rem; }
+  .disclaimer {
+    border: 1px solid #6b5d28; background: #1c1910; color: #d8c87a;
+    padding: 0.6rem 1rem; border-radius: 6px; margin: 0 0 2rem; font-size: 0.9rem;
+  }
+  ul { padding-left: 1.2rem; }
+  li { margin: 0.45rem 0; }
+  pre {
+    background: #16161c; border: 1px solid #26262e; border-radius: 6px;
+    padding: 1rem; overflow-x: auto; font-size: 0.88rem;
+  }
+  a { color: #7aa2f7; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .links { margin-top: 2rem; display: flex; gap: 1.4rem; flex-wrap: wrap; }
+  footer { margin-top: 3rem; color: #62626e; font-size: 0.85rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>sana</h1>
+  <p class="tagline">an object-storage-native search database, in Rust</p>
+
+  <p class="disclaimer">⚠ AI-assisted project, built with Claude. An
+  educational <a href="https://turbopuffer.com">turbopuffer</a>-inspired
+  clone — learn from it, don't bet on it.</p>
+
+  <ul>
+    <li>documents live entirely in object storage — a directory, or S3 with
+        server-enforced conditional writes</li>
+    <li>vector search: IVF + faithful RaBitQ quantization, SIMD kernels,
+        SPFresh-style local index maintenance</li>
+    <li>full-text BM25 with rank-safe block MAXSCORE; attribute filters
+        native to the vector index</li>
+    <li>one binary: CLI, HTTP service with embedded indexing worker,
+        automatic compaction &amp; GC, Prometheus <code>/metrics</code></li>
+  </ul>
+
+  <pre>cargo run --release -- demo ./data
+cargo run --release -- serve ./data
+cargo run --release --example usage</pre>
+
+  <div class="links">
+    <a href="guide.md">user guide</a>
+    <a href="wiki/architecture.md">architecture</a>
+    <a href="PROGRESS.md">build log &amp; decisions</a>
+    <a href="benchmarks.md">benchmarks</a>
+  </div>
+
+  <footer>brevity is the soul of wit</footer>
+</main>
+</body>
+</html>
