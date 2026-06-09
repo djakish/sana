@@ -11,18 +11,18 @@ the next unchecked task under "Current milestone" / "Next up".
 
 ## Status snapshot
 
-- **Current stage:** Stage 11 (Observability) — **done.** Metrics registry,
-  object-store traffic + latency, phase latency histograms, cache stats,
-  per-namespace index-lag gauges, and ANN/FTS work counters all scrape from
-  `GET /metrics`.
-- **Next up:** Stage 12 — a real S3 backend behind `ObjectStore`, then
-  automatic background maintenance in `sana serve`.
+- **Current stage:** Stage 13 (Automatic maintenance) — **done.** Stage 12's
+  `S3ObjectStore` speaks real S3 with server-enforced conditional writes
+  (verified live against MinIO), and `sana serve` now runs policy-driven
+  compaction, vector maintenance, and two-pass deferred GC on its own.
+- **Next up:** user docs (`docs/guide.md`), a usage example, benchmark notes,
+  and the project page.
 - **Done:** Stage 0 (Skeleton), Stage 1 (Durable Documents), Stage 2 (SST/LSM),
   Stage 3 (Attributes & Exact Search), Stage 4 (ANN v0), Stage 5 (Native
   Filtering), Stage 6 (SPFresh local rebuild), Stage 7 (Full-text search),
   Stage 8 (RaBitQ & kernels), Stage 9 (Object-store operations), Stage 10
   (Durability hardening and write semantics).
-- **Tests:** `cargo test` green (212 tests); `cargo clippy --all-targets` clean.
+- **Tests:** `cargo test` green (223 tests); `cargo clippy --all-targets` clean.
 - **Note:** post-Stage-2 and Stage-3–5 code-review fixes applied; remaining
   findings tracked under "Stage 2 — code review follow-ups" and "Stages 3–5 —
   code review follow-ups". Recently fixed limitations: Stage 2 ranged
@@ -101,9 +101,16 @@ the next unchecked task under "Current milestone" / "Next up".
 - [x] **Stage 10 — Durability hardening and write semantics.** Corruption-safe
       SST metadata, idempotent/conditional writes, bounded write backpressure,
       and a service-facing HTTP/metadata surface.
-- [ ] **Stage 11 — Observability.** In-process metrics registry, object-store
-      traffic metering, and a Prometheus `/metrics` endpoint (MVP done; latency
-      histograms, index-lag gauges, and cache stats still to come).
+- [x] **Stage 11 — Observability.** In-process metrics registry, object-store
+      traffic metering and latency, phase latency histograms, cache stats,
+      per-namespace index-lag gauges, ANN/FTS counters, Prometheus `/metrics`.
+- [x] **Stage 12 — S3 backend.** `S3ObjectStore` over presigned SigV4 requests
+      with native conditional writes (`If-None-Match: *` / `If-Match: etag`),
+      env-gated MinIO conformance tests, and `s3://bucket[/prefix]` locations
+      accepted by every CLI verb and `sana serve`.
+- [x] **Stage 13 — Automatic maintenance.** Policy-driven background
+      compaction, vector maintenance, and two-pass deferred GC inside
+      `sana serve`.
 
 ---
 
@@ -1071,6 +1078,76 @@ Stage 11 decisions / notes:
 
 ---
 
+## Stage 12 — S3 Backend (done)
+
+Goal: make "object-store-native" literal — run the whole engine against real
+S3-compatible storage with server-enforced conditional writes.
+
+- [x] `S3ObjectStore` (`src/object_store/s3.rs`): GET / ranged GET / PUT /
+      conditional PUT / paginated ListObjectsV2 / DELETE over presigned SigV4
+      requests; `S3Config::from_location("s3://bucket[/prefix]")` plus
+      environment configuration.
+- [x] Env-gated conformance suite (`tests/s3_object_store.rs`) covering the
+      store contract and a full namespace lifecycle; verified against live
+      MinIO (6/6 green) plus a CLI smoke (`create`/`upsert`/`flush`/`get` over
+      `s3://`).
+- [x] Every CLI verb and `sana serve` accept `s3://bucket[/prefix]` locations.
+
+Stage 12 decisions / notes:
+
+- **D72 — S3 conditional writes are the real CAS; rusty-s3 + reqwest, not the
+  AWS SDK.** Put-if-absent sends `If-None-Match: *` and compare-and-set sends
+  `If-Match: <etag>`, so the precondition is enforced *by the store* across
+  processes and nodes — this lifts D4's single-process filesystem limitation.
+  Object versions wrap unquoted ETags; CAS only ever needs version equality,
+  and every recovery path that verifies immutable objects compares bytes, not
+  tokens, so ETag versions are safe (a content-hash token from another backend
+  simply mismatches, which is the correct CAS answer). 412 maps to
+  `CasMismatch`/`AlreadyExists`, 404-on-If-Match to `CasMismatch` with no
+  actual, and 409 `ConditionalRequestConflict` (a racing conditional write)
+  gets a short bounded retry. Ranged reads send one `Range` header and check
+  `Content-Range`'s total size so a clamped read surfaces as `InvalidRange`,
+  matching filesystem semantics; empty ranges bounds-check with a HEAD. The
+  dependency posture stays D10-minimal: `rusty-s3` is a tiny sans-IO SigV4
+  presigner (the conditional headers are plain HTTP and ride unsigned) and
+  `reqwest`/rustls is the one transport addition — the engine needs six verbs,
+  not the AWS SDK's smithy stack. The trade-off, documented here on purpose:
+  credentials are env-vars (+ session token), no IAM-role/SSO chain; swapping
+  in `aws-sdk-s3` later touches exactly one file behind `ObjectStore`.
+
+---
+
+## Stage 13 — Automatic Maintenance (done)
+
+Goal: a single `sana serve` keeps its namespaces tidy — no operator cron jobs
+for compaction, vector maintenance, or GC.
+
+- [x] `src/maintenance.rs`: `MaintenancePolicy` (run-count and vector-append
+      thresholds, vector maintenance, GC toggles) + `run_once` pass over every
+      namespace with per-namespace error isolation.
+- [x] `api::serve` runs the maintenance loop beside the index worker
+      (60-second interval, default policy).
+- [x] Tests: threshold-triggered compaction preserving data, unindexed
+      namespaces left alone, and two-pass deferred GC.
+
+Stage 13 decisions / notes:
+
+- **D73 — Maintenance is deferred, prioritized, and isolated.** A pass touches
+  only *fully indexed* namespaces for index-shape work (the flush worker owns
+  catching up): full compaction fires when doc/attr run counts or a vector
+  append chain reach the policy thresholds, otherwise manifest-published
+  vector split/merge tasks run — never both in one pass, since compaction
+  subsumes the append chain anyway. GC handles D4's quiescence assumption with
+  *two-pass deferred deletion*: a pass deletes only objects the previous pass
+  already saw orphaned, so an in-flight reader holding a superseded manifest
+  gets at least one full maintenance interval (60 s, far beyond any query
+  timeout) to drain. The candidate set lives in process memory; a restart
+  merely delays reclamation by one pass. Per-namespace failures land in
+  `MaintenanceReport.errors` instead of aborting the fleet pass, and
+  namespaces deleted between passes drop their candidates.
+
+---
+
 ## Decision log
 
 Decisions I (the implementer) made; the user delegated architectural calls.
@@ -1126,9 +1203,11 @@ src/
   object_store.rs        ObjectStore trait, ObjectVersion, version_of
   object_store/
     fs.rs                FsObjectStore (filesystem backend)
+    s3.rs                S3ObjectStore (presigned SigV4, native conditional writes)
     cache.rs             immutable-object byte-bounded LRU decorator
     metered.rs           ObjectStore decorator that counts backend traffic
   metrics.rs             in-process metrics registry + Prometheus rendering
+  maintenance.rs         policy-driven compaction/vector/GC background pass
   manifest.rs            NamespaceManifest, ManifestPointer, SstMeta (+ codecs)
   metadata.rs            service-facing namespace/index/pinning metadata
   wal.rs                 WalCursor, WalOp, WalBatch (+ binary codec)
@@ -1165,5 +1244,14 @@ tests/
   pinning tests live beside the control implementation in src/pinning.rs
   write.rs               conditional atomicity, retries, and two-phase filters
   text.rs                tokenization, BM25, text SST round-trip
+  s3_object_store.rs     env-gated S3/MinIO conformance + engine lifecycle
+  maintenance.rs         threshold compaction + two-pass deferred GC
   fixtures/              committed golden snapshots
+docs/
+  guide.md               user guide (CLI, S3, HTTP API, metrics, benchmark)
+  benchmarks.md          latency-harness numbers on a dev machine
+  index.html             minimal project page (GitHub Pages serves /docs)
+examples/
+  usage.rs               end-to-end library tour (write → index → 4 query shapes)
+  latency.rs             benchmark harness over the serve decorator stack
 ```
