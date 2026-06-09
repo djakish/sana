@@ -1,8 +1,9 @@
 # Sana — Build Progress & Task Tracker
 
 This is the durable task log. Work pauses and resumes across sessions, so this
-file is the source of truth for "what's done, what's next, and why". Read this
-plus `docs/wiki/architecture.md` before continuing.
+file is the source of truth for "what's done, what's next, and why". (The
+pre-development design document and research material were retired once the
+build caught up with them; this log carries the decisions forward.)
 
 **How to resume:** read this file → run `cargo test` (should be green) → pick up
 the next unchecked task under "Current milestone" / "Next up".

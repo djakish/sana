@@ -1,6 +1,6 @@
 //! Sana: an object-storage-native search database for vectors, text, and
-//! attributes. See `docs/wiki/architecture.md` for the full design and
-//! `docs/PROGRESS.md` for the staged build status and decision log.
+//! attributes. See `docs/guide.md` for usage and `docs/PROGRESS.md` for the
+//! staged build log and every design decision.
 
 pub mod api;
 pub mod attr;

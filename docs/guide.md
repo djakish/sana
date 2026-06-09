@@ -131,7 +131,7 @@ filtered queries, plus the true object-store traffic the run generated. See
 
 ## More
 
-- `docs/wiki/architecture.md` — the full design document.
-- `docs/PROGRESS.md` — staged build log and every design decision (D1–D73).
+- `docs/PROGRESS.md` — staged build log, architecture notes, and every design
+  decision (D1–D73).
 - `sana --help` (no args) — the complete CLI verb list: branch, copy, export,
   pin, gc, recall, and friends.
