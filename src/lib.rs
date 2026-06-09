@@ -11,6 +11,7 @@ pub mod error;
 pub mod frame;
 pub mod index_queue;
 pub mod indexer;
+pub mod maintenance;
 pub mod manifest;
 pub mod metadata;
 pub mod metrics;

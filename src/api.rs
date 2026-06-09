@@ -288,8 +288,34 @@ pub async fn serve_with_shutdown(
     )
     .with_graceful_shutdown(shutdown)
     .into_future();
-    let worker = run_index_worker(store, metrics);
+    let worker = async {
+        tokio::join!(
+            run_index_worker(store.clone(), metrics),
+            run_maintenance_loop(store),
+        );
+    };
     run_server_and_worker(server, worker).await
+}
+
+/// Background maintenance: one policy pass per interval. The interval doubles
+/// as the deferred-GC grace period — an orphan is deleted only after surviving
+/// two consecutive scans, so readers get at least one interval to drain.
+async fn run_maintenance_loop(store: Arc<dyn ObjectStore>) {
+    const MAINTENANCE_INTERVAL_MS: u64 = 60_000;
+
+    let policy = crate::maintenance::MaintenancePolicy::default();
+    let mut state = crate::maintenance::MaintenanceState::default();
+    loop {
+        tokio::time::sleep(Duration::from_millis(MAINTENANCE_INTERVAL_MS)).await;
+        match crate::maintenance::run_once(store.clone(), &policy, &mut state).await {
+            Ok(report) => {
+                for error in &report.errors {
+                    eprintln!("maintenance: {error}");
+                }
+            }
+            Err(error) => eprintln!("maintenance pass failed: {error}"),
+        }
+    }
 }
 
 async fn run_server_and_worker(

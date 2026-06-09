@@ -728,19 +728,12 @@ fn unexpected_broker_reply(operation: &str) -> Error {
 
 /// Scan authoritative WAL/manifest state and restore any missed indexing
 /// notifications through a temporary group-commit broker.
-pub async fn reconcile_unindexed(store: Arc<dyn ObjectStore>) -> Result<ReconcileReport> {
-    let broker = IndexQueueBroker::start(store.clone(), 1_024, 256);
-    reconcile_unindexed_with_broker(store, &broker).await
-}
-
-/// Reconcile lagging namespaces through an existing broker.
-pub async fn reconcile_unindexed_with_broker(
-    store: Arc<dyn ObjectStore>,
-    broker: &IndexQueueBroker,
-) -> Result<ReconcileReport> {
+/// Every namespace with a manifest pointer under the store's `namespaces/`
+/// prefix. Listing is not a hot path; this backs reconciliation and
+/// maintenance scans.
+pub async fn list_namespace_names(store: &Arc<dyn ObjectStore>) -> Result<BTreeSet<String>> {
     const POINTER_SUFFIX: &str = "/manifest/current";
-
-    let namespace_names: BTreeSet<String> = store
+    Ok(store
         .list("namespaces/")
         .await?
         .into_iter()
@@ -752,7 +745,20 @@ pub async fn reconcile_unindexed_with_broker(
                 .filter(|name| !name.is_empty())
                 .map(str::to_string)
         })
-        .collect();
+        .collect())
+}
+
+pub async fn reconcile_unindexed(store: Arc<dyn ObjectStore>) -> Result<ReconcileReport> {
+    let broker = IndexQueueBroker::start(store.clone(), 1_024, 256);
+    reconcile_unindexed_with_broker(store, &broker).await
+}
+
+/// Reconcile lagging namespaces through an existing broker.
+pub async fn reconcile_unindexed_with_broker(
+    store: Arc<dyn ObjectStore>,
+    broker: &IndexQueueBroker,
+) -> Result<ReconcileReport> {
+    let namespace_names = list_namespace_names(&store).await?;
     let mut report = ReconcileReport {
         scanned_namespaces: namespace_names.len(),
         ..ReconcileReport::default()
