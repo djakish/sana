@@ -19,10 +19,12 @@ use crate::error::Result;
 pub mod cache;
 pub mod fs;
 pub mod metered;
+pub mod s3;
 
 pub use cache::{CacheStats, CachingObjectStore};
 pub use fs::FsObjectStore;
 pub use metered::MeteredObjectStore;
+pub use s3::{S3Config, S3ObjectStore};
 
 /// An opaque object version token. For the filesystem backend this is a hash
 /// of the object's contents; for S3/GCS it will wrap an ETag or generation.

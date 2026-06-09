@@ -6,7 +6,9 @@ use std::sync::Arc;
 
 use sana::metrics::Metrics;
 use sana::namespace::Namespace;
-use sana::object_store::{CachingObjectStore, FsObjectStore, MeteredObjectStore, ObjectStore};
+use sana::object_store::{
+    CachingObjectStore, FsObjectStore, MeteredObjectStore, ObjectStore, S3Config, S3ObjectStore,
+};
 use sana::query::{MultiQuery, Query, RecallRequest};
 use sana::value::{Document, Id, Value};
 
@@ -75,10 +77,21 @@ fn usage() {
     eprintln!("  sana pin-status <dir> <ns>");
     eprintln!("  sana serve <dir> [address] [cache-bytes]");
     eprintln!("  sana demo    <dir>");
+    eprintln!();
+    eprintln!("  <dir> may be a directory or s3://bucket[/prefix]; S3 reads");
+    eprintln!("  SANA_S3_ENDPOINT, AWS_REGION, and AWS credentials from the env.");
 }
 
-fn store(dir: &str) -> Arc<dyn ObjectStore> {
-    Arc::new(FsObjectStore::new(dir))
+/// Open the object-store backing for a CLI location: a filesystem directory,
+/// or `s3://bucket[/prefix]` configured through the environment (endpoint,
+/// region, and credentials; see `S3Config::from_location`).
+fn store(location: &str) -> Result<Arc<dyn ObjectStore>, Box<dyn std::error::Error>> {
+    if location.starts_with("s3://") {
+        let config = S3Config::from_location(location)?;
+        Ok(Arc::new(S3ObjectStore::from_env(config)?))
+    } else {
+        Ok(Arc::new(FsObjectStore::new(location)))
+    }
 }
 
 /// Parse an id token as u64 if possible, else treat it as a string id.
@@ -104,14 +117,14 @@ fn parse_value(token: &str) -> Value {
 
 async fn create(args: &[String]) -> CliResult {
     let (dir, ns) = (arg(args, 2)?, arg(args, 3)?);
-    Namespace::create(store(dir), ns).await?;
+    Namespace::create(store(dir)?, ns).await?;
     println!("created namespace {ns}");
     Ok(())
 }
 
 async fn upsert(args: &[String]) -> CliResult {
     let (dir, ns, id) = (arg(args, 2)?, arg(args, 3)?, arg(args, 4)?);
-    let namespace = Namespace::create_or_open(store(dir), ns).await?;
+    let namespace = Namespace::create_or_open(store(dir)?, ns).await?;
 
     let mut doc = Document::new(parse_id(id));
     for pair in &args[5.min(args.len())..] {
@@ -127,7 +140,7 @@ async fn upsert(args: &[String]) -> CliResult {
 
 async fn get(args: &[String]) -> CliResult {
     let (dir, ns, id) = (arg(args, 2)?, arg(args, 3)?, arg(args, 4)?);
-    let namespace = Namespace::open(store(dir), ns).await?;
+    let namespace = Namespace::open(store(dir)?, ns).await?;
     match namespace.lookup(&parse_id(id)).await? {
         Some(doc) => println!("{doc:#?}"),
         None => println!("not found: {id}"),
@@ -137,7 +150,7 @@ async fn get(args: &[String]) -> CliResult {
 
 async fn delete(args: &[String]) -> CliResult {
     let (dir, ns, id) = (arg(args, 2)?, arg(args, 3)?, arg(args, 4)?);
-    let namespace = Namespace::open(store(dir), ns).await?;
+    let namespace = Namespace::open(store(dir)?, ns).await?;
     namespace.delete(parse_id(id)).await?;
     println!("deleted {id}");
     Ok(())
@@ -145,7 +158,7 @@ async fn delete(args: &[String]) -> CliResult {
 
 async fn list(args: &[String]) -> CliResult {
     let (dir, ns) = (arg(args, 2)?, arg(args, 3)?);
-    let namespace = Namespace::open(store(dir), ns).await?;
+    let namespace = Namespace::open(store(dir)?, ns).await?;
     let docs = namespace.replay().await?;
     println!("{} document(s):", docs.len());
     for (id, doc) in &docs {
@@ -156,7 +169,7 @@ async fn list(args: &[String]) -> CliResult {
 
 async fn query(args: &[String]) -> CliResult {
     let (dir, ns) = (arg(args, 2)?, arg(args, 3)?);
-    let namespace = Namespace::open(store(dir), ns).await?;
+    let namespace = Namespace::open(store(dir)?, ns).await?;
     let query = match args.get(4) {
         Some(json) => serde_json::from_str::<Query>(json)?,
         None => Query::all(),
@@ -187,7 +200,7 @@ async fn query(args: &[String]) -> CliResult {
 
 async fn multi_query(args: &[String]) -> CliResult {
     let (dir, ns, json) = (arg(args, 2)?, arg(args, 3)?, arg(args, 4)?);
-    let namespace = Namespace::open(store(dir), ns).await?;
+    let namespace = Namespace::open(store(dir)?, ns).await?;
     let request = serde_json::from_str::<MultiQuery>(json)?;
     let result = namespace.multi_query(request).await?;
     println!("{}", serde_json::to_string_pretty(&result)?);
@@ -196,7 +209,7 @@ async fn multi_query(args: &[String]) -> CliResult {
 
 async fn recall(args: &[String]) -> CliResult {
     let (dir, ns) = (arg(args, 2)?, arg(args, 3)?);
-    let namespace = Namespace::open(store(dir), ns).await?;
+    let namespace = Namespace::open(store(dir)?, ns).await?;
     let request = match args.get(4) {
         Some(json) => serde_json::from_str::<RecallRequest>(json)?,
         None => RecallRequest::default(),
@@ -208,7 +221,7 @@ async fn recall(args: &[String]) -> CliResult {
 
 async fn flush(args: &[String]) -> CliResult {
     let (dir, ns) = (arg(args, 2)?, arg(args, 3)?);
-    let namespace = Namespace::open(store(dir), ns).await?;
+    let namespace = Namespace::open(store(dir)?, ns).await?;
     let did = sana::indexer::flush(&namespace).await?;
     println!(
         "{}",
@@ -223,7 +236,7 @@ async fn flush(args: &[String]) -> CliResult {
 
 async fn compact(args: &[String]) -> CliResult {
     let (dir, ns) = (arg(args, 2)?, arg(args, 3)?);
-    let namespace = Namespace::open(store(dir), ns).await?;
+    let namespace = Namespace::open(store(dir)?, ns).await?;
     let did = sana::indexer::compact(&namespace).await?;
     println!(
         "{}",
@@ -239,7 +252,7 @@ async fn compact(args: &[String]) -> CliResult {
 async fn gc(args: &[String]) -> CliResult {
     let (dir, ns) = (arg(args, 2)?, arg(args, 3)?);
     let apply = args.iter().any(|a| a == "--apply");
-    let namespace = Namespace::open(store(dir), ns).await?;
+    let namespace = Namespace::open(store(dir)?, ns).await?;
     let report = sana::indexer::gc(&namespace, apply).await?;
     let verb = if report.applied {
         "deleted"
@@ -264,7 +277,7 @@ async fn gc(args: &[String]) -> CliResult {
 
 async fn maintain_vectors(args: &[String]) -> CliResult {
     let (dir, ns) = (arg(args, 2)?, arg(args, 3)?);
-    let namespace = Namespace::open(store(dir), ns).await?;
+    let namespace = Namespace::open(store(dir)?, ns).await?;
     let did = sana::indexer::maintain_vectors(&namespace).await?;
     println!(
         "{}",
@@ -279,7 +292,7 @@ async fn maintain_vectors(args: &[String]) -> CliResult {
 
 async fn work_indexing(args: &[String]) -> CliResult {
     let (dir, worker_id) = (arg(args, 2)?, arg(args, 3)?);
-    match sana::index_queue::run_worker_once(store(dir), worker_id, 30_000, 1_000).await? {
+    match sana::index_queue::run_worker_once(store(dir)?, worker_id, 30_000, 1_000).await? {
         Some(run) => println!(
             "completed job {} for {} through WAL seq {} ({})",
             run.job_id,
@@ -298,7 +311,7 @@ async fn work_indexing(args: &[String]) -> CliResult {
 
 async fn reconcile_indexing(args: &[String]) -> CliResult {
     let dir = arg(args, 2)?;
-    let report = sana::index_queue::reconcile_unindexed(store(dir)).await?;
+    let report = sana::index_queue::reconcile_unindexed(store(dir)?).await?;
     println!(
         "scanned {} namespace(s): {} lagging, {} notification(s) added, {} coalesced",
         report.scanned_namespaces,
@@ -311,7 +324,7 @@ async fn reconcile_indexing(args: &[String]) -> CliResult {
 
 async fn branch(args: &[String]) -> CliResult {
     let (dir, source_name, child_name) = (arg(args, 2)?, arg(args, 3)?, arg(args, 4)?);
-    let source = Namespace::open(store(dir), source_name).await?;
+    let source = Namespace::open(store(dir)?, source_name).await?;
     let child = source.branch(child_name).await?;
     let parent = child
         .load_manifest()
@@ -328,8 +341,8 @@ async fn branch(args: &[String]) -> CliResult {
 async fn copy(args: &[String]) -> CliResult {
     let (source_dir, source_name, target_dir, target_name) =
         (arg(args, 2)?, arg(args, 3)?, arg(args, 4)?, arg(args, 5)?);
-    let source = Namespace::open(store(source_dir), source_name).await?;
-    let report = source.copy_to(store(target_dir), target_name).await?;
+    let source = Namespace::open(store(source_dir)?, source_name).await?;
+    let report = source.copy_to(store(target_dir)?, target_name).await?;
     println!(
         "copied {source_name} generation {} to {target_name}: {} object(s), {} bytes",
         report.source_generation, report.object_count, report.copied_bytes
@@ -340,8 +353,8 @@ async fn copy(args: &[String]) -> CliResult {
 async fn export(args: &[String]) -> CliResult {
     let (source_dir, namespace_name, target_dir, prefix) =
         (arg(args, 2)?, arg(args, 3)?, arg(args, 4)?, arg(args, 5)?);
-    let namespace = Namespace::open(store(source_dir), namespace_name).await?;
-    let report = namespace.export_to(store(target_dir), prefix).await?;
+    let namespace = Namespace::open(store(source_dir)?, namespace_name).await?;
+    let report = namespace.export_to(store(target_dir)?, prefix).await?;
     println!(
         "exported {namespace_name} generation {} to {}: {} object(s), {} bytes",
         report.source_generation, report.catalog_key, report.object_count, report.copied_bytes
@@ -356,7 +369,7 @@ async fn pin(args: &[String]) -> CliResult {
         .map(|value| value.parse::<u32>())
         .transpose()?
         .unwrap_or(1);
-    sana::pinning::PinningController::new(store(dir))
+    sana::pinning::PinningController::new(store(dir)?)
         .configure(namespace_name, Some(replicas))
         .await?;
     println!("pinned {namespace_name} with {replicas} replica(s)");
@@ -365,7 +378,7 @@ async fn pin(args: &[String]) -> CliResult {
 
 async fn unpin(args: &[String]) -> CliResult {
     let (dir, namespace_name) = (arg(args, 2)?, arg(args, 3)?);
-    sana::pinning::PinningController::new(store(dir))
+    sana::pinning::PinningController::new(store(dir)?)
         .configure(namespace_name, None)
         .await?;
     println!("unpinned {namespace_name}");
@@ -374,7 +387,7 @@ async fn unpin(args: &[String]) -> CliResult {
 
 async fn pin_status(args: &[String]) -> CliResult {
     let (dir, namespace_name) = (arg(args, 2)?, arg(args, 3)?);
-    match sana::pinning::PinningController::new(store(dir))
+    match sana::pinning::PinningController::new(store(dir)?)
         .metadata(namespace_name)
         .await?
     {
@@ -406,7 +419,7 @@ async fn serve(args: &[String]) -> CliResult {
         .transpose()?
         .unwrap_or(256 * 1024 * 1024);
     let metrics = Metrics::shared();
-    let backing: Arc<dyn ObjectStore> = Arc::new(FsObjectStore::new(dir));
+    let backing = store(dir)?;
     let metered: Arc<dyn ObjectStore> = Arc::new(MeteredObjectStore::new(backing, metrics.clone()));
     let cached: Arc<dyn ObjectStore> =
         Arc::new(CachingObjectStore::new(metered, cache_bytes).with_metrics(metrics.clone()));
@@ -427,7 +440,7 @@ async fn shutdown_signal() {
 
 async fn demo(args: &[String]) -> CliResult {
     let dir = arg(args, 2)?;
-    let ns = Namespace::create_or_open(store(dir), "demo").await?;
+    let ns = Namespace::create_or_open(store(dir)?, "demo").await?;
 
     let mut a = Document::new(Id::U64(1));
     a.attributes
