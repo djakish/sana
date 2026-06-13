@@ -2,6 +2,10 @@
 name = "sana"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "An object-storage-native search database: vectors, full-text, and attribute filters over documents whose only durable home is an object store."
+repository = "https://github.com/djakish/sana"
+readme = "README.md"
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time", "net", "signal"] }
