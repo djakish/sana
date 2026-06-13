@@ -25,7 +25,7 @@ the next unchecked task under "Current milestone" / "Next up".
   Filtering), Stage 6 (SPFresh local rebuild), Stage 7 (Full-text search),
   Stage 8 (RaBitQ & kernels), Stage 9 (Object-store operations), Stage 10
   (Durability hardening and write semantics).
-- **Tests:** `cargo test` green (223 tests); `cargo clippy --all-targets` clean.
+- **Tests:** `cargo test` green (230 tests); `cargo clippy --all-targets` clean.
 - **Note:** post-Stage-2 and Stage-3–5 code-review fixes applied; remaining
   findings tracked under "Stage 2 — code review follow-ups" and "Stages 3–5 —
   code review follow-ups". Recently fixed limitations: Stage 2 ranged
@@ -72,7 +72,7 @@ the next unchecked task under "Current milestone" / "Next up".
   the write/query paths at their dominant phase seams (write plan/commit/notify,
   query plan/candidates/overlay/rank/materialize), attached per-request via
   `Namespace::with_metrics`.
-- **Last updated:** 2026-06-10.
+- **Last updated:** 2026-06-13.
 
 ---
 
@@ -1155,6 +1155,35 @@ Stage 13 decisions / notes:
   merely delays reclamation by one pass. Per-namespace failures land in
   `MaintenanceReport.errors` instead of aborting the fleet pass, and
   namespaces deleted between passes drop their candidates.
+
+---
+
+## Follow-ups (post Stage 13)
+
+Review-driven polish after the engine was feature-complete.
+
+- **MIT license.** Added `LICENSE` and `license`/`description`/`repository`
+  metadata to `Cargo.toml`; the README/project page already claimed
+  open-source.
+- **Current-state architecture doc.** `docs/ARCHITECTURE.md` describes the engine
+  as it stands (object-store boundary, on-disk layout, write/read paths, core
+  invariants), so this log can stay a chronological record. Two stale references
+  to `DefaultHasher` (the Stage 3–5 "left as-is" note and D3) were amended in
+  place — superseded, not rewritten — to point at the SHA-256 + `siphasher`
+  resolution.
+- **D74 — Plain-JSON wire values.** `Id`, `Value`, and `VectorValue` now
+  serialize as bare JSON scalars/arrays (`1`, `4.5`, `"fantasy"`, `[0.1, 0.2]`)
+  instead of serde's type-tagged enum form (`{"U64": 1}`, `{"Float": 4.5}`),
+  matching how turbopuffer and peers accept documents. The type comes from the
+  JSON token plus the schema. The split rides on `serializer.is_human_readable()`:
+  JSON gets the plain form, while postcard (WAL/SSTs) keeps the tagged encoding
+  because it is not self-describing and cannot round-trip a tag-less scalar — so
+  the binary on-disk bytes and every binary golden are unchanged. A canonical
+  hyphenated-UUID string round-trips to `Id::Uuid` (a 36-char hyphenated-hex
+  string therefore cannot be a `String` id). Structural enums (`Upsert`/`Patch`
+  operations, `Eq`/`Range`/`And` filters) keep their tags — those discriminate,
+  they do not annotate a scalar. No compatibility with the old tagged JSON form;
+  this is a deliberate pre-1.0 break.
 
 ---
 

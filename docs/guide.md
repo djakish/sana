@@ -19,7 +19,7 @@ cargo build --release
 ./target/release/sana upsert  ./data books 1 title="A Wizard of Earthsea" genre=fantasy rating=4.5
 ./target/release/sana flush   ./data books          # build indexes now (serve does this for you)
 ./target/release/sana get     ./data books 1
-./target/release/sana query   ./data books '{"filter":{"Eq":{"column":"genre","value":{"String":"fantasy"}}}}'
+./target/release/sana query   ./data books '{"filter":{"Eq":{"column":"genre","value":"fantasy"}}}'
 ```
 
 Every CLI verb takes a store location as its first argument: a directory, or
@@ -67,14 +67,18 @@ readers drain first).
 
 Write — append two documents (creates the namespace on first write):
 
+Attribute values, vectors, and ids are plain JSON — the type comes from the
+JSON token and the schema, not a wrapper. (The `Upsert`/`Patch`/`Delete` tag on
+an operation is the structural discriminator and stays.)
+
 ```sh
 curl -s localhost:8080/v2/namespaces/books -d '{
   "kind": "append",
   "operations": [
-    {"Upsert": {"id": {"U64": 1}, "document": {
-      "id": {"U64": 1},
-      "attributes": {"title": {"String": "The Dispossessed"}, "rating": {"Float": 4.8}},
-      "vectors": {"embedding": {"F32": [0.95, 0.05]}}
+    {"Upsert": {"id": 1, "document": {
+      "id": 1,
+      "attributes": {"title": "The Dispossessed", "rating": 4.8},
+      "vectors": {"embedding": [0.95, 0.05]}
     }}}
   ],
   "idempotency_key": "load-1"
@@ -87,7 +91,7 @@ Query — ANN with a filter:
 curl -s localhost:8080/v2/namespaces/books/query -d '{
   "kind": "single",
   "query": {
-    "filter": {"Range": {"column": "rating", "lower": {"Included": {"Float": 4.0}}, "upper": null}},
+    "filter": {"Range": {"column": "rating", "lower": {"Included": 4.0}, "upper": null}},
     "approx_vector": {"column": "embedding", "vector": [1.0, 0.0], "k": 5}
   }
 }' -H 'content-type: application/json'
