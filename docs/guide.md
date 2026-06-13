@@ -40,6 +40,24 @@ Conditional writes (`If-None-Match: *`, `If-Match: <etag>`) are enforced by
 the store itself, so several nodes can safely share one bucket. The
 filesystem backend's CAS is single-process only — fine for dev.
 
+### Local MinIO
+
+`docker-compose.yml` brings up MinIO and creates the buckets, so the S3 path is
+copy-paste:
+
+```sh
+docker compose up -d                                 # MinIO on :9000, console :9001
+export AWS_ACCESS_KEY_ID=sana AWS_SECRET_ACCESS_KEY=sana-secret
+export SANA_S3_ENDPOINT=http://127.0.0.1:9000 SANA_S3_PATH_STYLE=1
+
+cargo run --release -- serve s3://sana-dev/books     # or any CLI verb over s3://
+SANA_S3_TEST_ENDPOINT=$SANA_S3_ENDPOINT cargo test --test s3_object_store
+```
+
+The conformance suite is a no-op unless `SANA_S3_TEST_ENDPOINT` is set, and it
+creates its own bucket. The same MinIO backs the S3 row in
+[benchmarks.md](benchmarks.md).
+
 ## The service
 
 ```sh
@@ -268,11 +286,17 @@ The backing constants live in `query.rs`, `write.rs`, `api.rs`,
 ## Library
 
 The HTTP service is a thin adapter — everything is callable as a library.
-`examples/usage.rs` is the tour: create a namespace, write, `indexer::flush`,
-then filtered / exact-kNN / ANN / BM25 queries and a hybrid multi-query.
+Runnable examples:
+
+- `usage` — the end-to-end tour: write → `indexer::flush` → filtered / exact-kNN
+  / ANN / BM25 queries and a hybrid multi-query.
+- `hybrid` — a vector ranking and a BM25 ranking over one snapshot, fused
+  client-side with Reciprocal Rank Fusion (RRF).
+- `conditional` — compare-and-set writes and idempotent retries.
+- `latency` — the benchmark harness; takes a directory or an `s3://…` location.
 
 ```sh
-cargo run --example usage
+cargo run --example hybrid
 ```
 
 ## Observability

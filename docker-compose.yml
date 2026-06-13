@@ -1,0 +1,38 @@
+# MinIO: a local S3-compatible store for development and the S3 conformance
+# suite. Brings up MinIO and creates the buckets Sana uses.
+#
+#   docker compose up -d
+#   export AWS_ACCESS_KEY_ID=sana AWS_SECRET_ACCESS_KEY=sana-secret
+#   export SANA_S3_ENDPOINT=http://127.0.0.1:9000 SANA_S3_PATH_STYLE=1
+#   cargo run --release -- serve s3://sana-dev/books
+#
+# Console: http://127.0.0.1:9001 (sana / sana-secret).
+
+services:
+  minio:
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: sana
+      MINIO_ROOT_PASSWORD: sana-secret
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+
+  # One-shot: wait for MinIO, then create the dev and conformance buckets.
+  createbuckets:
+    image: minio/mc
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 sana sana-secret; do sleep 1; done;
+      mc mb -p local/sana-dev;
+      mc mb -p local/sana-conformance;
+      echo 'buckets ready: sana-dev, sana-conformance';
+      "
+
+volumes:
+  minio-data:

@@ -15,7 +15,9 @@ use std::time::Instant;
 
 use sana::indexer;
 use sana::metrics::Metrics;
-use sana::object_store::{CachingObjectStore, FsObjectStore, MeteredObjectStore, ObjectStore};
+use sana::object_store::{
+    CachingObjectStore, FsObjectStore, MeteredObjectStore, ObjectStore, S3Config, S3ObjectStore,
+};
 use sana::query::{ApproxVectorQuery, FilterExpr, Query};
 use sana::value::{Document, Id, Value, VectorValue};
 use sana::wal::WalOp;
@@ -35,13 +37,18 @@ async fn main() {
         .unwrap_or_else(|| _temp.path().to_string_lossy().into_owned());
 
     let metrics = Metrics::shared();
-    let backing: Arc<dyn ObjectStore> = Arc::new(FsObjectStore::new(&dir));
+    let backing: Arc<dyn ObjectStore> = if dir.starts_with("s3://") {
+        let config = S3Config::from_location(&dir).expect("valid s3:// location");
+        Arc::new(S3ObjectStore::from_env(config).expect("s3 store from environment"))
+    } else {
+        Arc::new(FsObjectStore::new(&dir))
+    };
     let metered: Arc<dyn ObjectStore> = Arc::new(MeteredObjectStore::new(backing, metrics.clone()));
     let store: Arc<dyn ObjectStore> =
         Arc::new(CachingObjectStore::new(metered, 256 * 1024 * 1024).with_metrics(metrics.clone()));
 
     println!("sana latency harness");
-    println!("  dir={dir}");
+    println!("  store={dir}");
     println!("  writes={writes} dim={dim} queries={queries}\n");
 
     let ns = sana::namespace::Namespace::create_or_open(store.clone(), "bench")

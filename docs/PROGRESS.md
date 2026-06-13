@@ -1162,6 +1162,12 @@ Stage 13 decisions / notes:
 
 Review-driven polish after the engine was feature-complete.
 
+- **Docs & examples.** A request/response cookbook and a limits table in the
+  guide; `examples/hybrid.rs` (RRF fusion over `multi_query`) and
+  `examples/conditional.rs` (CAS + idempotent retry); a `docker-compose.yml`
+  MinIO stack so the S3 path is copy-paste, the latency harness extended to
+  target `s3://`, and a local-MinIO row added to the benchmarks.
+
 - **MIT license.** Added `LICENSE` and `license`/`description`/`repository`
   metadata to `Cargo.toml`; the README/project page already claimed
   open-source.
@@ -1297,5 +1303,7 @@ docs/
   index.html             minimal project page (GitHub Pages serves /docs)
 examples/
   usage.rs               end-to-end library tour (write → index → 4 query shapes)
-  latency.rs             benchmark harness over the serve decorator stack
+  hybrid.rs              multi-query vector + BM25 fused client-side with RRF
+  conditional.rs         conditional (CAS) writes and idempotent retries
+  latency.rs             benchmark harness (filesystem or s3://) over the serve stack
 ```

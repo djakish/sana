@@ -46,3 +46,45 @@ put-if-absent + 15,152 compare-and-sets (18.2 MiB), zero CAS conflicts.
 - **Zero `cas_mismatches`** is the single-writer happy path; the protocol's
   value is what happens when that stops being true (crash recovery, fenced
   retries), which the test suite covers.
+
+## Local MinIO (loopback) — 2026-06-13
+
+The same harness against a local MinIO (`docker compose up -d`), so writes and
+CAS go over the real S3 protocol instead of the filesystem. 2,000 docs, 64-dim,
+500 queries per shape. **Loopback, not network S3:** there is no inter-region
+RTT, so real AWS S3 would add tens of milliseconds per round trip on top of
+these.
+
+```sh
+docker compose up -d
+export AWS_ACCESS_KEY_ID=sana AWS_SECRET_ACCESS_KEY=sana-secret
+export SANA_S3_ENDPOINT=http://127.0.0.1:9000 SANA_S3_PATH_STYLE=1
+cargo run --release --example latency -- s3://sana-dev/bench 2000 64 500
+```
+
+| Operation | p50 | p90 | p99 | throughput |
+|---|---|---|---|---|
+| write, 1 doc / WAL commit | 28.0 ms | 33.2 ms | 40.6 ms | 35 commits/s |
+| write, 100 docs / WAL commit | 29.8 ms | 35.2 ms | 40.7 ms | **3,272 docs/s** (0.31 ms/doc) |
+| flush (index 4,000 docs) | — | — | — | 7.40 s total |
+| point lookup | 1.22 ms | 1.41 ms | 2.97 ms | 762 ops/s |
+| ANN vector query (k=10) | 9.7 ms | 10.5 ms | 11.3 ms | 104 ops/s |
+| filter query (eq, limit 10) | 5.5 ms | 6.4 ms | 8.8 ms | 186 ops/s |
+
+Object-store traffic for the run: 19,164 gets (5.7 MiB), 4,052 put-if-absent +
+6,062 compare-and-sets (7.2 MiB), zero CAS conflicts.
+
+What the comparison with the filesystem table shows:
+
+- **A WAL commit is round-trip-bound, not disk-bound.** Single writes sit at
+  ~28 ms — a fixed handful of conditional round trips — and batching 100 docs
+  into one commit still amortizes to 0.31 ms/doc. (They land *below* the
+  fsync'd filesystem's 60 ms because loopback HTTP has no per-op fsync; real S3
+  adds network RTT and would be higher.)
+- **The cache covers immutable objects, not the mutable control plane.** Point
+  lookups are ~16× the filesystem's because each one still reads the mutable
+  `manifest/current` pointer and commit cursor from the backend (they bypass the
+  cache); the immutable manifest body and SST blocks are served from memory.
+- **ANN is unchanged (~9.7 ms).** Once the IVF object is cache-resident the scan
+  is in-memory, so the backend barely matters — the whole point of the
+  object-store-native + cache design.
