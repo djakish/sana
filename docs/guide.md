@@ -85,24 +85,185 @@ curl -s localhost:8080/v2/namespaces/books -d '{
 }' -H 'content-type: application/json'
 ```
 
-Query — ANN with a filter:
+Query bodies POST to `/query` and are tagged `single` or `multi`. Every write
+and query shape is in the [Cookbook](#cookbook) below. Errors come back as
+`{"error": {"code": "...", "message": "..."}}` with stable 400/404/409/429/500
+classes — see [Limits](#limits).
 
-```sh
-curl -s localhost:8080/v2/namespaces/books/query -d '{
-  "kind": "single",
-  "query": {
-    "filter": {"Range": {"column": "rating", "lower": {"Included": 4.0}, "upper": null}},
-    "approx_vector": {"column": "embedding", "vector": [1.0, 0.0], "k": 5}
-  }
-}' -H 'content-type: application/json'
+## Cookbook
+
+Every body below POSTs to the route in its heading — same `curl … -d '<body>'`
+shape as the append example above. Scalars, ids, and vectors are plain JSON; the
+`Upsert` / `Eq` / `Sum` / … tags are structural discriminators.
+
+### Writes — `POST /v2/namespaces/{ns}`
+
+Append (upsert), with an idempotency key — a repeat returns the original cursor:
+
+```json
+{"kind":"append","operations":[
+  {"Upsert":{"id":1,"document":{"id":1,
+    "attributes":{"title":"Dune","genre":"scifi","rating":4.5,"year":1965},
+    "vectors":{"embedding":[0.9,0.1]}}}}],
+ "idempotency_key":"load-1"}
 ```
 
-A multi-query (`"kind": "multi"`) runs several queries against one consistent
-snapshot — the building block for hybrid text+vector retrieval with
-client-side fusion. Errors come back as
-`{"error": {"code": "...", "message": "..."}}` with stable
-400/404/409/429/500 classes; writes past the 2 GiB unindexed-WAL budget get
-`429 backpressure`.
+Patch (a `null` attribute clears the field) and delete in one atomic batch:
+
+```json
+{"kind":"append","operations":[
+  {"Patch":{"id":1,"attributes":{"rating":4.8,"subtitle":null}}},
+  {"Delete":{"id":2}}]}
+```
+
+Conditional write — apply each op only if its per-id condition holds:
+
+```json
+{"kind":"conditional","writes":[
+  {"operation":{"Upsert":{"id":1,"document":{"id":1,"attributes":{"rating":5.0}}}},
+   "condition":{"Eq":{"column":"rating","value":4.8}}}]}
+```
+
+Patch by filter — set fields on every matching row (defaults to ≤ 50k rows):
+
+```json
+{"kind":"patch_by_filter","request":{
+  "filter":{"Eq":{"column":"genre","value":"scifi"}},
+  "attributes":{"featured":true}}}
+```
+
+Delete by filter (defaults to ≤ 5M rows):
+
+```json
+{"kind":"delete_by_filter","request":{
+  "filter":{"Range":{"column":"rating","upper":{"Excluded":3.0}}}}}
+```
+
+An append returns just the commit cursor; conditional / patch / delete also
+return an outcome:
+
+```json
+{"cursor":{"epoch":0,"seq":7},
+ "outcome":{"rows_affected":1,"rows_upserted":1,"rows_patched":0,
+            "rows_deleted":0,"applied_ids":[1]}}
+```
+
+### Queries — `POST /v2/namespaces/{ns}/query`
+
+Equality filter:
+
+```json
+{"kind":"single","query":{"filter":{"Eq":{"column":"genre","value":"scifi"}}}}
+```
+
+Range — either bound optional, `Included` or `Excluded`:
+
+```json
+{"kind":"single","query":{"filter":{"Range":{"column":"rating",
+  "lower":{"Included":4.0},"upper":{"Excluded":5.0}}}}}
+```
+
+Boolean combinators — `And` / `Or` / `Not`:
+
+```json
+{"kind":"single","query":{"filter":{"And":[
+  {"Eq":{"column":"genre","value":"scifi"}},
+  {"Not":{"Eq":{"column":"year","value":1965}}}]}}}
+```
+
+Order by an attribute (or `"Id"`) and limit:
+
+```json
+{"kind":"single","query":{
+  "order_by":{"target":{"Attribute":"rating"},"direction":"Desc"},"limit":10}}
+```
+
+Aggregates — `Count` and `Sum`:
+
+```json
+{"kind":"single","query":{"filter":{"Eq":{"column":"genre","value":"scifi"}},
+  "aggregates":["Count",{"Sum":{"column":"rating"}}]}}
+```
+
+Exact (brute-force) kNN:
+
+```json
+{"kind":"single","query":{"exact_vector":{"column":"embedding","vector":[1.0,0.0],"k":5}}}
+```
+
+Approximate kNN with a filter, explicit probes, and an L2 override:
+
+```json
+{"kind":"single","query":{
+  "filter":{"Range":{"column":"rating","lower":{"Included":4.0}}},
+  "approx_vector":{"column":"embedding","vector":[1.0,0.0],"k":5,"probes":8,"metric":"L2"}}}
+```
+
+Full-text BM25:
+
+```json
+{"kind":"single","query":{"text":{"column":"title","query":"dune","k":10}}}
+```
+
+Multi-query — several rankings over one consistent snapshot, the building block
+for hybrid retrieval (fuse client-side):
+
+```json
+{"kind":"multi","query":{"queries":[
+  {"approx_vector":{"column":"embedding","vector":[1.0,0.0],"k":10}},
+  {"text":{"column":"title","query":"dune","k":10}}]}}
+```
+
+A single response wraps rows — each with the document and, for a ranked query, a
+`score` (higher is better) — plus any aggregates:
+
+```json
+{"kind":"single","result":{
+  "rows":[{"id":1,
+    "document":{"id":1,"vectors":{"embedding":[0.9,0.1]},
+                "attributes":{"rating":4.5,"title":"Dune"}},
+    "score":-0.0123}],
+  "aggregates":[{"Count":2},
+                {"Sum":{"column":"rating","value_count":2,"total":9.3}}]}}
+```
+
+A multi response is `{"kind":"multi","result":{"results":[<single result>, …]}}`.
+
+### Metadata — `GET /v1/namespaces/{ns}/metadata`
+
+```json
+{"namespace":"books",
+ "schema":{"columns":{
+   "rating":{"column_type":{"Scalar":"Float"},"filterable":true,"indexed":true},
+   "title":{"column_type":"FullText","filterable":false,"indexed":true}},
+   "version":2},
+ "approx_logical_bytes":81920,"approx_row_count":1000,
+ "created_at_ms":1700000000000,"updated_at_ms":1700000500000,
+ "index":{"status":"updating","unindexed_bytes":4096,
+          "committed_cursor":{"epoch":0,"seq":12},
+          "indexed_cursor":{"epoch":0,"seq":9}}}
+```
+
+`status` flips to `up-to-date` once `indexed_cursor` reaches `committed_cursor`.
+
+## Limits
+
+| Limit | Default | When exceeded |
+|---|---|---|
+| Unindexed WAL per namespace | 2 GiB (per write via `options.max_unindexed_wal_bytes`) | `429 backpressure` |
+| HTTP request body | 64 MiB | `413` |
+| Query result `limit` | ≤ 10,000 | `400 invalid_request` |
+| Queries per multi-query | 16 | `400 invalid_request` |
+| Full-text query | 1,024 bytes | `400 invalid_request` |
+| Patch-by-filter match | 50,000 rows (`max_rows`) | strict: applies nothing; `allow_partial`: applies first N, sets `rows_remaining` |
+| Delete-by-filter match | 5,000,000 rows (`max_rows`) | same as patch |
+| Concurrent queries / namespace | 16 slots | `429 query_concurrency` |
+| Idempotency key | 1–256 bytes | `400 invalid_request` |
+| String id | 64 bytes | `400 invalid_request` |
+| Columns / vector columns / vector dims | 1,024 / 2 / 10,752 | `400 invalid_request` |
+
+The backing constants live in `query.rs`, `write.rs`, `api.rs`,
+`backpressure.rs`, `namespace.rs`, and `schema.rs`.
 
 ## Library
 
@@ -137,6 +298,6 @@ filtered queries, plus the true object-store traffic the run generated. See
 
 - `docs/ARCHITECTURE.md` — how the engine works today: the object-store
   boundary, on-disk layout, write/read paths, and the core invariants.
-- `docs/PROGRESS.md` — staged build log and every design decision (D1–D73).
+- `docs/PROGRESS.md` — staged build log and every design decision (D1–D74).
 - `sana --help` (no args) — the complete CLI verb list: branch, copy, export,
   pin, gc, recall, and friends.
