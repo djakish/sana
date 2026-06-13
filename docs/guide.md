@@ -131,7 +131,8 @@ filtered queries, plus the true object-store traffic the run generated. See
 
 ## More
 
-- `docs/PROGRESS.md` — staged build log, architecture notes, and every design
-  decision (D1–D73).
+- `docs/ARCHITECTURE.md` — how the engine works today: the object-store
+  boundary, on-disk layout, write/read paths, and the core invariants.
+- `docs/PROGRESS.md` — staged build log and every design decision (D1–D73).
 - `sana --help` (no args) — the complete CLI verb list: branch, copy, export,
   pin, gc, recall, and friends.

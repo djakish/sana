@@ -574,6 +574,13 @@ A high-recall review of the Stage 3–5 diff (`462f44b..HEAD`) ran after it land
   object-store module — left for a deliberate format change rather than folded
   into this cleanup. (The `splitmix64`/FNV recall sampler is hand-rolled but
   intentional and isolated; left as-is.)
+  - **Update (superseded, commit `stabilize-content-addressed-object-versions`):**
+    done, but not via blake3. `version_of` now emits **SHA-256** (`sha256-…`),
+    and the old fixed-key output is reproduced explicitly by `legacy_version_of`
+    via the `siphasher` crate (`std`'s `DefaultHasher` *is* SipHash-1-3) so
+    pre-existing keys keep validating through `ObjectVersion::matches_content`.
+    The cross-Rust-version stability concern is closed. See
+    [ARCHITECTURE.md](ARCHITECTURE.md) §1.
 
 ---
 
@@ -1166,6 +1173,11 @@ Decisions I (the implementer) made; the user delegated architectural calls.
   non-issue because the only CAS target (manifest pointer) strictly increases
   its generation, so content never repeats. `DefaultHasher::new()` has a fixed
   seed → versions are stable across runs.
+  - **Superseded:** the original used `DefaultHasher`, whose algorithm `std`
+    does not guarantee stable across Rust versions. `version_of` is now
+    **SHA-256**; the old SipHash-1-3 output is pinned via the `siphasher` crate
+    as `legacy_version_of` and still accepted. See the Stage 3–5 follow-up note
+    and [ARCHITECTURE.md](ARCHITECTURE.md) §1.
 - **D4 — FS CAS via single in-process lock + atomic rename.** Correct for
   single-process local dev (which is all early Sana needs). Crash-safe via
   temp-file + `rename`. **Limitation:** not safe across OS processes; real
