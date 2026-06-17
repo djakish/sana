@@ -124,7 +124,8 @@ immutable body. The body (`NamespaceManifest`, pretty JSON, deterministic via
 
 Indexing publishes by writing immutable objects first, then **CAS-advancing**
 `manifest/current` to a new generation. A lost CAS leaves orphaned immutable
-objects that GC reclaims — never corruption.
+objects that operator GC can report and reclaim after an external safety check —
+never corruption.
 
 ---
 
@@ -226,10 +227,11 @@ These hold everywhere and are the reason the moving parts compose:
 - **Catalog-last publication.** Immutable objects are written before the manifest
   CAS that references them; `export` writes its `catalog.json` last. A reader
   therefore never sees a catalog pointing at a missing object.
-- **Two-pass deferred GC.** `serve` deletes an orphan only after it was seen
-  orphaned on the *previous* pass, giving in-flight readers ≥ one full
-  maintenance interval to drain (the single-writer-quiescence stand-in for a
-  reader watermark).
+- **GC fail-closed.** Automatic deletion is disabled by default. `sana gc`
+  reports orphaned immutable objects as a dry-run, and `sana gc --apply` remains
+  an operator action for controlled quiescent deployments. The legacy two-pass
+  maintenance GC can be explicitly enabled in-process, but production
+  multi-pod reclamation needs durable reader/publisher watermarks before delete.
 - **Epoch fail-closed.** WAL epoch rotation is unimplemented; overlay/flush/GC
   compare full cursors and reject cross-epoch ranges rather than risk a silent
   stale read.
@@ -254,9 +256,10 @@ authoritative cursors and doubles as the per-namespace lag metric.
 
 `sana serve` runs this itself: an embedded indexing worker (poll, lease,
 heartbeat, retry; reconcile every 30 s) plus a maintenance loop (every 60 s:
-threshold-driven compaction *or* vector maintenance, then two-pass GC). A default
-single-process deployment is self-indexing and self-maintaining; external workers
-can still be added for scale because the queue is durable and fenced.
+threshold-driven compaction *or* vector maintenance; automatic GC is off by
+default). A default single-process deployment is self-indexing and keeps index
+shape maintained; external workers can still be added for scale because the
+queue is durable and fenced.
 
 ---
 
@@ -303,7 +306,7 @@ lag.
 |---|---|---|
 | Unindexed-WAL backpressure | 2 GiB (configurable) | `backpressure.rs` |
 | HTTP request body | 64 MiB | `api.rs` |
-| Max query results / `limit` | 10,000 | `query.rs` |
+| Max query results / default `limit` | 10,000 | `query.rs` |
 | Queries per multi-query | 16 | `query.rs` |
 | Full-text query length | 1 KiB | `query.rs` |
 | Patch / delete-by-filter defaults | 50k / 5M rows | `write.rs` |

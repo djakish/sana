@@ -26,7 +26,10 @@ async fn main() -> sana::Result<()> {
     }];
     let first = ns.append(ops.clone(), Some("txn-42".into())).await?;
     let retry = ns.append(ops, Some("txn-42".into())).await?;
-    println!("idempotent append: first={first:?} retry={retry:?} (equal: {})", first == retry);
+    println!(
+        "idempotent append: first={first:?} retry={retry:?} (equal: {})",
+        first == retry
+    );
 
     // Compare-and-set: raise the balance to 150 only while it is still 100.
     let applied = ns

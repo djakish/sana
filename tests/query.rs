@@ -8,14 +8,16 @@ use sana::error::Error;
 use sana::namespace::Namespace;
 use sana::object_store::{FsObjectStore, GetResult, ObjectMeta, ObjectStore, ObjectVersion};
 use sana::query::{
-    Aggregate, AggregateResult, ApproxVectorQuery, ExactVectorQuery, FilterExpr, MultiQuery,
-    OrderBy, OrderTarget, Query, QueryOptions, RangeBound, RecallRequest, SortDirection, TextQuery,
+    Aggregate, AggregateResult, ApproxVectorQuery, ExactVectorQuery, FilterExpr, MAX_QUERY_RESULTS,
+    MultiQuery, OrderBy, OrderTarget, Query, QueryOptions, RangeBound, RecallRequest,
+    SortDirection, TextQuery,
 };
 use sana::schema::DistanceMetric;
 use sana::sst::SstReader;
 use sana::text::Bm25Params;
 use sana::value::{Document, Id, Value, VectorValue};
 use sana::vector;
+use sana::wal::WalOp;
 use sana::{attr, indexer};
 use tempfile::TempDir;
 
@@ -621,6 +623,49 @@ async fn query_cardinality_limits_are_enforced() {
     });
     let error = ns.query(text).await.unwrap_err();
     assert!(matches!(error, Error::InvalidQuery(_)));
+}
+
+#[tokio::test]
+async fn omitted_limit_defaults_to_max_results_and_aggregates_count_all_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let ns = Namespace::create(store(&dir), "docs").await.unwrap();
+    let total = MAX_QUERY_RESULTS + 3;
+    let mut operations = Vec::with_capacity(total);
+    for id in 0..total {
+        let mut document = Document::new(Id::U64(id as u64));
+        document
+            .attributes
+            .insert("group".into(), Value::String("all".into()));
+        operations.push(WalOp::Upsert {
+            id: document.id.clone(),
+            document,
+        });
+    }
+    ns.append(operations, None).await.unwrap();
+
+    let mut query = Query::all();
+    query.aggregates = vec![Aggregate::Count];
+    let result = ns.query(query.clone()).await.unwrap();
+    assert_eq!(result.rows.len(), MAX_QUERY_RESULTS);
+    assert_eq!(
+        result.aggregates,
+        vec![AggregateResult::Count(total as u64)]
+    );
+
+    let multi = ns
+        .multi_query(MultiQuery {
+            queries: vec![query.clone(), query],
+        })
+        .await
+        .unwrap();
+    assert_eq!(multi.results.len(), 2);
+    for result in multi.results {
+        assert_eq!(result.rows.len(), MAX_QUERY_RESULTS);
+        assert_eq!(
+            result.aggregates,
+            vec![AggregateResult::Count(total as u64)]
+        );
+    }
 }
 
 #[tokio::test]

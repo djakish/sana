@@ -81,13 +81,14 @@ async fn main() -> sana::Result<()> {
 }
 
 /// Reciprocal Rank Fusion: each list contributes `1 / (k + rank)` to a document
-/// (rank 0-based, the canonical `k = 60`). It is scale-free, so it fuses a BM25
-/// ranking and a vector ranking without normalizing their incomparable scores.
+/// with one-based ranks (the canonical `k = 60`). It is scale-free, so it fuses
+/// a BM25 ranking and a vector ranking without normalizing their incomparable
+/// scores.
 fn reciprocal_rank_fusion(rankings: &[&QueryResult], k: f64) -> Vec<(Id, f64)> {
     let mut scores: HashMap<Id, f64> = HashMap::new();
     for ranking in rankings {
         for (rank, row) in ranking.rows.iter().enumerate() {
-            *scores.entry(row.id.clone()).or_default() += 1.0 / (k + rank as f64);
+            *scores.entry(row.id.clone()).or_default() += 1.0 / (k + rank as f64 + 1.0);
         }
     }
     let mut fused: Vec<(Id, f64)> = scores.into_iter().collect();
@@ -102,6 +103,39 @@ fn print_ranking(label: &str, result: &QueryResult) {
             Some(Value::String(s)) => s.as_str(),
             _ => "",
         };
-        println!("  {}. id {:?}  {title:?}  score={:?}", rank + 1, row.id, row.score);
+        println!(
+            "  {}. id {:?}  {title:?}  score={:?}",
+            rank + 1,
+            row.id,
+            row.score
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sana::query::QueryRow;
+
+    #[test]
+    fn reciprocal_rank_fusion_uses_one_based_ranks() {
+        let ranking = QueryResult {
+            rows: vec![row(1), row(2)],
+            aggregates: Vec::new(),
+        };
+        let fused = reciprocal_rank_fusion(&[&ranking], 60.0);
+
+        assert_eq!(fused[0].0, Id::U64(1));
+        assert_eq!(fused[1].0, Id::U64(2));
+        assert!((fused[0].1 - (1.0 / 61.0)).abs() < f64::EPSILON);
+        assert!((fused[1].1 - (1.0 / 62.0)).abs() < f64::EPSILON);
+    }
+
+    fn row(id: u64) -> QueryRow {
+        QueryRow {
+            id: Id::U64(id),
+            document: Document::new(Id::U64(id)),
+            score: None,
+        }
     }
 }

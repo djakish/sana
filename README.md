@@ -16,9 +16,9 @@ clone, built in staged, documented commits.
 - Indexes — LSM document SSTs, delta-tiered attribute postings, BM25 full-text
   with rank-safe block MAXSCORE, IVF vectors with faithful RaBitQ quantization
   (SIMD kernels) and SPFresh-style local split/merge maintenance.
-- One binary — a CLI, an HTTP service with an embedded indexing worker and
-  automatic maintenance (compaction, vector upkeep, two-pass deferred GC), and
-  a Prometheus `/metrics` endpoint.
+- One binary — a CLI, an HTTP service with an embedded indexing worker,
+  automatic compaction/vector upkeep, operator GC dry-runs, and a Prometheus
+  `/metrics` endpoint.
 - Backends — local filesystem for dev; S3-compatible stores with
   server-enforced conditional writes (verified against MinIO).
 - Operations — namespace branch, cross-store copy, deterministic export,

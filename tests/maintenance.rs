@@ -72,6 +72,38 @@ async fn unindexed_namespaces_are_left_alone() {
 }
 
 #[tokio::test]
+async fn default_policy_does_not_reclaim_or_remember_gc_candidates() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(&dir);
+    let ns = Namespace::create(store.clone(), "docs").await.unwrap();
+    flushed_runs(&ns, 3).await;
+
+    let policy = MaintenancePolicy {
+        compact_at_runs: 3,
+        ..MaintenancePolicy::default()
+    };
+    let mut state = MaintenanceState::default();
+
+    let first = run_once(store.clone(), &policy, &mut state).await.unwrap();
+    assert_eq!(first.compacted, ["docs"]);
+    assert_eq!(first.gc_deleted_objects, 0);
+    assert_eq!(first.gc_pending_objects, 0);
+
+    let orphans = indexer::gc(&ns, false).await.unwrap().orphan_keys;
+    assert!(!orphans.is_empty());
+
+    let second = run_once(store.clone(), &policy, &mut state).await.unwrap();
+    assert_eq!(second.gc_deleted_objects, 0);
+    assert_eq!(second.gc_pending_objects, 0);
+    for key in &orphans {
+        store
+            .get(key)
+            .await
+            .expect("default maintenance leaves GC to operators");
+    }
+}
+
+#[tokio::test]
 async fn gc_deletes_orphans_only_after_two_consecutive_passes() {
     let dir = tempfile::tempdir().unwrap();
     let store = store(&dir);
@@ -80,6 +112,7 @@ async fn gc_deletes_orphans_only_after_two_consecutive_passes() {
 
     let policy = MaintenancePolicy {
         compact_at_runs: 3,
+        gc: true,
         ..MaintenancePolicy::default()
     };
     let mut state = MaintenanceState::default();

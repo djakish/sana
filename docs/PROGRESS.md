@@ -15,7 +15,8 @@ the next unchecked task under "Current milestone" / "Next up".
 - **Current stage:** Stage 13 (Automatic maintenance) — **done.** Stage 12's
   `S3ObjectStore` speaks real S3 with server-enforced conditional writes
   (verified live against MinIO), and `sana serve` now runs policy-driven
-  compaction, vector maintenance, and two-pass deferred GC on its own.
+  compaction and vector maintenance on its own. Automatic object deletion is
+  disabled by default until reader/publisher watermarks exist.
 - **Next up:** the engine is feature-complete for its educational goal; docs,
   a library example, benchmark notes, and the project page ship with it.
   Future work, should it continue: a turbopuffer wire-compatibility layer,
@@ -112,8 +113,8 @@ the next unchecked task under "Current milestone" / "Next up".
       env-gated MinIO conformance tests, and `s3://bucket[/prefix]` locations
       accepted by every CLI verb and `sana serve`.
 - [x] **Stage 13 — Automatic maintenance.** Policy-driven background
-      compaction, vector maintenance, and two-pass deferred GC inside
-      `sana serve`.
+      compaction and vector maintenance inside `sana serve`; GC remains an
+      explicit/dry-run-first operator action by default.
 
 ---
 
@@ -1129,8 +1130,9 @@ Stage 12 decisions / notes:
 
 ## Stage 13 — Automatic Maintenance (done)
 
-Goal: a single `sana serve` keeps its namespaces tidy — no operator cron jobs
-for compaction, vector maintenance, or GC.
+Goal: a single `sana serve` keeps its index shape tidy — no operator cron jobs
+for compaction or vector maintenance. Object reclamation stays dry-run/operator
+driven by default until a real safe point exists.
 
 - [x] `src/maintenance.rs`: `MaintenancePolicy` (run-count and vector-append
       thresholds, vector maintenance, GC toggles) + `run_once` pass over every
@@ -1138,7 +1140,8 @@ for compaction, vector maintenance, or GC.
 - [x] `api::serve` runs the maintenance loop beside the index worker
       (60-second interval, default policy).
 - [x] Tests: threshold-triggered compaction preserving data, unindexed
-      namespaces left alone, and two-pass deferred GC.
+      namespaces left alone, default GC-disabled behavior, and opt-in two-pass
+      deferred GC.
 
 Stage 13 decisions / notes:
 
@@ -1147,14 +1150,11 @@ Stage 13 decisions / notes:
   catching up): full compaction fires when doc/attr run counts or a vector
   append chain reach the policy thresholds, otherwise manifest-published
   vector split/merge tasks run — never both in one pass, since compaction
-  subsumes the append chain anyway. GC handles D4's quiescence assumption with
-  *two-pass deferred deletion*: a pass deletes only objects the previous pass
-  already saw orphaned, so an in-flight reader holding a superseded manifest
-  gets at least one full maintenance interval (60 s, far beyond any query
-  timeout) to drain. The candidate set lives in process memory; a restart
-  merely delays reclamation by one pass. Per-namespace failures land in
-  `MaintenanceReport.errors` instead of aborting the fleet pass, and
-  namespaces deleted between passes drop their candidates.
+  subsumes the append chain anyway. The legacy GC toggle is off by default:
+  two-pass deletion is only an opt-in single-process/quiescent safeguard, not a
+  production proof. Per-namespace failures land in `MaintenanceReport.errors`
+  instead of aborting the fleet pass, and namespaces deleted between passes drop
+  their candidates.
 
 ---
 
@@ -1190,6 +1190,20 @@ Review-driven polish after the engine was feature-complete.
   operations, `Eq`/`Range`/`And` filters) keep their tags — those discriminate,
   they do not annotate a scalar. No compatibility with the old tagged JSON form;
   this is a deliberate pre-1.0 break.
+- **D75 — Production-readiness hardening starts fail-closed.** Automatic online
+  GC now defaults off because TiDB-style safe reclamation requires a safe point
+  over active readers/transactions, and Delta Lake's VACUUM guidance similarly
+  warns that concurrent readers or uncommitted files can still be live. Sana
+  keeps `sana gc` as dry-run by default and leaves the legacy maintenance GC
+  behind an explicit policy flag until durable reader/publisher watermarks are
+  implemented. Query `limit: null` now means `MAX_QUERY_RESULTS` (10,000);
+  aggregates are computed over all matches before row truncation. JSON
+  attributes reject integers above `i64::MAX` rather than converting to lossy
+  `f64`, while `2^53+1` and `i64::MAX` still parse as exact Rust `i64`.
+  Existing F16/F32 vector columns canonicalize human JSON float arrays to the
+  column encoding before WAL publication, so a queried F16 document can be
+  written back unchanged through HTTP. The hybrid example's RRF helper now uses
+  one-based ranks as defined by Cormack/Clarke/Buettcher.
 
 ---
 
@@ -1257,7 +1271,7 @@ src/
     cache.rs             immutable-object byte-bounded LRU decorator
     metered.rs           ObjectStore decorator that counts backend traffic
   metrics.rs             in-process metrics registry + Prometheus rendering
-  maintenance.rs         policy-driven compaction/vector/GC background pass
+  maintenance.rs         policy-driven compaction/vector pass + opt-in GC
   manifest.rs            NamespaceManifest, ManifestPointer, SstMeta (+ codecs)
   metadata.rs            service-facing namespace/index/pinning metadata
   wal.rs                 WalCursor, WalOp, WalBatch (+ binary codec)
@@ -1295,7 +1309,7 @@ tests/
   write.rs               conditional atomicity, retries, and two-phase filters
   text.rs                tokenization, BM25, text SST round-trip
   s3_object_store.rs     env-gated S3/MinIO conformance + engine lifecycle
-  maintenance.rs         threshold compaction + two-pass deferred GC
+  maintenance.rs         threshold compaction + default-off/opt-in GC
   fixtures/              committed golden snapshots
 docs/
   guide.md               user guide (CLI, S3, HTTP API, metrics, benchmark)

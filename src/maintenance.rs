@@ -4,11 +4,12 @@
 //! One pass scans every namespace and, for fully indexed ones, runs the
 //! existing maintenance primitives in priority order: full compaction when
 //! run counts or vector append chains grow past the policy thresholds,
-//! otherwise manifest-published vector split/merge/reassign work. GC is
-//! deferred: a pass only *deletes* objects that the previous pass already saw
-//! orphaned, giving in-flight readers one full maintenance interval to drain
-//! (D73). Per-namespace failures are reported, not fatal — one wedged
-//! namespace must not stall the fleet.
+//! otherwise manifest-published vector split/merge/reassign work. Online GC is
+//! disabled by default: deleting immutable objects safely in a multi-process
+//! deployment requires durable reader/publisher watermarks, not a local timer.
+//! Operators can still opt into the legacy two-pass GC while the CLI dry-run
+//! remains available. Per-namespace failures are reported, not fatal — one
+//! wedged namespace must not stall the fleet.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -27,7 +28,11 @@ pub struct MaintenancePolicy {
     pub compact_at_vector_appends: usize,
     /// Execute manifest-published vector maintenance tasks.
     pub vector_maintenance: bool,
-    /// Reclaim orphaned objects with two-pass deferred deletion.
+    /// Reclaim orphaned objects with legacy two-pass deferred deletion.
+    ///
+    /// This is intentionally off by default. It is safe only in controlled
+    /// single-process/quiescent deployments; production GC needs a durable safe
+    /// point over readers and publishers.
     pub gc: bool,
 }
 
@@ -37,13 +42,14 @@ impl Default for MaintenancePolicy {
             compact_at_runs: 8,
             compact_at_vector_appends: 4,
             vector_maintenance: true,
-            gc: true,
+            gc: false,
         }
     }
 }
 
-/// Cross-pass memory for deferred GC: the orphans each namespace showed on the
-/// previous pass. An object is deleted only when two consecutive scans agree.
+/// Cross-pass memory for opt-in deferred GC: the orphans each namespace showed
+/// on the previous pass. An object is deleted only when two consecutive scans
+/// agree.
 #[derive(Debug, Default)]
 pub struct MaintenanceState {
     gc_candidates: BTreeMap<String, BTreeSet<String>>,

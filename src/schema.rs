@@ -65,6 +65,28 @@ pub struct Schema {
 }
 
 impl Schema {
+    /// Canonicalize wire vector values for columns that already have a schema.
+    ///
+    /// Human-readable JSON represents both F32 and F16 vectors as float arrays,
+    /// so deserialization produces `VectorValue::F32`. Before validation and
+    /// WAL publication, an existing vector column's schema decides the storage
+    /// encoding. New vector columns keep their deserialized representation and
+    /// therefore infer F32 unless a library caller supplied `VectorValue::F16`.
+    pub fn coerce_vectors_for_existing_columns(&self, ops: &mut [WalOp]) -> Result<()> {
+        for op in ops {
+            match op {
+                WalOp::Upsert { document, .. } => {
+                    self.coerce_vector_map(&mut document.vectors)?;
+                }
+                WalOp::Patch { vectors, .. } => {
+                    self.coerce_vector_map(vectors)?;
+                }
+                WalOp::Delete { .. } => {}
+            }
+        }
+        Ok(())
+    }
+
     /// Infer new columns and validate all typed values in an atomic WAL batch.
     ///
     /// Sana starts strict: once a column is inferred, later writes must keep the
@@ -109,6 +131,18 @@ impl Schema {
                 .ok_or_else(|| Error::InvalidSchema("schema version overflow".into()))?;
         }
         Ok(changed)
+    }
+
+    fn coerce_vector_map(&self, vectors: &mut BTreeMap<String, VectorValue>) -> Result<()> {
+        for (name, vector) in vectors {
+            let Some(spec) = self.columns.get(name) else {
+                continue;
+            };
+            if let ColumnType::Vector { encoding, .. } = spec.column_type {
+                coerce_vector_encoding(name, vector, encoding)?;
+            }
+        }
+        Ok(())
     }
 
     fn infer_and_validate_document(&mut self, document: &Document) -> Result<bool> {
@@ -409,6 +443,48 @@ fn infer_vector_type(name: &str, vector: &VectorValue) -> Result<ColumnType> {
                 encoding: VectorEncoding::F16,
                 metric: DistanceMetric::Cosine,
             })
+        }
+    }
+}
+
+fn coerce_vector_encoding(
+    name: &str,
+    vector: &mut VectorValue,
+    encoding: VectorEncoding,
+) -> Result<()> {
+    match (encoding, &*vector) {
+        (VectorEncoding::F32, VectorValue::F32(_)) | (VectorEncoding::F16, VectorValue::F16(_)) => {
+            Ok(())
+        }
+        (VectorEncoding::F32, VectorValue::F16(values)) => {
+            *vector = VectorValue::F32(
+                values
+                    .iter()
+                    .map(|bits| half::f16::from_bits(*bits).to_f32())
+                    .collect(),
+            );
+            Ok(())
+        }
+        (VectorEncoding::F16, VectorValue::F32(values)) => {
+            if values.iter().any(|value| !value.is_finite()) {
+                return Err(Error::InvalidSchema(format!(
+                    "vector column '{name}' contains a non-finite f32"
+                )));
+            }
+            let bits: Vec<u16> = values
+                .iter()
+                .map(|value| half::f16::from_f32(*value).to_bits())
+                .collect();
+            if bits
+                .iter()
+                .any(|bits| !half::f16::from_bits(*bits).is_finite())
+            {
+                return Err(Error::InvalidSchema(format!(
+                    "vector column '{name}' cannot represent value as finite f16"
+                )));
+            }
+            *vector = VectorValue::F16(bits);
+            Ok(())
         }
     }
 }

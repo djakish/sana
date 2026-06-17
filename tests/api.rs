@@ -274,6 +274,98 @@ async fn http_conditional_and_filter_writes_return_outcomes() {
 }
 
 #[tokio::test]
+async fn http_vector_json_round_trips_existing_f16_and_f32_columns() {
+    let dir = tempfile::tempdir().unwrap();
+    let object_store = store(&dir);
+    let app = router(object_store.clone());
+
+    let half_ns = Namespace::create(object_store.clone(), "half")
+        .await
+        .unwrap();
+    let mut half_doc = Document::new(Id::U64(1));
+    half_doc.vectors.insert(
+        "embedding".into(),
+        VectorValue::F16(vec![
+            half::f16::from_f32(1.0).to_bits(),
+            half::f16::from_f32(0.5).to_bits(),
+        ]),
+    );
+    half_ns.upsert(half_doc).await.unwrap();
+
+    let query = QueryRequest::Single {
+        query: Box::new(Query::all()),
+        options: QueryOptions::default(),
+    };
+    let response = request(
+        &app,
+        Method::POST,
+        "/v2/namespaces/half/query",
+        Some(serde_json::to_vec(&query).unwrap()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let returned = match json_body::<QueryResponse>(response).await {
+        QueryResponse::Single(result) => result.rows[0].document.clone(),
+        QueryResponse::Multi(_) => panic!("expected single-query response"),
+    };
+    assert!(matches!(returned.vectors["embedding"], VectorValue::F32(_)));
+
+    let write = WriteRequest::Append {
+        operations: vec![WalOp::Upsert {
+            id: returned.id.clone(),
+            document: returned,
+        }],
+        idempotency_key: None,
+        options: WriteOptions::default(),
+    };
+    let response = request(
+        &app,
+        Method::POST,
+        "/v2/namespaces/half",
+        Some(serde_json::to_vec(&write).unwrap()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let stored = half_ns.lookup(&Id::U64(1)).await.unwrap().unwrap();
+    assert!(matches!(stored.vectors["embedding"], VectorValue::F16(_)));
+
+    let float_ns = Namespace::create(object_store.clone(), "float")
+        .await
+        .unwrap();
+    float_ns.upsert(document(1)).await.unwrap();
+    let response = request(
+        &app,
+        Method::POST,
+        "/v2/namespaces/float/query",
+        Some(serde_json::to_vec(&query).unwrap()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let returned = match json_body::<QueryResponse>(response).await {
+        QueryResponse::Single(result) => result.rows[0].document.clone(),
+        QueryResponse::Multi(_) => panic!("expected single-query response"),
+    };
+    let write = WriteRequest::Append {
+        operations: vec![WalOp::Upsert {
+            id: returned.id.clone(),
+            document: returned,
+        }],
+        idempotency_key: None,
+        options: WriteOptions::default(),
+    };
+    let response = request(
+        &app,
+        Method::POST,
+        "/v2/namespaces/float",
+        Some(serde_json::to_vec(&write).unwrap()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let stored = float_ns.lookup(&Id::U64(1)).await.unwrap().unwrap();
+    assert!(matches!(stored.vectors["embedding"], VectorValue::F32(_)));
+}
+
+#[tokio::test]
 async fn http_errors_use_stable_status_and_json_envelopes() {
     let dir = tempfile::tempdir().unwrap();
     Namespace::create(store(&dir), "bounded").await.unwrap();

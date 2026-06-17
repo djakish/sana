@@ -30,12 +30,15 @@ coordination around maintenance and object deletion.
 
 ## P0: Safe object reclamation
 
-**Status:** automatic GC is not safe for a multi-process deployment.
+**Status:** automatic deletion is disabled by default. The legacy two-pass GC
+path remains unsafe for a multi-process deployment unless explicitly opted into
+for controlled single-process/quiescent use.
 
 Current code:
 
-- [`maintenance.rs`](../src/maintenance.rs#L65-L151) remembers orphan
-  candidates only in process memory and deletes an object after two scans.
+- [`maintenance.rs`](../src/maintenance.rs#L65-L151) keeps legacy GC behind
+  `MaintenancePolicy::gc`; when enabled, it remembers orphan candidates only in
+  process memory and deletes an object after two scans.
 - [`indexer.rs`](../src/indexer.rs#L822-L913) computes liveness from only the
   current manifest and explicitly assumes quiescence.
 - Publishers write immutable objects before publishing their manifest:
@@ -66,7 +69,7 @@ still holds the old generation.
 
 ### Required work
 
-- [ ] Disable automatic online GC by default. Keep dry-run reporting available.
+- [x] Disable automatic online GC by default. Keep dry-run reporting available.
 - [ ] Add a durable reader-generation lease or watermark per query pod.
 - [ ] Include active publishers in the reclamation safety calculation.
 - [ ] Delete only below a computed safe generation, never only because two
@@ -282,7 +285,9 @@ Possible building blocks:
 
 ## P1: Enforce a real query result bound
 
-**Status:** `MAX_QUERY_RESULTS` applies only when the caller supplies `limit`.
+**Status:** `MAX_QUERY_RESULTS` is now the effective default when `limit` is
+omitted. Query aggregates are computed over all matches before the returned row
+page is truncated.
 
 [`execute_with_snapshot`](../src/query.rs#L330-L419) rejects
 `limit > 10_000`, but `limit: null` returns every matching document.
@@ -297,17 +302,18 @@ Possible building blocks:
 
 ### Required work
 
-- [ ] Define an effective default limit, initially `MAX_QUERY_RESULTS`.
-- [ ] Apply it to every query path, including ordinary, text, vector, and
+- [x] Define an effective default limit, initially `MAX_QUERY_RESULTS`.
+- [x] Apply it to every query path, including ordinary, text, vector, and
       multi-query responses.
-- [ ] Keep aggregate semantics explicit: aggregate over all matches or only the
+- [x] Keep aggregate semantics explicit: aggregate over all matches or only the
       returned page.
 - [ ] Add cursor-based pagination before advertising full scans over HTTP.
-- [ ] Test omitted limits and multi-query worst cases.
+- [x] Test omitted limits and multi-query worst cases.
 
 ## P1: Do not silently lose integer precision
 
-**Status:** JSON integers above `i64::MAX` silently become `f64`.
+**Status:** JSON integers above `i64::MAX` are rejected instead of being
+silently converted to `f64`.
 
 [`ValueVisitor::visit_u64`](../src/value.rs#L270-L279) converts an out-of-range
 `u64` with `v as f64`. Many such integers cannot be represented exactly.
@@ -322,11 +328,11 @@ Possible building blocks:
 
 ### Required work
 
-- [ ] Choose one explicit contract:
+- [x] Choose one explicit contract:
       add `Value::UInt(u64)`, reject values above `i64::MAX`, or require a
       string representation.
-- [ ] Never silently convert an integer to a lossy float.
-- [ ] Add boundary tests around `2^53`, `i64::MAX`, and `u64::MAX`.
+- [x] Never silently convert an integer to a lossy float.
+- [x] Add boundary tests around `2^53`, `i64::MAX`, and `u64::MAX`.
 
 RFC 8259 identifies `[-(2^53)+1, (2^53)-1]` as the interoperable exact integer
 range for common JSON implementations:
@@ -334,7 +340,9 @@ range for common JSON implementations:
 
 ## P1: Make F16 JSON writes schema-aware
 
-**Status:** F16 vectors serialize as plain floats but deserialize as F32.
+**Status:** F16 vectors serialize as plain floats; JSON writes now treat that
+float array as a wire vector and coerce it to the existing column's schema
+before WAL publication.
 
 - F16 JSON serialization emits a float array:
   [`value.rs`](../src/value.rs#L343-L364).
@@ -352,10 +360,10 @@ range for common JSON implementations:
 
 ### Required work
 
-- [ ] Parse HTTP vectors into a neutral wire representation such as `Vec<f32>`.
-- [ ] Convert to F16 or F32 using the existing column schema before validation.
-- [ ] Infer F32 only when creating a new vector column without an explicit schema.
-- [ ] Add HTTP round-trip tests for both F16 and F32 columns.
+- [x] Parse HTTP vectors into a neutral wire representation such as `Vec<f32>`.
+- [x] Convert to F16 or F32 using the existing column schema before validation.
+- [x] Infer F32 only when creating a new vector column without an explicit schema.
+- [x] Add HTTP round-trip tests for both F16 and F32 columns.
 
 ## P2: Connect pinning to request routing
 
@@ -388,8 +396,8 @@ cache locality: [turbopuffer architecture](https://turbopuffer.com/docs/architec
 rankings as permutations over `1..|D|`, so the first result should contribute
 `1 / (k + 1)`, not `1 / k`.
 
-- [ ] Use `1.0 / (k + rank as f64 + 1.0)`.
-- [ ] Add a small deterministic unit test.
+- [x] Use `1.0 / (k + rank as f64 + 1.0)`.
+- [x] Add a small deterministic unit test.
 
 Source: [Cormack, Clarke, and Buettcher, Reciprocal Rank Fusion](https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf).
 

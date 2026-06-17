@@ -333,11 +333,7 @@ async fn execute_with_snapshot(
     commit: WalCursor,
     query: Query,
 ) -> Result<QueryResult> {
-    if query.limit.is_some_and(|limit| limit > MAX_QUERY_RESULTS) {
-        return Err(Error::InvalidQuery(format!(
-            "query limit cannot exceed {MAX_QUERY_RESULTS}"
-        )));
-    }
+    let effective_limit = effective_query_limit(query.limit)?;
     if query.exact_vector.is_some() && query.approx_vector.is_some() {
         return Err(Error::InvalidQuery(
             "query cannot specify both exact_vector and approx_vector".into(),
@@ -361,7 +357,7 @@ async fn execute_with_snapshot(
             commit,
             text_query,
             query.filter.as_ref(),
-            query.limit,
+            effective_limit,
             &query.aggregates,
         )
         .await;
@@ -377,7 +373,7 @@ async fn execute_with_snapshot(
             commit,
             ann_query,
             query.filter.as_ref(),
-            query.limit,
+            Some(effective_limit),
         )
         .await;
     }
@@ -409,9 +405,7 @@ async fn execute_with_snapshot(
         .query_rank
         .observe(rank_start.elapsed());
 
-    if let Some(limit) = query.limit {
-        candidates.truncate(limit);
-    }
+    candidates.truncate(effective_limit);
 
     Ok(QueryResult {
         rows: candidates,
@@ -425,13 +419,13 @@ async fn execute_text(
     commit: WalCursor,
     text_query: &TextQuery,
     filter: Option<&FilterExpr>,
-    limit: Option<usize>,
+    limit: usize,
     aggregates: &[Aggregate],
 ) -> Result<QueryResult> {
     validate_text_query(manifest, text_query)?;
     incr(&ns.metrics().search.text_queries);
 
-    let effective_limit = limit.unwrap_or(text_query.k).min(text_query.k);
+    let effective_limit = limit.min(text_query.k);
     let top_k = if filter.is_none() && aggregates.is_empty() {
         Some(effective_limit)
     } else {
@@ -951,7 +945,17 @@ async fn exact_vector_fallback(
 /// Rows to keep for a vector query: the top `k`, further capped by an explicit
 /// `limit` when the caller asked for fewer than `k`.
 fn keep_count(k: usize, limit: Option<usize>) -> usize {
-    limit.map_or(k, |limit| limit.min(k))
+    limit.unwrap_or(MAX_QUERY_RESULTS).min(k)
+}
+
+fn effective_query_limit(limit: Option<usize>) -> Result<usize> {
+    match limit {
+        Some(limit) if limit > MAX_QUERY_RESULTS => Err(Error::InvalidQuery(format!(
+            "query limit cannot exceed {MAX_QUERY_RESULTS}"
+        ))),
+        Some(limit) => Ok(limit),
+        None => Ok(MAX_QUERY_RESULTS),
+    }
 }
 
 /// Score, prune, sort, and truncate `candidates` for an exact (rerank) vector

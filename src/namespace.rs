@@ -1389,7 +1389,17 @@ impl Namespace {
     }
 
     async fn validate_ops_for_current_schema(&self, operations: &[WalOp]) -> Result<()> {
+        let mut operations = operations.to_vec();
+        self.canonicalize_and_validate_ops_for_current_schema(&mut operations)
+            .await
+    }
+
+    async fn canonicalize_and_validate_ops_for_current_schema(
+        &self,
+        operations: &mut [WalOp],
+    ) -> Result<()> {
         let mut schema = self.load_manifest().await?.schema;
+        schema.coerce_vectors_for_existing_columns(operations)?;
         schema.infer_and_validate_ops(operations)?;
         Ok(())
     }
@@ -1404,7 +1414,8 @@ impl Namespace {
         // schema. A concurrent writer must reserve the commit state before
         // publishing its schema change, so a successful reservation fences
         // schema evolution until this request commits or is aborted.
-        self.validate_ops_for_current_schema(&prepared.operations)
+        let mut operations = prepared.operations;
+        self.canonicalize_and_validate_ops_for_current_schema(&mut operations)
             .await?;
 
         let next_seq = state
@@ -1413,13 +1424,13 @@ impl Namespace {
             .checked_add(1)
             .ok_or_else(|| Error::InvalidWrite("WAL sequence exhausted".into()))?;
         let next = WalCursor::new(state.committed.epoch, next_seq);
-        let wal_fingerprint = request_fingerprint(&prepared.operations)?;
+        let wal_fingerprint = request_fingerprint(&operations)?;
         let batch = WalBatch {
             namespace: self.name.clone(),
             sequence: next.seq,
             created_at_ms: now_ms(),
             idempotency_key: prepared.idempotency_key.clone(),
-            operations: prepared.operations,
+            operations,
         };
         let encoded = batch.encode()?;
         let wal_size_bytes = u64::try_from(encoded.len())

@@ -3,8 +3,8 @@
 Sana is an object-storage-native search database: vectors (IVF + RaBitQ),
 full-text (BM25), and attribute filters over documents whose only durable home
 is an object store — a local directory or S3. One binary gives you a CLI, an
-HTTP service with a built-in indexing worker and automatic maintenance, and a
-Rust library.
+HTTP service with a built-in indexing worker, automatic compaction/vector
+maintenance, operator GC dry-runs, and a Rust library.
 
 > This is an AI-assisted educational project (a turbopuffer-inspired clone).
 > Don't run your production on it.
@@ -233,7 +233,9 @@ for hybrid retrieval (fuse client-side):
 ```
 
 A single response wraps rows — each with the document and, for a ranked query, a
-`score` (higher is better) — plus any aggregates:
+`score` (higher is better) — plus any aggregates. If `limit` is omitted, Sana
+returns at most 10,000 rows. Aggregates are computed over every matched row
+before that returned page is truncated:
 
 ```json
 {"kind":"single","result":{
@@ -270,7 +272,7 @@ A multi response is `{"kind":"multi","result":{"results":[<single result>, …]}
 |---|---|---|
 | Unindexed WAL per namespace | 2 GiB (per write via `options.max_unindexed_wal_bytes`) | `429 backpressure` |
 | HTTP request body | 64 MiB | `413` |
-| Query result `limit` | ≤ 10,000 | `400 invalid_request` |
+| Query result `limit` | default 10,000; explicit value must be ≤ 10,000 | `400 invalid_request` |
 | Queries per multi-query | 16 | `400 invalid_request` |
 | Full-text query | 1,024 bytes | `400 invalid_request` |
 | Patch-by-filter match | 50,000 rows (`max_rows`) | strict: applies nothing; `allow_partial`: applies first N, sets `rows_remaining` |

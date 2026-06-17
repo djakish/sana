@@ -271,11 +271,10 @@ impl<'de> Visitor<'de> for ValueVisitor {
         Ok(Value::Int(v))
     }
 
-    fn visit_u64<E>(self, v: u64) -> Result<Value, E> {
-        // Value::Int is i64; a u64 past its range degrades to Float, not error.
-        Ok(i64::try_from(v)
-            .map(Value::Int)
-            .unwrap_or_else(|_| Value::Float(v as f64)))
+    fn visit_u64<E: de::Error>(self, v: u64) -> Result<Value, E> {
+        i64::try_from(v).map(Value::Int).map_err(|_| {
+            E::custom("integer attribute exceeds i64::MAX; store wider integers as strings")
+        })
     }
 
     fn visit_f64<E>(self, v: f64) -> Result<Value, E> {
@@ -346,8 +345,10 @@ impl Serialize for VectorValue {
             match self {
                 VectorValue::F32(v) => v.serialize(serializer),
                 VectorValue::F16(v) => {
-                    let floats: Vec<f32> =
-                        v.iter().map(|bits| half::f16::from_bits(*bits).to_f32()).collect();
+                    let floats: Vec<f32> = v
+                        .iter()
+                        .map(|bits| half::f16::from_bits(*bits).to_f32())
+                        .collect();
                     floats.serialize(serializer)
                 }
             }
@@ -399,10 +400,16 @@ mod tests {
         assert_eq!(serde_json::to_string(&Value::Bool(true)).unwrap(), "true");
         assert_eq!(serde_json::to_string(&Value::Int(7)).unwrap(), "7");
         assert_eq!(serde_json::to_string(&Value::Float(4.5)).unwrap(), "4.5");
-        assert_eq!(serde_json::to_string(&Value::String("hi".into())).unwrap(), "\"hi\"");
         assert_eq!(
-            serde_json::to_string(&Value::Array(vec![Value::Int(1), Value::String("a".into())]))
-                .unwrap(),
+            serde_json::to_string(&Value::String("hi".into())).unwrap(),
+            "\"hi\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Value::Array(vec![
+                Value::Int(1),
+                Value::String("a".into())
+            ]))
+            .unwrap(),
             "[1,\"a\"]"
         );
     }
@@ -410,22 +417,55 @@ mod tests {
     #[test]
     fn value_json_round_trips_and_keeps_int_float_distinction() {
         assert_eq!(serde_json::from_str::<Value>("4").unwrap(), Value::Int(4));
-        assert_eq!(serde_json::from_str::<Value>("4.0").unwrap(), Value::Float(4.0));
-        assert_eq!(serde_json::from_str::<Value>("\"x\"").unwrap(), Value::String("x".into()));
-        assert_eq!(serde_json::from_str::<Value>("true").unwrap(), Value::Bool(true));
+        assert_eq!(
+            serde_json::from_str::<Value>("4.0").unwrap(),
+            Value::Float(4.0)
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>("\"x\"").unwrap(),
+            Value::String("x".into())
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>("true").unwrap(),
+            Value::Bool(true)
+        );
         assert_eq!(serde_json::from_str::<Value>("null").unwrap(), Value::Null);
         assert_eq!(
             serde_json::from_str::<Value>("[1, \"a\", false]").unwrap(),
-            Value::Array(vec![Value::Int(1), Value::String("a".into()), Value::Bool(false)])
+            Value::Array(vec![
+                Value::Int(1),
+                Value::String("a".into()),
+                Value::Bool(false)
+            ])
         );
+    }
+
+    #[test]
+    fn value_json_rejects_unsigned_integers_outside_i64_range() {
+        assert_eq!(
+            serde_json::from_str::<Value>("9007199254740993").unwrap(),
+            Value::Int(9_007_199_254_740_993)
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>("9223372036854775807").unwrap(),
+            Value::Int(i64::MAX)
+        );
+        assert!(serde_json::from_str::<Value>("9223372036854775808").is_err());
+        assert!(serde_json::from_str::<Value>("18446744073709551615").is_err());
     }
 
     #[test]
     fn id_json_is_plain_and_round_trips() {
         assert_eq!(serde_json::to_string(&Id::U64(1)).unwrap(), "1");
-        assert_eq!(serde_json::to_string(&Id::String("doc-1".into())).unwrap(), "\"doc-1\"");
+        assert_eq!(
+            serde_json::to_string(&Id::String("doc-1".into())).unwrap(),
+            "\"doc-1\""
+        );
         assert_eq!(serde_json::from_str::<Id>("1").unwrap(), Id::U64(1));
-        assert_eq!(serde_json::from_str::<Id>("\"doc-1\"").unwrap(), Id::String("doc-1".into()));
+        assert_eq!(
+            serde_json::from_str::<Id>("\"doc-1\"").unwrap(),
+            Id::String("doc-1".into())
+        );
     }
 
     #[test]
@@ -454,7 +494,10 @@ mod tests {
             VectorValue::F32(vec![1.0, 2.5])
         );
         let one = half::f16::from_f32(1.0).to_bits();
-        assert_eq!(serde_json::to_string(&VectorValue::F16(vec![one])).unwrap(), "[1.0]");
+        assert_eq!(
+            serde_json::to_string(&VectorValue::F16(vec![one])).unwrap(),
+            "[1.0]"
+        );
     }
 
     #[test]
@@ -474,7 +517,10 @@ mod tests {
             let bytes = postcard::to_allocvec(&id).unwrap();
             assert_eq!(postcard::from_bytes::<Id>(&bytes).unwrap(), id);
         }
-        for vector in [VectorValue::F32(vec![1.0, 2.0]), VectorValue::F16(vec![1, 2])] {
+        for vector in [
+            VectorValue::F32(vec![1.0, 2.0]),
+            VectorValue::F16(vec![1, 2]),
+        ] {
             let bytes = postcard::to_allocvec(&vector).unwrap();
             assert_eq!(postcard::from_bytes::<VectorValue>(&bytes).unwrap(), vector);
         }
@@ -483,7 +529,10 @@ mod tests {
     #[test]
     fn binary_branch_keeps_the_tagged_discriminant() {
         assert_eq!(postcard::to_allocvec(&Value::Null).unwrap(), vec![0]);
-        assert_eq!(postcard::to_allocvec(&Value::Bool(true)).unwrap(), vec![1, 1]);
+        assert_eq!(
+            postcard::to_allocvec(&Value::Bool(true)).unwrap(),
+            vec![1, 1]
+        );
         assert_eq!(postcard::to_allocvec(&Id::U64(1)).unwrap(), vec![0, 1]);
     }
 }
