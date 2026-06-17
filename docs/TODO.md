@@ -212,11 +212,15 @@ traffic:
 
 ## P0: Kubernetes lifecycle and health
 
-**Status:** shutdown and health checks are not sufficient for Kubernetes.
+**Status:** HTTP roles now expose Kubernetes-style liveness/readiness probes
+and enter drain on Ctrl-C or SIGTERM. Workers finish the current tick/job before
+observing shutdown and stopping the next claim/pass.
 
-- [`shutdown_signal`](../src/main.rs#L431-L438) handles Ctrl-C but not SIGTERM.
-- [`/healthz`](../src/api.rs#L368-L370) always reports success.
-- There is no separate readiness state or drain state.
+- [`shutdown_signal`](../src/main.rs#L431-L438) handles Ctrl-C and SIGTERM.
+- [`/livez`](../src/api.rs#L368-L370) reports process liveness; `/healthz`
+  remains a liveness alias.
+- [`/readyz`](../src/api.rs#L368-L370) checks readiness state, overload, and a
+  bounded backend list.
 
 ### Failure
 
@@ -227,14 +231,14 @@ traffic:
 
 ### Required work
 
-- [ ] Handle both Ctrl-C and SIGTERM.
-- [ ] Add `/livez` for process health and `/readyz` for traffic readiness.
-- [ ] Do not make liveness fail only because S3 is temporarily unavailable.
-- [ ] Make readiness fail during startup, backend failure, overload, and drain.
-- [ ] On shutdown, become unready first and stop accepting new work.
-- [ ] Drain HTTP requests and stop claiming jobs.
-- [ ] Finish, fail, or release the current job before the termination deadline.
-- [ ] Set Kubernetes `terminationGracePeriodSeconds` from the maximum drain time.
+- [x] Handle both Ctrl-C and SIGTERM.
+- [x] Add `/livez` for process health and `/readyz` for traffic readiness.
+- [x] Do not make liveness fail only because S3 is temporarily unavailable.
+- [x] Make readiness fail during startup, backend failure, overload, and drain.
+- [x] On shutdown, become unready first and stop accepting new work.
+- [x] Drain HTTP requests and stop claiming jobs.
+- [x] Finish, fail, or release the current job before the termination deadline.
+- [x] Set Kubernetes `terminationGracePeriodSeconds` from the maximum drain time.
 
 Sources:
 

@@ -317,18 +317,19 @@ async fn maintain(args: &[String]) -> CliResult {
     let mut state = sana::maintenance::MaintenanceState::default();
     if has_flag(args, "--loop") {
         println!("running maintenance loop every {MAINTENANCE_INTERVAL_MS} ms; Ctrl-C to stop");
-        let shutdown = shutdown_signal();
-        tokio::pin!(shutdown);
+        let mut shutdown = shutdown_watcher();
         loop {
-            tokio::select! {
-                _ = &mut shutdown => return Ok(()),
-                result = run_maintenance_pass(store.clone(), &policy, &mut state) => {
-                    result?;
-                    tokio::select! {
-                        _ = &mut shutdown => return Ok(()),
-                        () = tokio::time::sleep(std::time::Duration::from_millis(MAINTENANCE_INTERVAL_MS)) => {}
-                    }
-                }
+            if *shutdown.borrow() {
+                return Ok(());
+            }
+            run_maintenance_pass(store.clone(), &policy, &mut state).await?;
+            if sleep_or_shutdown(
+                &mut shutdown,
+                std::time::Duration::from_millis(MAINTENANCE_INTERVAL_MS),
+            )
+            .await
+            {
+                return Ok(());
             }
         }
     } else {
@@ -406,14 +407,13 @@ async fn run_indexing_once(store: Arc<dyn ObjectStore>, worker_id: &str) -> CliR
 
 async fn run_indexing_loop(store: Arc<dyn ObjectStore>, worker_id: String) -> CliResult {
     let mut next_reconcile = tokio::time::Instant::now();
-    let shutdown = shutdown_signal();
-    tokio::pin!(shutdown);
+    let shutdown = shutdown_watcher();
     println!("running indexing worker {worker_id}; Ctrl-C to stop");
     loop {
-        tokio::select! {
-            _ = &mut shutdown => return Ok(()),
-            () = run_indexing_tick(store.clone(), &worker_id, &mut next_reconcile) => {}
+        if *shutdown.borrow() {
+            return Ok(());
         }
+        run_indexing_tick(store.clone(), &worker_id, &mut next_reconcile).await;
     }
 }
 
@@ -602,12 +602,52 @@ async fn run_serve_role(args: &[String], dir: &str, role: ServeRole, command: &s
 }
 
 async fn shutdown_signal() {
-    match tokio::signal::ctrl_c().await {
-        Ok(()) => println!("shutting down"),
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => {
+            if let Err(error) = result {
+                eprintln!("failed to install Ctrl-C handler: {error}");
+                std::future::pending::<()>().await;
+            }
+        }
+        () = terminate_signal() => {}
+    }
+    println!("shutting down");
+}
+
+#[cfg(unix)]
+async fn terminate_signal() {
+    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(mut signal) => {
+            signal.recv().await;
+        }
         Err(error) => {
-            eprintln!("failed to install Ctrl-C handler: {error}");
+            eprintln!("failed to install SIGTERM handler: {error}");
             std::future::pending::<()>().await;
         }
+    }
+}
+
+#[cfg(not(unix))]
+async fn terminate_signal() {
+    std::future::pending::<()>().await;
+}
+
+fn shutdown_watcher() -> tokio::sync::watch::Receiver<bool> {
+    let (sender, receiver) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        let _ = sender.send(true);
+    });
+    receiver
+}
+
+async fn sleep_or_shutdown(
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    duration: std::time::Duration,
+) -> bool {
+    tokio::select! {
+        _ = shutdown.changed() => true,
+        () = tokio::time::sleep(duration) => false,
     }
 }
 

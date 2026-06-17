@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::future::{Future, IntoFuture};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -30,12 +31,69 @@ use crate::write::{
 const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CONCURRENT_QUERY_SLOTS: usize = 16;
 const QUERY_SLOT_WAIT: Duration = Duration::from_millis(800);
+const READY_BACKEND_TIMEOUT: Duration = Duration::from_millis(500);
+const READINESS_DRAIN_DELAY: Duration = Duration::from_secs(5);
+const WORKER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 struct ApiState {
     store: Arc<dyn ObjectStore>,
     query_limiter: Arc<QueryLimiter>,
     metrics: Arc<Metrics>,
+    health: Arc<HealthState>,
+}
+
+#[derive(Debug)]
+pub struct HealthState {
+    ready: AtomicBool,
+    draining: AtomicBool,
+    drain_notify: tokio::sync::Notify,
+}
+
+impl HealthState {
+    fn ready() -> Self {
+        Self {
+            ready: AtomicBool::new(true),
+            draining: AtomicBool::new(false),
+            drain_notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn starting() -> Self {
+        Self {
+            ready: AtomicBool::new(false),
+            draining: AtomicBool::new(false),
+            drain_notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn mark_ready(&self) {
+        self.ready.store(true, Ordering::SeqCst);
+    }
+
+    fn begin_drain(&self) {
+        self.draining.store(true, Ordering::SeqCst);
+        self.ready.store(false, Ordering::SeqCst);
+        self.drain_notify.notify_waiters();
+    }
+
+    fn accepts_traffic(&self) -> bool {
+        self.ready.load(Ordering::SeqCst) && !self.draining.load(Ordering::SeqCst)
+    }
+
+    fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::SeqCst)
+    }
+
+    async fn wait_for_drain(&self) {
+        loop {
+            let notified = self.drain_notify.notified();
+            if self.is_draining() {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 struct QueryLimiter {
@@ -89,6 +147,15 @@ impl QueryLimiter {
                 ),
             }),
         }
+    }
+
+    async fn overloaded(&self) -> bool {
+        let mut namespaces = self.namespaces.lock().await;
+        namespaces.retain(|_, semaphore| semaphore.strong_count() > 0);
+        namespaces
+            .values()
+            .filter_map(Weak::upgrade)
+            .any(|semaphore| semaphore.available_permits() == 0)
     }
 }
 
@@ -249,8 +316,18 @@ pub fn router(store: Arc<dyn ObjectStore>) -> Router {
 }
 
 pub fn router_with_metrics(store: Arc<dyn ObjectStore>, metrics: Arc<Metrics>) -> Router {
+    router_with_metrics_and_health(store, metrics, Arc::new(HealthState::ready()))
+}
+
+fn router_with_metrics_and_health(
+    store: Arc<dyn ObjectStore>,
+    metrics: Arc<Metrics>,
+    health: Arc<HealthState>,
+) -> Router {
     Router::new()
-        .route("/healthz", get(health))
+        .route("/healthz", get(livez))
+        .route("/livez", get(livez))
+        .route("/readyz", get(readyz))
         .route("/metrics", get(metrics_endpoint))
         .route("/v2/namespaces/{namespace}", post(write))
         .route("/v2/namespaces/{namespace}/query", post(query))
@@ -268,6 +345,7 @@ pub fn router_with_metrics(store: Arc<dyn ObjectStore>, metrics: Arc<Metrics>) -
                 QUERY_SLOT_WAIT,
             )),
             metrics,
+            health,
         })
 }
 
@@ -282,8 +360,11 @@ pub async fn serve_api_with_shutdown(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(address).await?;
-    axum::serve(listener, router_with_metrics(store, metrics))
-        .with_graceful_shutdown(shutdown)
+    let health = Arc::new(HealthState::starting());
+    let router = router_with_metrics_and_health(store, metrics, health.clone());
+    health.mark_ready();
+    axum::serve(listener, router)
+        .with_graceful_shutdown(drain_on_shutdown(health, shutdown))
         .await
 }
 
@@ -294,30 +375,39 @@ pub async fn serve_with_shutdown(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(address).await?;
-    let server = axum::serve(
-        listener,
-        router_with_metrics(store.clone(), metrics.clone()),
-    )
-    .with_graceful_shutdown(shutdown)
-    .into_future();
+    let health = Arc::new(HealthState::starting());
+    let router = router_with_metrics_and_health(store.clone(), metrics.clone(), health.clone());
+    health.mark_ready();
+    let server = axum::serve(listener, router)
+        .with_graceful_shutdown(drain_on_shutdown(health.clone(), shutdown))
+        .into_future();
     let worker = async {
+        let worker_health = health.clone();
         tokio::join!(
-            run_index_worker(store.clone(), metrics),
-            run_maintenance_loop(store),
+            run_index_worker(store.clone(), metrics, worker_health.clone()),
+            run_maintenance_loop(store, worker_health),
         );
     };
-    run_server_and_worker(server, worker).await
+    run_server_and_worker(server, worker, WORKER_DRAIN_TIMEOUT).await
+}
+
+async fn drain_on_shutdown(health: Arc<HealthState>, shutdown: impl Future<Output = ()>) {
+    shutdown.await;
+    health.begin_drain();
+    tokio::time::sleep(READINESS_DRAIN_DELAY).await;
 }
 
 /// Background maintenance: one policy pass per interval. The default policy
 /// compacts and maintains vector topology but does not delete orphaned objects.
-async fn run_maintenance_loop(store: Arc<dyn ObjectStore>) {
+async fn run_maintenance_loop(store: Arc<dyn ObjectStore>, health: Arc<HealthState>) {
     const MAINTENANCE_INTERVAL_MS: u64 = 60_000;
 
     let policy = crate::maintenance::MaintenancePolicy::default();
     let mut state = crate::maintenance::MaintenanceState::default();
     loop {
-        tokio::time::sleep(Duration::from_millis(MAINTENANCE_INTERVAL_MS)).await;
+        if sleep_or_drain(&health, Duration::from_millis(MAINTENANCE_INTERVAL_MS)).await {
+            return;
+        }
         match crate::maintenance::run_once(store.clone(), &policy, &mut state).await {
             Ok(report) => {
                 for error in &report.errors {
@@ -332,16 +422,24 @@ async fn run_maintenance_loop(store: Arc<dyn ObjectStore>) {
 async fn run_server_and_worker(
     server: impl Future<Output = std::io::Result<()>>,
     worker: impl Future<Output = ()>,
+    worker_drain_timeout: Duration,
 ) -> std::io::Result<()> {
     tokio::pin!(server);
     tokio::pin!(worker);
     tokio::select! {
-        result = &mut server => result,
-        () = &mut worker => unreachable!("index worker loop returned"),
+        result = &mut server => {
+            let _ = tokio::time::timeout(worker_drain_timeout, &mut worker).await;
+            result
+        }
+        () = &mut worker => server.await,
     }
 }
 
-async fn run_index_worker(store: Arc<dyn ObjectStore>, metrics: Arc<Metrics>) {
+async fn run_index_worker(
+    store: Arc<dyn ObjectStore>,
+    metrics: Arc<Metrics>,
+    health: Arc<HealthState>,
+) {
     const LEASE_MS: u64 = 30_000;
     const HEARTBEAT_MS: u64 = 1_000;
     const IDLE_POLL_MS: u64 = 100;
@@ -351,6 +449,9 @@ async fn run_index_worker(store: Arc<dyn ObjectStore>, metrics: Arc<Metrics>) {
     let worker_id = format!("serve-{}", std::process::id());
     let mut next_reconcile = tokio::time::Instant::now();
     loop {
+        if health.is_draining() {
+            return;
+        }
         if tokio::time::Instant::now() >= next_reconcile {
             // The reconcile scan doubles as the per-namespace lag observation.
             match crate::index_queue::reconcile_unindexed(store.clone()).await {
@@ -366,18 +467,54 @@ async fn run_index_worker(store: Arc<dyn ObjectStore>, metrics: Arc<Metrics>) {
         {
             Ok(Some(_)) => {}
             Ok(None) => {
-                tokio::time::sleep(std::time::Duration::from_millis(IDLE_POLL_MS)).await;
+                if sleep_or_drain(&health, Duration::from_millis(IDLE_POLL_MS)).await {
+                    return;
+                }
             }
             Err(error) => {
                 eprintln!("index worker failed: {error}");
-                tokio::time::sleep(std::time::Duration::from_millis(ERROR_RETRY_MS)).await;
+                if sleep_or_drain(&health, Duration::from_millis(ERROR_RETRY_MS)).await {
+                    return;
+                }
             }
         }
     }
 }
 
-async fn health() -> Json<serde_json::Value> {
+async fn sleep_or_drain(health: &HealthState, duration: Duration) -> bool {
+    tokio::select! {
+        () = health.wait_for_drain() => true,
+        () = tokio::time::sleep(duration) => false,
+    }
+}
+
+async fn livez() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "status": "ok" }))
+}
+
+async fn readyz(State(state): State<ApiState>) -> Response {
+    if !state.health.accepts_traffic() {
+        return readiness_response(StatusCode::SERVICE_UNAVAILABLE, "draining_or_starting");
+    }
+    if state.query_limiter.overloaded().await {
+        return readiness_response(StatusCode::SERVICE_UNAVAILABLE, "overloaded");
+    }
+    match tokio::time::timeout(READY_BACKEND_TIMEOUT, state.store.list("namespaces/")).await {
+        Ok(Ok(_)) => readiness_response(StatusCode::OK, "ready"),
+        Ok(Err(_)) => readiness_response(StatusCode::SERVICE_UNAVAILABLE, "backend_unavailable"),
+        Err(_) => readiness_response(StatusCode::SERVICE_UNAVAILABLE, "backend_timeout"),
+    }
+}
+
+fn readiness_response(status: StatusCode, state: &'static str) -> Response {
+    (
+        status,
+        Json(serde_json::json!({
+            "status": if status == StatusCode::OK { "ok" } else { "unavailable" },
+            "state": state,
+        })),
+    )
+        .into_response()
 }
 
 async fn metrics_endpoint(State(state): State<ApiState>) -> Response {
@@ -393,6 +530,7 @@ async fn write(
     Path(namespace): Path<String>,
     request: Result<Json<WriteRequest>, JsonRejection>,
 ) -> Result<Json<WriteResponse>, ApiError> {
+    ensure_accepting_traffic(&state)?;
     let Json(request) = request.map_err(json_rejection)?;
     let namespace = Namespace::create_or_open(state.store, &namespace)
         .await?
@@ -456,6 +594,7 @@ async fn query(
     Path(namespace): Path<String>,
     request: Result<Json<QueryRequest>, JsonRejection>,
 ) -> Result<Json<QueryResponse>, ApiError> {
+    ensure_accepting_traffic(&state)?;
     let Json(request) = request.map_err(json_rejection)?;
     let namespace_handle = Namespace::open(state.store, &namespace)
         .await?
@@ -481,6 +620,7 @@ async fn metadata(
     State(state): State<ApiState>,
     Path(namespace): Path<String>,
 ) -> Result<Json<crate::metadata::NamespaceMetadata>, ApiError> {
+    ensure_accepting_traffic(&state)?;
     let namespace = Namespace::open(state.store, &namespace).await?;
     Ok(Json(namespace.metadata().await?))
 }
@@ -490,6 +630,7 @@ async fn recall(
     Path(namespace): Path<String>,
     request: Result<Json<RecallApiRequest>, JsonRejection>,
 ) -> Result<Json<RecallResult>, ApiError> {
+    ensure_accepting_traffic(&state)?;
     let Json(request) = request.map_err(json_rejection)?;
     let namespace_handle = Namespace::open(state.store, &namespace)
         .await?
@@ -507,6 +648,7 @@ async fn warm_cache(
     Path(namespace): Path<String>,
     params: Result<QueryParams<WarmCacheParams>, QueryRejection>,
 ) -> Result<Json<WarmCacheResponse>, ApiError> {
+    ensure_accepting_traffic(&state)?;
     let QueryParams(params) = params.map_err(query_rejection)?;
     let namespace = Namespace::open(state.store, &namespace).await?;
     let defaults = CacheWarmOptions::default();
@@ -525,6 +667,18 @@ async fn warm_cache(
         skipped_objects: report.plan.skipped_objects,
         skipped_bytes: report.plan.skipped_bytes,
     }))
+}
+
+fn ensure_accepting_traffic(state: &ApiState) -> Result<(), ApiError> {
+    if state.health.accepts_traffic() {
+        Ok(())
+    } else {
+        Err(ApiError::Request {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "draining",
+            message: "server is not ready to accept traffic".into(),
+        })
+    }
 }
 
 fn json_rejection(rejection: JsonRejection) -> ApiError {
@@ -568,6 +722,25 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Method, Request, StatusCode};
+    use axum::routing::get;
+    use tower::ServiceExt;
+
+    use crate::object_store::{FsObjectStore, ObjectStore};
+
+    async fn request(app: axum::Router, method: Method, uri: &str) -> axum::response::Response {
+        app.oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
     #[tokio::test]
     async fn server_completion_cancels_worker_future() {
         let polls = Arc::new(AtomicUsize::new(0));
@@ -583,7 +756,9 @@ mod tests {
             Ok(())
         };
 
-        super::run_server_and_worker(server, worker).await.unwrap();
+        super::run_server_and_worker(server, worker, Duration::from_millis(20))
+            .await
+            .unwrap();
         let polls_after_shutdown = polls.load(Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(polls.load(Ordering::SeqCst), polls_after_shutdown);
@@ -607,5 +782,56 @@ mod tests {
         drop(limiter.acquire("other", 1).await.unwrap());
         drop(all_slots);
         drop(limiter.acquire("docs", 1).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn readiness_tracks_drain_without_breaking_liveness() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(FsObjectStore::new(dir.path()));
+        let health = Arc::new(super::HealthState::ready());
+        let app = super::router_with_metrics_and_health(
+            store,
+            crate::metrics::Metrics::shared(),
+            health.clone(),
+        );
+
+        let response = request(app.clone(), Method::GET, "/livez").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = request(app.clone(), Method::GET, "/readyz").await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        health.begin_drain();
+        let response = request(app.clone(), Method::GET, "/livez").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = request(app.clone(), Method::GET, "/readyz").await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let response = request(app, Method::GET, "/v1/namespaces/docs/metadata").await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["error"]["code"], "draining");
+    }
+
+    #[tokio::test]
+    async fn readiness_fails_when_query_limiter_is_overloaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn ObjectStore> = Arc::new(FsObjectStore::new(dir.path()));
+        let limiter = Arc::new(super::QueryLimiter::new(1, Duration::from_millis(1)));
+        let _permit = limiter.acquire("docs", 1).await.unwrap();
+        let app = axum::Router::new()
+            .route("/livez", get(super::livez))
+            .route("/readyz", get(super::readyz))
+            .with_state(super::ApiState {
+                store,
+                query_limiter: limiter,
+                metrics: crate::metrics::Metrics::shared(),
+                health: Arc::new(super::HealthState::ready()),
+            });
+
+        let response = request(app.clone(), Method::GET, "/livez").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = request(app, Method::GET, "/readyz").await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }

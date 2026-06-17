@@ -1215,6 +1215,17 @@ Review-driven polish after the engine was feature-complete.
   `IndexQueueBroker` is an in-process group-commit helper with no client/server
   transport yet. `docs/kubernetes-roles.yaml` shows separate API, indexer, and
   maintenance Deployments.
+- **D77 — Kubernetes lifecycle uses readiness as the traffic gate.** Following
+  Kubernetes probe guidance, `/livez` (and legacy `/healthz`) stays
+  process-local and does not fail just because S3 is unavailable. `/readyz`
+  fails during startup, drain, local query-slot overload, or a bounded backend
+  list failure. Ctrl-C and SIGTERM both start drain: Sana marks itself unready,
+  rejects new namespace traffic with `503 draining`, waits five seconds for
+  readiness propagation, then lets Axum gracefully drain in-flight requests.
+  Looped indexer and maintenance roles watch the same signals between units of
+  work, so shutdown stops the next claim/pass without cancelling the current
+  job or maintenance scan. The Kubernetes example sets termination grace periods
+  from the five-second readiness delay plus a 30-second worker-drain budget.
 
 ---
 

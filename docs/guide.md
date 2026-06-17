@@ -96,7 +96,14 @@ for a minimal separate-Deployment example.
 | `POST /v1/namespaces/{ns}/_debug/recall` | ANN recall vs exact, on sampled vectors |
 | `GET /v1/namespaces/{ns}/hint_cache_warm` | prefetch one manifest generation into cache |
 | `GET /metrics` | Prometheus text |
-| `GET /healthz` | liveness |
+| `GET /livez` / `GET /healthz` | process liveness |
+| `GET /readyz` | traffic readiness; fails during startup, drain, overload, or backend failure |
+
+On Ctrl-C or SIGTERM, Sana marks itself unready immediately, rejects new
+namespace traffic with `503 draining`, waits briefly for readiness propagation,
+and then lets Axum gracefully drain in-flight HTTP requests. Looping indexer and
+maintenance roles observe the same signals between work items, so they do not
+claim another job or start another maintenance pass during termination.
 
 Write — append two documents (creates the namespace on first write):
 

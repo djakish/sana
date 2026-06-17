@@ -27,6 +27,7 @@ spec:
         app: sana
         role: api
     spec:
+      terminationGracePeriodSeconds: 45
       containers:
         - name: sana
           image: ghcr.io/example/sana:latest
@@ -37,6 +38,20 @@ spec:
             - "268435456"
           ports:
             - containerPort: 8080
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: 8080
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            failureThreshold: 30
+            periodSeconds: 1
           envFrom:
             - secretRef:
                 name: sana-s3
@@ -57,6 +72,7 @@ spec:
         app: sana
         role: indexer
     spec:
+      terminationGracePeriodSeconds: 45
       containers:
         - name: sana
           image: ghcr.io/example/sana:latest
@@ -90,6 +106,7 @@ spec:
         app: sana
         role: maintenance
     spec:
+      terminationGracePeriodSeconds: 75
       containers:
         - name: sana
           image: ghcr.io/example/sana:latest

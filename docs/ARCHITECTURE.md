@@ -286,9 +286,14 @@ store traffic.
 The HTTP surface (`src/api.rs`) is a thin Axum adapter over the same library
 methods the CLI uses — not a second implementation. Routes: write
 (`POST /v2/namespaces/{ns}`), single/multi query, metadata, `_debug/recall`,
-`hint_cache_warm`, `/metrics`, `/healthz`. Errors map to stable
+`hint_cache_warm`, `/metrics`, `/livez`, `/readyz`, `/healthz`. Errors map to stable
 `400/404/409/429/500` JSON envelopes; per-namespace query concurrency is bounded
 by a weighted semaphore.
+
+Kubernetes lifecycle: liveness is process-local and does not depend on S3;
+readiness fails during startup, drain, local query-slot overload, or a bounded
+backend-list failure. Ctrl-C/SIGTERM flips readiness off before graceful HTTP
+shutdown so load balancers can stop routing while in-flight requests drain.
 
 Metrics (`src/metrics.rs`) are a dependency-free in-process registry rendered as
 Prometheus text. Because the meter sits *below* the cache, object-store counters
