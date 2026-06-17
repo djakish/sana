@@ -275,6 +275,18 @@ pub async fn serve(store: Arc<dyn ObjectStore>, address: SocketAddr) -> std::io:
     serve_with_shutdown(store, address, Metrics::shared(), std::future::pending()).await
 }
 
+pub async fn serve_api_with_shutdown(
+    store: Arc<dyn ObjectStore>,
+    address: SocketAddr,
+    metrics: Arc<Metrics>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
+    let listener = tokio::net::TcpListener::bind(address).await?;
+    axum::serve(listener, router_with_metrics(store, metrics))
+        .with_graceful_shutdown(shutdown)
+        .await
+}
+
 pub async fn serve_with_shutdown(
     store: Arc<dyn ObjectStore>,
     address: SocketAddr,
@@ -297,9 +309,8 @@ pub async fn serve_with_shutdown(
     run_server_and_worker(server, worker).await
 }
 
-/// Background maintenance: one policy pass per interval. The interval doubles
-/// as the deferred-GC grace period — an orphan is deleted only after surviving
-/// two consecutive scans, so readers get at least one interval to drain.
+/// Background maintenance: one policy pass per interval. The default policy
+/// compacts and maintains vector topology but does not delete orphaned objects.
 async fn run_maintenance_loop(store: Arc<dyn ObjectStore>) {
     const MAINTENANCE_INTERVAL_MS: u64 = 60_000;
 

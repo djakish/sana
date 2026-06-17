@@ -1204,6 +1204,17 @@ Review-driven polish after the engine was feature-complete.
   column encoding before WAL publication, so a queried F16 document can be
   written back unchanged through HTTP. The hybrid example's RRF helper now uses
   one-based ranks as defined by Cormack/Clarke/Buettcher.
+- **D76 — Runtime roles split before the broker boundary.** `sana serve-api`
+  runs HTTP only, and `sana serve --role all` preserves the single-process dev
+  shape. `sana work-indexing --loop` is a standalone leased indexing worker with
+  periodic reconciliation, and `sana maintain --loop` runs the all-namespace
+  maintenance pass without serving traffic. This follows the turbopuffer
+  query/indexer separation: API replicas can now scale horizontally without
+  each pod claiming queue work or listing every namespace for maintenance. The
+  standalone networked `queue-broker` remains a separate P0 because the current
+  `IndexQueueBroker` is an in-process group-commit helper with no client/server
+  transport yet. `docs/kubernetes-roles.yaml` shows separate API, indexer, and
+  maintenance Deployments.
 
 ---
 
@@ -1313,6 +1324,7 @@ tests/
   fixtures/              committed golden snapshots
 docs/
   guide.md               user guide (CLI, S3, HTTP API, metrics, benchmark)
+  kubernetes-roles.yaml  separate API/indexer/maintenance Deployment sketch
   benchmarks.md          latency-harness numbers on a dev machine
   index.html             minimal project page (GitHub Pages serves /docs)
 examples/

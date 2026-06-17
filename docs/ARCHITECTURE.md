@@ -254,12 +254,14 @@ manifest stay authoritative): each commit best-effort enqueues its cursor;
 namespace). `reconcile_unindexed` repairs missed notifications by comparing
 authoritative cursors and doubles as the per-namespace lag metric.
 
-`sana serve` runs this itself: an embedded indexing worker (poll, lease,
-heartbeat, retry; reconcile every 30 s) plus a maintenance loop (every 60 s:
-threshold-driven compaction *or* vector maintenance; automatic GC is off by
-default). A default single-process deployment is self-indexing and keeps index
-shape maintained; external workers can still be added for scale because the
-queue is durable and fenced.
+`sana serve --role all` runs this itself: an embedded indexing worker (poll,
+lease, heartbeat, retry; reconcile every 30 s) plus a maintenance loop (every
+60 s: threshold-driven compaction *or* vector maintenance; automatic GC is off
+by default). Multi-pod deployments use `sana serve-api` for HTTP-only query/write
+pods, `sana work-indexing --loop` for leased indexing workers, and
+`sana maintain --loop` for all-namespace maintenance. API-only pods do not claim
+jobs or scan namespaces, so query scaling no longer multiplies background object
+store traffic.
 
 ---
 

@@ -1,0 +1,102 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: sana-api
+spec:
+  selector:
+    app: sana
+    role: api
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sana-api
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: sana
+      role: api
+  template:
+    metadata:
+      labels:
+        app: sana
+        role: api
+    spec:
+      containers:
+        - name: sana
+          image: ghcr.io/example/sana:latest
+          args:
+            - serve-api
+            - s3://REPLACE_BUCKET/sana
+            - 0.0.0.0:8080
+            - "268435456"
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - secretRef:
+                name: sana-s3
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sana-indexer
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: sana
+      role: indexer
+  template:
+    metadata:
+      labels:
+        app: sana
+        role: indexer
+    spec:
+      containers:
+        - name: sana
+          image: ghcr.io/example/sana:latest
+          args:
+            - work-indexing
+            - s3://REPLACE_BUCKET/sana
+            - "$(POD_NAME)"
+            - --loop
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          envFrom:
+            - secretRef:
+                name: sana-s3
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sana-maintenance
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sana
+      role: maintenance
+  template:
+    metadata:
+      labels:
+        app: sana
+        role: maintenance
+    spec:
+      containers:
+        - name: sana
+          image: ghcr.io/example/sana:latest
+          args:
+            - maintain
+            - s3://REPLACE_BUCKET/sana
+            - --loop
+          envFrom:
+            - secretRef:
+                name: sana-s3

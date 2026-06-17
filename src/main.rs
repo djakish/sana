@@ -14,6 +14,18 @@ use sana::value::{Document, Id, Value};
 
 type CliResult = Result<(), Box<dyn std::error::Error>>;
 
+const INDEX_LEASE_MS: u64 = 30_000;
+const INDEX_RETRY_MS: u64 = 1_000;
+const INDEX_IDLE_MS: u64 = 100;
+const INDEX_RECONCILE_MS: u64 = 30_000;
+const MAINTENANCE_INTERVAL_MS: u64 = 60_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ServeRole {
+    All,
+    Api,
+}
+
 #[tokio::main]
 async fn main() -> CliResult {
     let args: Vec<String> = std::env::args().collect();
@@ -32,6 +44,7 @@ async fn main() -> CliResult {
         Some("compact") => compact(&args).await,
         Some("gc") => gc(&args).await,
         Some("maintain-vectors") => maintain_vectors(&args).await,
+        Some("maintain") => maintain(&args).await,
         Some("reconcile-indexing") => reconcile_indexing(&args).await,
         Some("work-indexing") => work_indexing(&args).await,
         Some("branch") => branch(&args).await,
@@ -41,6 +54,7 @@ async fn main() -> CliResult {
         Some("unpin") => unpin(&args).await,
         Some("pin-status") => pin_status(&args).await,
         Some("serve") => serve(&args).await,
+        Some("serve-api") => serve_api(&args).await,
         Some("demo") => demo(&args).await,
         _ => {
             usage();
@@ -67,15 +81,17 @@ fn usage() {
     eprintln!("  sana compact <dir> <ns>   # merge SSTs, drop tombstones");
     eprintln!("  sana gc      <dir> <ns> [--apply]   # report (or delete) orphaned objects");
     eprintln!("  sana maintain-vectors <dir> <ns>   # run one vector maintenance pass");
+    eprintln!("  sana maintain <dir> [--loop]   # run all-namespace maintenance");
     eprintln!("  sana reconcile-indexing <dir>   # restore missed indexing notifications");
-    eprintln!("  sana work-indexing <dir> <worker-id>   # claim and run one indexing job");
+    eprintln!("  sana work-indexing <dir> [worker-id] [--loop]   # run indexing worker");
     eprintln!("  sana branch <dir> <source-ns> <child-ns>   # zero-copy indexed snapshot");
     eprintln!("  sana copy <source-dir> <source-ns> <target-dir> <target-ns>");
     eprintln!("  sana export <source-dir> <ns> <target-dir> <prefix>");
     eprintln!("  sana pin <dir> <ns> [replicas]");
     eprintln!("  sana unpin <dir> <ns>");
     eprintln!("  sana pin-status <dir> <ns>");
-    eprintln!("  sana serve <dir> [address] [cache-bytes]");
+    eprintln!("  sana serve <dir> [address] [cache-bytes] [--role all|api]");
+    eprintln!("  sana serve-api <dir> [address] [cache-bytes]");
     eprintln!("  sana demo    <dir>");
     eprintln!();
     eprintln!("  <dir> may be a directory or s3://bucket[/prefix]; S3 reads");
@@ -290,9 +306,88 @@ async fn maintain_vectors(args: &[String]) -> CliResult {
     Ok(())
 }
 
+async fn maintain(args: &[String]) -> CliResult {
+    let values = positional_args(args, &[], &["--loop"])?;
+    let dir = values
+        .first()
+        .copied()
+        .ok_or_else(|| "missing argument #2".to_string())?;
+    let store = store(dir)?;
+    let policy = sana::maintenance::MaintenancePolicy::default();
+    let mut state = sana::maintenance::MaintenanceState::default();
+    if has_flag(args, "--loop") {
+        println!("running maintenance loop every {MAINTENANCE_INTERVAL_MS} ms; Ctrl-C to stop");
+        let shutdown = shutdown_signal();
+        tokio::pin!(shutdown);
+        loop {
+            tokio::select! {
+                _ = &mut shutdown => return Ok(()),
+                result = run_maintenance_pass(store.clone(), &policy, &mut state) => {
+                    result?;
+                    tokio::select! {
+                        _ = &mut shutdown => return Ok(()),
+                        () = tokio::time::sleep(std::time::Duration::from_millis(MAINTENANCE_INTERVAL_MS)) => {}
+                    }
+                }
+            }
+        }
+    } else {
+        run_maintenance_pass(store, &policy, &mut state).await
+    }
+}
+
+async fn run_maintenance_pass(
+    store: Arc<dyn ObjectStore>,
+    policy: &sana::maintenance::MaintenancePolicy,
+    state: &mut sana::maintenance::MaintenanceState,
+) -> CliResult {
+    let report = sana::maintenance::run_once(store, policy, state).await?;
+    println!(
+        "maintenance scanned {} namespace(s): compacted {}, vector-maintained {}, gc-deleted {}, gc-pending {}, errors {}",
+        report.scanned_namespaces,
+        report.compacted.len(),
+        report.vector_maintained.len(),
+        report.gc_deleted_objects,
+        report.gc_pending_objects,
+        report.errors.len()
+    );
+    if !report.compacted.is_empty() {
+        println!("  compacted: {}", report.compacted.join(", "));
+    }
+    if !report.vector_maintained.is_empty() {
+        println!(
+            "  vector-maintained: {}",
+            report.vector_maintained.join(", ")
+        );
+    }
+    for error in &report.errors {
+        eprintln!("  {error}");
+    }
+    Ok(())
+}
+
 async fn work_indexing(args: &[String]) -> CliResult {
-    let (dir, worker_id) = (arg(args, 2)?, arg(args, 3)?);
-    match sana::index_queue::run_worker_once(store(dir)?, worker_id, 30_000, 1_000).await? {
+    let values = positional_args(args, &[], &["--loop"])?;
+    let dir = values
+        .first()
+        .copied()
+        .ok_or_else(|| "missing argument #2".to_string())?;
+    let worker_id = values
+        .get(1)
+        .map(|value| (*value).to_string())
+        .unwrap_or_else(|| format!("cli-indexer-{}", std::process::id()));
+    let store = store(dir)?;
+    if has_flag(args, "--loop") {
+        run_indexing_loop(store, worker_id).await
+    } else {
+        run_indexing_once(store, &worker_id).await
+    }
+}
+
+async fn run_indexing_once(store: Arc<dyn ObjectStore>, worker_id: &str) -> CliResult {
+    match sana::index_queue::run_worker_once(store, worker_id, INDEX_LEASE_MS, INDEX_RETRY_MS)
+        .await?
+    {
         Some(run) => println!(
             "completed job {} for {} through WAL seq {} ({})",
             run.job_id,
@@ -307,6 +402,60 @@ async fn work_indexing(args: &[String]) -> CliResult {
         None => println!("no indexing jobs available"),
     }
     Ok(())
+}
+
+async fn run_indexing_loop(store: Arc<dyn ObjectStore>, worker_id: String) -> CliResult {
+    let mut next_reconcile = tokio::time::Instant::now();
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+    println!("running indexing worker {worker_id}; Ctrl-C to stop");
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => return Ok(()),
+            () = run_indexing_tick(store.clone(), &worker_id, &mut next_reconcile) => {}
+        }
+    }
+}
+
+async fn run_indexing_tick(
+    store: Arc<dyn ObjectStore>,
+    worker_id: &str,
+    next_reconcile: &mut tokio::time::Instant,
+) {
+    if tokio::time::Instant::now() >= *next_reconcile {
+        match sana::index_queue::reconcile_unindexed(store.clone()).await {
+            Ok(report) => println!(
+                "reconciled {} namespace(s): {} lagging, {} added, {} coalesced",
+                report.scanned_namespaces,
+                report.lagging_namespaces,
+                report.notifications_added,
+                report.notifications_coalesced
+            ),
+            Err(error) => eprintln!("index reconciliation failed: {error}"),
+        }
+        *next_reconcile =
+            tokio::time::Instant::now() + std::time::Duration::from_millis(INDEX_RECONCILE_MS);
+    }
+
+    match sana::index_queue::run_worker_once(store, worker_id, INDEX_LEASE_MS, INDEX_RETRY_MS).await
+    {
+        Ok(Some(run)) => println!(
+            "completed job {} for {} through WAL seq {} ({})",
+            run.job_id,
+            run.namespace,
+            run.target_cursor.seq,
+            if run.did_flush {
+                "index published"
+            } else {
+                "already indexed"
+            }
+        ),
+        Ok(None) => tokio::time::sleep(std::time::Duration::from_millis(INDEX_IDLE_MS)).await,
+        Err(error) => {
+            eprintln!("index worker failed: {error}");
+            tokio::time::sleep(std::time::Duration::from_millis(INDEX_RETRY_MS)).await;
+        }
+    }
 }
 
 async fn reconcile_indexing(args: &[String]) -> CliResult {
@@ -407,14 +556,30 @@ async fn pin_status(args: &[String]) -> CliResult {
 }
 
 async fn serve(args: &[String]) -> CliResult {
-    let dir = arg(args, 2)?;
-    let address = args
-        .get(3)
-        .map(String::as_str)
-        .unwrap_or("127.0.0.1:8080")
-        .parse()?;
-    let cache_bytes = args
-        .get(4)
+    let values = positional_args(args, &["--role"], &[])?;
+    let dir = values
+        .first()
+        .copied()
+        .ok_or_else(|| "missing argument #2".to_string())?;
+    let role = serve_role(args)?;
+    run_serve_role(args, dir, role, "serve").await
+}
+
+async fn serve_api(args: &[String]) -> CliResult {
+    let values = positional_args(args, &[], &[])?;
+    let dir = values
+        .first()
+        .copied()
+        .ok_or_else(|| "missing argument #2".to_string())?;
+    run_serve_role(args, dir, ServeRole::Api, "serve-api").await
+}
+
+async fn run_serve_role(args: &[String], dir: &str, role: ServeRole, command: &str) -> CliResult {
+    let flag_names: &[&str] = if command == "serve" { &["--role"] } else { &[] };
+    let values = positional_args(args, flag_names, &[])?;
+    let address = values.get(1).copied().unwrap_or("127.0.0.1:8080").parse()?;
+    let cache_bytes = values
+        .get(2)
         .map(|value| value.parse::<usize>())
         .transpose()?
         .unwrap_or(256 * 1024 * 1024);
@@ -423,8 +588,16 @@ async fn serve(args: &[String]) -> CliResult {
     let metered: Arc<dyn ObjectStore> = Arc::new(MeteredObjectStore::new(backing, metrics.clone()));
     let cached: Arc<dyn ObjectStore> =
         Arc::new(CachingObjectStore::new(metered, cache_bytes).with_metrics(metrics.clone()));
-    println!("serving Sana on http://{address} with {cache_bytes} cache bytes");
-    sana::api::serve_with_shutdown(cached, address, metrics, shutdown_signal()).await?;
+    match role {
+        ServeRole::All => {
+            println!("serving Sana all-in-one on http://{address} with {cache_bytes} cache bytes");
+            sana::api::serve_with_shutdown(cached, address, metrics, shutdown_signal()).await?;
+        }
+        ServeRole::Api => {
+            println!("serving Sana API on http://{address} with {cache_bytes} cache bytes");
+            sana::api::serve_api_with_shutdown(cached, address, metrics, shutdown_signal()).await?;
+        }
+    }
     Ok(())
 }
 
@@ -463,8 +636,112 @@ async fn demo(args: &[String]) -> CliResult {
     Ok(())
 }
 
+fn serve_role(args: &[String]) -> Result<ServeRole, String> {
+    match flag_value(args, "--role")? {
+        Some("all") => Ok(ServeRole::All),
+        Some("api") => Ok(ServeRole::Api),
+        Some(other) => Err(format!("unknown serve role '{other}', expected all or api")),
+        None => Ok(ServeRole::All),
+    }
+}
+
+fn has_flag(args: &[String], flag: &str) -> bool {
+    args.iter().skip(2).any(|arg| arg == flag)
+}
+
+fn flag_value<'a>(args: &'a [String], flag: &str) -> Result<Option<&'a str>, String> {
+    let mut i = 2;
+    while i < args.len() {
+        if args[i] == flag {
+            return args
+                .get(i + 1)
+                .map(String::as_str)
+                .map(Some)
+                .ok_or_else(|| format!("{flag} requires a value"));
+        }
+        i += 1;
+    }
+    Ok(None)
+}
+
+fn positional_args<'a>(
+    args: &'a [String],
+    flags_with_value: &[&str],
+    valueless_flags: &[&str],
+) -> Result<Vec<&'a str>, String> {
+    let mut out = Vec::new();
+    let mut i = 2;
+    while i < args.len() {
+        let value = args[i].as_str();
+        if flags_with_value.contains(&value) {
+            if i + 1 >= args.len() {
+                return Err(format!("{value} requires a value"));
+            }
+            i += 2;
+        } else if valueless_flags.contains(&value) {
+            i += 1;
+        } else {
+            out.push(value);
+            i += 1;
+        }
+    }
+    Ok(out)
+}
+
 fn arg(args: &[String], i: usize) -> Result<&str, String> {
     args.get(i)
         .map(String::as_str)
         .ok_or_else(|| format!("missing argument #{i}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn serve_role_defaults_to_all_and_accepts_api() {
+        assert_eq!(
+            serve_role(&args(&["sana", "serve", "./data"])).unwrap(),
+            ServeRole::All
+        );
+        assert_eq!(
+            serve_role(&args(&["sana", "serve", "./data", "--role", "api"])).unwrap(),
+            ServeRole::Api
+        );
+        assert!(serve_role(&args(&["sana", "serve", "./data", "--role", "bad"])).is_err());
+    }
+
+    #[test]
+    fn positional_args_skip_loop_and_role_flags() {
+        assert_eq!(
+            positional_args(
+                &args(&[
+                    "sana",
+                    "serve",
+                    "./data",
+                    "--role",
+                    "api",
+                    "127.0.0.1:8081",
+                    "1024"
+                ]),
+                &["--role"],
+                &[]
+            )
+            .unwrap(),
+            vec!["./data", "127.0.0.1:8081", "1024"]
+        );
+        assert_eq!(
+            positional_args(
+                &args(&["sana", "work-indexing", "./data", "--loop", "worker-a"]),
+                &[],
+                &["--loop"]
+            )
+            .unwrap(),
+            vec!["./data", "worker-a"]
+        );
+    }
 }

@@ -64,12 +64,27 @@ creates its own bucket. The same MinIO backs the S3 row in
 sana serve ./data 127.0.0.1:8080 268435456   # store, address, cache bytes
 ```
 
-One process serves HTTP, runs a durable indexing worker (your writes become
-indexed without a second process), reconciles missed index notifications every
-30 s, and runs background maintenance every 60 s: compaction once a namespace
-accumulates enough SST runs or vector deltas, vector split/merge maintenance,
-and garbage collection of superseded objects (two-pass deferred, so in-flight
-readers drain first).
+By default, `serve` is all-in-one dev mode: one process serves HTTP, runs a
+durable indexing worker (your writes become indexed without a second process),
+reconciles missed index notifications every 30 s, and runs background
+maintenance every 60 s. Maintenance compacts namespaces that accumulate enough
+SST runs or vector deltas and runs vector split/merge work; automatic object
+deletion is off by default.
+
+For multi-pod deployments, split the roles:
+
+```sh
+sana serve-api s3://my-bucket/sana 0.0.0.0:8080 268435456
+sana work-indexing s3://my-bucket/sana indexer-0 --loop
+sana maintain s3://my-bucket/sana --loop
+
+# Equivalent single-node/dev form:
+sana serve s3://my-bucket/sana 0.0.0.0:8080 268435456 --role all
+```
+
+API-only pods do not reconcile the queue, claim indexing jobs, or scan all
+namespaces for maintenance. See [`kubernetes-roles.yaml`](kubernetes-roles.yaml)
+for a minimal separate-Deployment example.
 
 ### Routes
 

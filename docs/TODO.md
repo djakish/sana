@@ -90,7 +90,9 @@ Related designs:
 
 ## P0: Separate process roles
 
-**Status:** every API pod also becomes an indexer and maintenance worker.
+**Status:** API-only, indexing-worker, and maintenance roles now exist. The
+standalone networked `queue-broker` role is still tracked under the global queue
+broker P0.
 
 [`api::serve_with_shutdown`](../src/api.rs#L278-L297) always joins the HTTP
 server, index worker, and maintenance loop. Scaling the API Deployment from one
@@ -107,19 +109,20 @@ maintenance loops.
 
 ### Required work
 
-- [ ] Add explicit roles, for example:
+- [x] Add explicit API, indexing, and maintenance roles:
 
   ```text
   sana serve-api
-  sana queue-broker
   sana work-indexing --loop
   sana maintain --loop
   ```
 
-- [ ] Keep `sana serve --role all` only as a convenient single-node/dev mode.
+- [ ] Add the standalone `sana queue-broker` role tracked in the queue-broker
+      section below.
+- [x] Keep `sana serve --role all` only as a convenient single-node/dev mode.
 - [ ] Give each role separate concurrency, cache, metrics, and shutdown config.
-- [ ] Make API replicas horizontally scalable without starting background work.
-- [ ] Add deployment examples with separate Kubernetes Deployments.
+- [x] Make API replicas horizontally scalable without starting background work.
+- [x] Add deployment examples with separate Kubernetes Deployments.
 
 Turbopuffer's published architecture similarly shows separate query and indexer
 binaries: [turbopuffer architecture](https://turbopuffer.com/docs/architecture).
