@@ -3,65 +3,153 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>sana — object-storage-native search</title>
-<style>
-  :root { color-scheme: dark; }
-  body {
-    margin: 0; padding: 4rem 1.5rem;
-    background: #101014; color: #d8d8e0;
-    font: 16px/1.6 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-    display: flex; justify-content: center;
-  }
-  main { max-width: 44rem; }
-  h1 { font-size: 2.2rem; margin: 0; color: #fff; letter-spacing: 0.04em; }
-  .tagline { color: #9a9ab0; margin: 0.4rem 0 2rem; }
-  .disclaimer {
-    border: 1px solid #6b5d28; background: #1c1910; color: #d8c87a;
-    padding: 0.6rem 1rem; border-radius: 6px; margin: 0 0 2rem; font-size: 0.9rem;
-  }
-  ul { padding-left: 1.2rem; }
-  li { margin: 0.45rem 0; }
-  pre {
-    background: #16161c; border: 1px solid #26262e; border-radius: 6px;
-    padding: 1rem; overflow-x: auto; font-size: 0.88rem;
-  }
-  a { color: #7aa2f7; text-decoration: none; }
-  a:hover { text-decoration: underline; }
-  .links { margin-top: 2rem; display: flex; gap: 1.4rem; flex-wrap: wrap; }
-  footer { margin-top: 3rem; color: #62626e; font-size: 0.85rem; }
-</style>
+<title>The Sana Book — A search database, explained from the ground up</title>
+<link rel="stylesheet" href="book/style.css">
+<script defer src="book/book.js"></script>
 </head>
 <body>
-<main>
-  <h1>sana</h1>
-  <p class="tagline">an object-storage-native search database, in Rust</p>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+  <nav class="top-nav" aria-label="Book navigation">
+    <a class="brand" href="./index.html">sana book</a>
+    <div class="nav-links">
+      <a href="book/intro.html">intro</a>
+      <a href="book/storage.html">storage</a>
+      <a href="book/sstable-lsm.html">sst + lsm</a>
+      <a href="book/query.html">query</a>
+      <a href="book/vector.html">vectors</a>
+      <a href="book/spfresh-rabitq.html">spfresh + rabitq</a>
+      <a href="book/operations.html">operations</a>
+      <a href="book/glossary.html">glossary</a>
+    </div>
+  </nav>
+</header>
 
-  <p class="disclaimer">⚠ AI-assisted project, built with Claude. An
-  educational <a href="https://turbopuffer.com">turbopuffer</a>-inspired
-  clone — learn from it, don't bet on it.</p>
+<main id="main" class="book-home">
+  <aside class="home-toc" aria-label="Contents">
+    <strong>Contents</strong>
+    <p class="toc-part">Part I — Foundations</p>
+    <a href="book/intro.html">01 Introduction</a>
+    <p class="toc-part">Part II — Storing data that lasts</p>
+    <a href="book/storage.html">02 The durable boundary</a>
+    <a href="book/sstable-lsm.html">03 SSTables and LSM trees</a>
+    <p class="toc-part">Part III — Answering questions</p>
+    <a href="book/query.html">04 The query engine</a>
+    <a href="book/vector.html">05 Vector search</a>
+    <a href="book/spfresh-rabitq.html">06 SPFresh and RaBitQ</a>
+    <p class="toc-part">Part IV — Running it for real</p>
+    <a href="book/operations.html">07 Running the system</a>
+    <p class="toc-part">Appendices</p>
+    <a href="book/trace.html">A full trace</a>
+    <a href="book/glossary.html">Glossary</a>
+    <a href="book/map.html">System map</a>
+  </aside>
 
-  <ul>
-    <li>documents live entirely in object storage — a directory, or S3 with
-        server-enforced conditional writes</li>
-    <li>vector search: IVF + faithful RaBitQ quantization, SIMD kernels,
-        SPFresh-style local index maintenance</li>
-    <li>full-text BM25 with rank-safe block MAXSCORE; attribute filters
-        native to the vector index</li>
-    <li>one binary: CLI, HTTP service with embedded indexing worker,
-        automatic compaction &amp; GC, Prometheus <code>/metrics</code></li>
-  </ul>
+  <article class="home-content">
+    <p class="eyebrow">The Sana book</p>
+    <h1>A search database, explained from the ground up.</h1>
+    <p class="lede">
+      Sana is a small search engine written in Rust. This book builds it up one
+      layer at a time — how data is stored so it survives, how it is shaped so it
+      can be read quickly, and how three different kinds of search are answered
+      over it. Every term is explained the first time it appears. You do not need
+      a database background to start.
+    </p>
 
-  <pre>cargo run --release -- demo ./data
-cargo run --release -- serve ./data
-cargo run --release --example usage</pre>
+    <h2 id="what">What you will be able to do by the end</h2>
+    <p>
+      Follow a single piece of data — a book in a small library — from the moment
+      it is written, through the files it becomes on disk, to the instant a search
+      finds it again. By the last page you will understand what a vector is and
+      why anyone searches with one; what an index is and why it makes search fast;
+      and how a database can live entirely inside something as plain as a folder
+      or a cloud storage bucket.
+    </p>
 
-  <div class="links">
-    <a href="guide.md">user guide</a>
-    <a href="PROGRESS.md">build log &amp; decisions</a>
-    <a href="benchmarks.md">benchmarks</a>
-  </div>
+    <div class="define">
+      <span class="term-name">The running example</span>
+      <p>
+        Throughout the book we keep a tiny library of five books in a namespace
+        called <code>books</code>. The same five documents reappear at every
+        layer, so you always know what the machinery is actually moving.
+      </p>
+    </div>
 
-  <footer>brevity is the soul of wit</footer>
+    <pre class="diagram">books
+  1  A Wizard of Earthsea     fantasy  4.5  1968
+  2  The Dispossessed         scifi    4.8  1974
+  3  Dune                     scifi    4.7  1965
+  4  The Left Hand of Darkness scifi   4.6  1969
+  5  The Hobbit               fantasy  4.7  1937</pre>
+
+    <h2 id="how">How to read it</h2>
+    <p>
+      The chapters are a ladder: each one assumes the one before it and adds a
+      single new idea. Most sections start with the problem in plain language —
+      often the naive thing you might first try, and exactly how it breaks — and
+      only then show how Sana solves it. Diagrams and a handful of interactive
+      panels let you poke at the moving parts. Words in the
+      <a href="book/glossary.html">glossary</a> are defined there if a chapter
+      goes too fast.
+    </p>
+
+    <section aria-labelledby="parts-title">
+      <h2 id="parts-title">The four parts</h2>
+      <div class="toc-table">
+        <a class="toc-row" href="book/intro.html">
+          <span>01</span>
+          <strong>Introduction</strong>
+          <span>What a search database is, the three kinds of question people ask of data, and why Sana stores everything in object storage.</span>
+        </a>
+        <a class="toc-row" href="book/storage.html">
+          <span>02</span>
+          <strong>The durable boundary</strong>
+          <span>How writes are made to survive crashes using only an object store's handful of operations: immutable files and compare-and-set.</span>
+        </a>
+        <a class="toc-row" href="book/sstable-lsm.html">
+          <span>03</span>
+          <strong>SSTables and LSM trees</strong>
+          <span>Why data is kept in sorted, never-edited files, how a lookup finds a key fast, and how background merging keeps reads cheap.</span>
+        </a>
+        <a class="toc-row" href="book/query.html">
+          <span>04</span>
+          <strong>The query engine</strong>
+          <span>A consistent snapshot, a candidate list that is always rechecked, attribute filters, and full-text search with BM25.</span>
+        </a>
+        <a class="toc-row" href="book/vector.html">
+          <span>05</span>
+          <strong>Vector search from zero</strong>
+          <span>What a vector and an embedding are, why distance means similarity, and how to search millions of them without checking every one.</span>
+        </a>
+        <a class="toc-row" href="book/spfresh-rabitq.html">
+          <span>06</span>
+          <strong>SPFresh and RaBitQ</strong>
+          <span>Keeping a vector index fresh as data changes, and making each comparison cheap by testing a compressed sketch before the real one.</span>
+        </a>
+        <a class="toc-row" href="book/operations.html">
+          <span>07</span>
+          <strong>Running the system</strong>
+          <span>Who is allowed to do work, how a process starts and stops safely, where the milliseconds go, and what is honestly still unfinished.</span>
+        </a>
+      </div>
+    </section>
+
+    <div class="callout">
+      <strong>A note on what this is.</strong> Sana is an AI-assisted educational
+      project — a clone of the ideas behind
+      <a href="https://turbopuffer.com">turbopuffer</a>, written to be read and
+      learned from, not to run a business on. The code in the repository is the
+      final authority; this book is a guided reading of it.
+    </div>
+  </article>
 </main>
+
+<footer class="site-footer">
+  <span>Built from the Sana repository.</span>
+  <a href="guide.md">guide</a>
+  <a href="ARCHITECTURE.md">architecture</a>
+  <a href="PROGRESS.md">progress</a>
+  <a href="TODO.md">todo</a>
+</footer>
 </body>
 </html>

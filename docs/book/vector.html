@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vector Search From Zero - Sana Book</title>
+<link rel="stylesheet" href="style.css">
+<script defer src="book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+  <nav class="top-nav" aria-label="Book navigation">
+    <a class="brand" href="../index.html">sana book</a>
+    <div class="nav-links">
+      <a href="intro.html">intro</a>
+      <a href="storage.html">storage</a>
+      <a href="sstable-lsm.html">sst + lsm</a>
+      <a href="query.html">query</a>
+      <a href="vector.html">vectors</a>
+      <a href="spfresh-rabitq.html">spfresh + rabitq</a>
+      <a href="operations.html">operations</a>
+      <a href="glossary.html">glossary</a>
+    </div>
+  </nav>
+</header>
+<main id="main" class="book-page">
+  <article class="book-content">
+    <p class="chapter-kicker">05 / retrieval</p>
+    <h1>Searching by meaning.</h1>
+    <p class="lede">
+      Filters match facts and full-text matches words. But "find me books that
+      <em>feel like</em> Dune" is neither — it is about meaning. Answering it is
+      what vectors are for. We start with what a vector even is and build up to
+      searching millions of them.
+    </p>
+
+    <h2 id="what-vector">What a vector is</h2>
+    <p>
+      A <strong>vector</strong> is just an ordered list of numbers. That's all.
+      <code>[0.9, 0.1]</code> is a vector with two numbers; <code>[0.2, 0.8, 0.5]</code>
+      has three. The useful way to picture it is as a point in space: two numbers
+      place a point on a flat map (an x and a y), three numbers place it in a room,
+      and although we can't picture it, a list of 768 numbers places a point in
+      768-dimensional space the same way.
+    </p>
+    <div class="define">
+      <span class="term-name">Vector</span>
+      <p>
+        An ordered list of numbers, understood as the coordinates of a point. The
+        count of numbers is the number of <strong>dimensions</strong>. Two points
+        being "close" in this space is the entire basis of vector search.
+      </p>
+    </div>
+
+    <h2 id="embedding">Where meaning comes from: embeddings</h2>
+    <p>
+      A list of numbers has nothing to do with books or meaning — until we choose
+      the numbers carefully. An <strong>embedding</strong> is a vector produced by
+      a trained model whose whole job is to place similar things near each other.
+      Feed it the text of <em>Dune</em> and it returns a few hundred numbers; feed
+      it <em>The Left Hand of Darkness</em> and it returns another few hundred —
+      and because both are dense, thoughtful science fiction, those two points land
+      near each other, while a cookbook lands far away.
+    </p>
+    <div class="define">
+      <span class="term-name">Embedding</span>
+      <p>
+        A vector that represents the <em>meaning</em> of something — a sentence, a
+        document, an image — created by a model trained so that similar inputs map
+        to nearby points. The numbers individually mean nothing; only their
+        positions relative to other embeddings carry the meaning.
+      </p>
+    </div>
+    <p class="plain">
+      You do not need to understand how the model is trained to use it. For this
+      book, an embedding is a black box: text in, a point in space out, with the
+      one guarantee that closeness equals similarity. Sana stores these points; it
+      does not produce them.
+    </p>
+
+    <h2 id="similarity">Closeness is similarity</h2>
+    <p>
+      If similar meanings sit at nearby points, then "find similar books" becomes
+      "find nearby points." To search, we embed the query into the same space and
+      look for the stored points closest to it. Drag the query below: notice that
+      what counts is the <em>direction</em> a point sits in — items pointing the
+      same way are judged most alike.
+    </p>
+
+    <div class="demo" data-similarity-demo>
+      <div class="demo-header">
+        <span class="demo-title">Nearest by direction</span>
+        <label class="range-control">query angle
+          <input data-sim-angle type="range" min="0" max="360" value="40">
+        </label>
+      </div>
+      <div class="demo-body">
+        <canvas class="vector-canvas" aria-label="Interactive similarity diagram: a query direction and labelled item vectors"></canvas>
+        <div class="stat-line"><span data-sim-stat></span></div>
+      </div>
+    </div>
+    <p>
+      "Close" needs a precise meaning, and there are a few. The
+      <strong>distance metric</strong> is how Sana turns two vectors into one
+      number that says how alike they are.
+    </p>
+    <table class="matrix">
+      <thead><tr><th>Metric</th><th>Measures</th><th>Good when</th></tr></thead>
+      <tbody>
+        <tr><td><strong>L2</strong> (Euclidean)</td><td>straight-line distance between the points</td><td>magnitude matters; smaller is closer</td></tr>
+        <tr><td><strong>Dot product</strong></td><td>alignment, scaled by length</td><td>embeddings already tuned for it; larger is closer</td></tr>
+        <tr><td><strong>Cosine</strong></td><td>the angle between directions, ignoring length</td><td>only direction should matter — the demo above</td></tr>
+      </tbody>
+    </table>
+
+    <h2 id="exact">The honest way: check everything</h2>
+    <p>
+      The simplest correct search is <strong>exact k-nearest-neighbor</strong>
+      search: compare the query to every stored vector, score each with the metric,
+      sort, and return the best <code>k</code>. For our five books this is instant
+      and perfectly accurate.
+    </p>
+    <div class="define">
+      <span class="term-name">k-nearest-neighbor (kNN)</span>
+      <p>
+        Returning the <code>k</code> stored items closest to the query.
+        <em>Exact</em> kNN compares against every item, so it is always right — and
+        its cost grows with the size of the collection.
+      </p>
+    </div>
+    <pre class="diagram">query q = [1.0, 0.0]
+
+id 3  [0.91, 0.04]  ->  score
+id 2  [0.20, 0.80]  ->  score
+id 4  [0.70, 0.20]  ->  score
+...every vector...
+
+sort by score, return top k</pre>
+    <p>
+      It is also a trap at scale. Ten million embeddings of 768 numbers each is
+      billions of multiplications <em>per query</em>. Exact search reads and scores
+      the entire collection every time. We need a way to look at only a small,
+      promising slice.
+    </p>
+
+    <h2 id="ann">The bargain: approximate search</h2>
+    <p>
+      <strong>Approximate nearest neighbor</strong> search trades a sliver of
+      accuracy for an enormous speed-up. The idea is to inspect only the regions of
+      space where good answers are likely to live, ignore the rest, and then score
+      exactly the few survivors. The approximation decides <em>what to look at</em>;
+      an exact rerank decides the <em>final order</em>, so the results that come
+      back are still scored truthfully.
+    </p>
+    <div class="define">
+      <span class="term-name">Recall</span>
+      <p>
+        The fraction of the true nearest neighbors that an approximate search
+        actually returned. Recall of 0.95 means it found 95 of the true top 100.
+        Vector search is the art of pushing recall close to 1.0 while reading as
+        little as possible — and you can dial the trade-off per query.
+      </p>
+    </div>
+
+    <h2 id="ivf">IVF: divide the space into cells</h2>
+    <p>
+      Sana's approximate index is the <strong>inverted file</strong>, or IVF. Build
+      it in two moves. First, run <strong>k-means</strong>, an algorithm that finds a
+      set of representative points called <strong>centroids</strong> — think of them
+      as the "capitals" of natural clusters in the data. Second, file every vector
+      under its nearest centroid, so the space is carved into cells.
+    </p>
+    <div class="define">
+      <span class="term-name">Centroid &amp; cluster</span>
+      <p>
+        A <strong>centroid</strong> is the center of a group of nearby vectors; the
+        group filed under it is a <strong>cluster</strong> (or partition). At query
+        time Sana compares the query only to the centroids, picks the nearest few,
+        and scans just those clusters. The number it scans is the
+        <strong>probes</strong> setting — your accuracy-versus-speed dial.
+      </p>
+    </div>
+    <p>
+      To search, compare the query to the handful of centroids, <strong>probe</strong>
+      the nearest clusters, scan only the vectors filed there, and exact-rerank the
+      survivors. Slide the probe count and watch the candidate set — and the cost —
+      grow as you trade speed for recall:
+    </p>
+
+    <div class="demo" data-vector-demo>
+      <div class="demo-header">
+        <span class="demo-title">IVF probes</span>
+        <label class="range-control">probes
+          <input data-probes type="range" min="1" max="4" value="2">
+        </label>
+      </div>
+      <div class="demo-body">
+        <canvas class="vector-canvas" aria-label="Interactive IVF vector search diagram"></canvas>
+        <div class="stat-line"><span data-vector-stat></span></div>
+      </div>
+    </div>
+    <p class="plain">
+      One probe is fast but might miss a near point that sits just across a cell
+      border; more probes catch it at more cost. The query marked <code>q</code> is
+      reranked exactly against the vectors in the lit clusters only.
+    </p>
+
+    <h2 id="filters">Filtered vector search</h2>
+    <p>
+      Often the meaning question carries a fact alongside it: "books like
+      <em>Dune</em>, but only fantasy." A naive engine would find the nearest
+      vectors and then throw most away for failing the filter — wasted work, and it
+      can return too few. Sana instead stores the filter information
+      <em>beside</em> the IVF data as bitmaps: a cluster-level summary says whether a
+      cluster holds any allowed row at all, and a row-level bitmap says which
+      vectors inside it are eligible. Disallowed clusters are skipped whole.
+    </p>
+    <pre class="diagram">filter: genre = "fantasy"
+
+cluster 0: contains a match  ->  scan rows allowed by mask 101001
+cluster 1: no match at all   ->  skip the entire cluster
+cluster 2: contains a match  ->  scan rows allowed by mask 001110</pre>
+
+    <h2 id="liveness">Updates without editing: the version map</h2>
+    <p>
+      Vector files are immutable like everything else (Chapter 2), so an update
+      cannot edit a stored vector. Instead it writes a <em>new</em> copy in a new
+      segment, and a small <strong>version map</strong> records which copy is the
+      live one for each id. The old vector still sits on disk, but ranking ignores
+      it because the map does not point at it.
+    </p>
+    <div class="define">
+      <span class="term-name">Version map (liveness)</span>
+      <p>
+        A file (<code>versions.bin</code>) mapping each document id to the version
+        of its currently-live vector. A vector copy counts only if the map points
+        at it; stale copies are invisible without ever being deleted. This is how
+        immutable vector files support live updates.
+      </p>
+    </div>
+    <pre class="diagram">versions.bin:  id 17 -> version 4
+
+segment A:  id 17, version 3   ->  stale, ignored
+segment B:  id 17, version 4   ->  live, ranked</pre>
+
+    <div class="callout">
+      <strong>What we earned.</strong> Search by meaning: documents as embedding
+      points, closeness as similarity, exact kNN for correctness and IVF for
+      speed, filters fused into the scan, and a version map so updates work on
+      immutable files. The last chapter on vectors makes this fast index stay fresh
+      and cheap as data changes.
+    </div>
+
+    <section class="refs">
+      <h2>References</h2>
+      <ul>
+        <li><a href="https://github.com/djakish/sana/blob/main/src/vector.rs">src/vector.rs</a></li>
+        <li><a href="https://github.com/djakish/sana/blob/main/src/vector/filter.rs">src/vector/filter.rs</a></li>
+        <li><a href="https://github.com/djakish/sana/blob/main/src/vector/kernels.rs">src/vector/kernels.rs</a></li>
+      </ul>
+    </section>
+  </article>
+  <aside class="side-toc" aria-label="Chapter navigation">
+    <strong>Chapter 05</strong>
+    <a href="#what-vector">what a vector is</a>
+    <a href="#embedding">embeddings</a>
+    <a href="#similarity">similarity</a>
+    <a href="#exact">exact knn</a>
+    <a href="#ann">approximate</a>
+    <a href="#ivf">ivf</a>
+    <a href="#filters">filters</a>
+    <a href="#liveness">liveness</a>
+  </aside>
+</main>
+<nav class="pager" aria-label="Page links">
+  <a href="query.html">Previous: The Query Engine</a>
+  <a href="spfresh-rabitq.html">Next: SPFresh and RaBitQ</a>
+</nav>
+<footer class="site-footer">
+  <span>Sana book</span>
+  <a href="../guide.md">guide</a>
+</footer>
+</body>
+</html>

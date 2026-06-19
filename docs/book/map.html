@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>System Map - Sana Book</title>
+<link rel="stylesheet" href="style.css">
+<script defer src="book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+  <nav class="top-nav" aria-label="Book navigation">
+    <a class="brand" href="../index.html">sana book</a>
+    <div class="nav-links">
+      <a href="intro.html">intro</a>
+      <a href="storage.html">storage</a>
+      <a href="sstable-lsm.html">sst + lsm</a>
+      <a href="query.html">query</a>
+      <a href="vector.html">vectors</a>
+      <a href="spfresh-rabitq.html">spfresh + rabitq</a>
+      <a href="operations.html">operations</a>
+      <a href="glossary.html">glossary</a>
+    </div>
+  </nav>
+</header>
+<main id="main" class="book-page">
+  <article class="book-content">
+    <p class="chapter-kicker">appendix / map</p>
+    <h1>The whole engine, on one page.</h1>
+    <p class="lede">
+      Each chapter adds one layer to the one below it. Here they are stacked, so
+      you can see the whole climb at once and jump back to any rung.
+    </p>
+    <pre class="diagram">Part I — Foundations
+  Ch 1  document, namespace, the three questions, object store
+
+Part II — Storing data that lasts
+  Ch 2  object store: put_if_absent + compare_and_set
+        immutable files, catalog-last publication, the WAL
+  Ch 3  SSTable block format, LSM runs, tombstones
+        compaction, the overlay (base + fresh WAL tail)
+
+Part III — Answering questions
+  Ch 4  snapshot, candidate superset, recheck
+        attribute filters, BM25 full-text, hybrid
+  Ch 5  vector, embedding, distance = similarity
+        exact kNN, ANN, IVF probes, filters, version map
+  Ch 6  SPFresh local maintenance (immutable deltas)
+        RaBitQ quantize -> estimate -> prune -> exact rerank
+
+Part IV — Running it for real
+  Ch 7  API / indexing / maintenance roles, the queue
+        readiness and drain, cache and metrics, the frontier</pre>
+    <p>
+      The repository remains the authority. This book is a reading layer over
+      <a href="../ARCHITECTURE.md">ARCHITECTURE.md</a>,
+      <a href="../PROGRESS.md">PROGRESS.md</a>, and the Rust modules. For a single
+      worked example that exercises every layer at once, read the
+      <a href="trace.html">full trace</a>.
+    </p>
+  </article>
+  <aside class="side-toc" aria-label="Chapters">
+    <strong>Chapters</strong>
+    <a href="intro.html">01 intro</a>
+    <a href="storage.html">02 storage</a>
+    <a href="sstable-lsm.html">03 sst + lsm</a>
+    <a href="query.html">04 query</a>
+    <a href="vector.html">05 vectors</a>
+    <a href="spfresh-rabitq.html">06 spfresh + rabitq</a>
+    <a href="operations.html">07 operations</a>
+    <a href="trace.html">A full trace</a>
+    <a href="glossary.html">Glossary</a>
+  </aside>
+</main>
+<nav class="pager" aria-label="Page links">
+  <a href="glossary.html">Previous: Glossary</a>
+  <a href="intro.html">Start reading: Introduction</a>
+</nav>
+<footer class="site-footer">
+  <span>Sana book</span>
+  <a href="../index.html">contents</a>
+</footer>
+</body>
+</html>

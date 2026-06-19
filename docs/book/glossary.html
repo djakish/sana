@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Glossary - Sana Book</title>
+<link rel="stylesheet" href="style.css">
+<script defer src="book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+  <nav class="top-nav" aria-label="Book navigation">
+    <a class="brand" href="../index.html">sana book</a>
+    <div class="nav-links">
+      <a href="intro.html">intro</a>
+      <a href="storage.html">storage</a>
+      <a href="sstable-lsm.html">sst + lsm</a>
+      <a href="query.html">query</a>
+      <a href="vector.html">vectors</a>
+      <a href="spfresh-rabitq.html">spfresh + rabitq</a>
+      <a href="operations.html">operations</a>
+      <a href="glossary.html">glossary</a>
+    </div>
+  </nav>
+</header>
+<main id="main" class="book-page">
+  <article class="book-content">
+    <p class="chapter-kicker">appendix / glossary</p>
+    <h1>Every term, in one place.</h1>
+    <p class="lede">
+      Every word the book defines, gathered for quick reference. If a chapter
+      moves too fast, look here. The chapter where each idea is introduced is noted
+      in parentheses.
+    </p>
+
+    <dl class="glossary">
+      <dt>Approximate nearest neighbor (ANN)</dt>
+      <dd>Vector search that inspects only the promising regions of space and exact-scores a few survivors, trading a little accuracy for a large speed-up. <em>(Ch. 5)</em></dd>
+
+      <dt>Attribute</dt>
+      <dd>A named value on a document, such as <code>genre</code> or <code>rating</code>. Filters are predicates over attributes. <em>(Ch. 1)</em></dd>
+
+      <dt>Base and overlay</dt>
+      <dd>The <strong>base</strong> is the indexed data named by the manifest; the <strong>overlay</strong> is the fresh WAL tail applied on top at query time. Together they give a view that includes your latest write. <em>(Ch. 3)</em></dd>
+
+      <dt>BM25</dt>
+      <dd>The standard full-text relevance formula. It scores a document by how often the query term appears, how rare that term is overall, and how long the document is. <em>(Ch. 4)</em></dd>
+
+      <dt>Catalog-last publication</dt>
+      <dd>Writing all data files before flipping the one pointer that makes them live, so a reader can never follow the catalog to a missing file. <em>(Ch. 2)</em></dd>
+
+      <dt>Centroid &amp; cluster</dt>
+      <dd>A <strong>centroid</strong> is the center of a group of nearby vectors; the <strong>cluster</strong> is the group filed under it. IVF searches only the clusters near the query. <em>(Ch. 5)</em></dd>
+
+      <dt>Compaction</dt>
+      <dd>Background merging of many sorted runs into one: keep the newest record per id, drop obsolete tombstones, and rebuild clean indexes so reads stay cheap. <em>(Ch. 3)</em></dd>
+
+      <dt>Compare-and-set (CAS)</dt>
+      <dd>Replace a file only if it still holds the exact version you last read; otherwise the store rejects the write. The basis of safe concurrent updates. <em>(Ch. 2)</em></dd>
+
+      <dt>Cursor</dt>
+      <dd>A position in the WAL. The latest committed cursor marks how far writes are durable; the indexed cursor marks how far indexing has caught up. <em>(Ch. 2–3)</em></dd>
+
+      <dt>Distance metric</dt>
+      <dd>The rule that turns two vectors into one number for how alike they are: L2 (straight-line distance), dot product (alignment), or cosine (angle only). <em>(Ch. 5)</em></dd>
+
+      <dt>Document</dt>
+      <dd>One record: an id plus attributes, optional text, and optional vectors. The unit you store and the unit a search returns. <em>(Ch. 1)</em></dd>
+
+      <dt>Drain</dt>
+      <dd>On shutdown, refusing new traffic while letting in-flight requests finish, so no request is dropped. <em>(Ch. 7)</em></dd>
+
+      <dt>Embedding</dt>
+      <dd>A vector that represents the meaning of something, produced by a model trained so that similar inputs land at nearby points. <em>(Ch. 5)</em></dd>
+
+      <dt>False positive / false negative</dt>
+      <dd>A candidate that does not really match (harmless — it gets rechecked) versus a real match the index forgot (fatal). Sana's indexes allow the first and forbid the second. <em>(Ch. 4)</em></dd>
+
+      <dt>Generation</dt>
+      <dd>A numbered version of a namespace's catalog. Publishing means CAS-advancing <code>manifest/current</code> to a new generation. <em>(Ch. 2)</em></dd>
+
+      <dt>Hybrid retrieval</dt>
+      <dd>Combining different search types — e.g. vector and full-text — over one snapshot and fusing their ranked lists into a single result. <em>(Ch. 4)</em></dd>
+
+      <dt>Immutable object</dt>
+      <dd>A file written once and never changed. It can be content-addressed, cached forever, and shared freely because it can never go stale. <em>(Ch. 2)</em></dd>
+
+      <dt>Index</dt>
+      <dd>A precomputed structure that turns a question into a short candidate list without scanning everything. Sana keeps one per question type. <em>(Ch. 1)</em></dd>
+
+      <dt>IVF (inverted file)</dt>
+      <dd>A vector index that clusters vectors around centroids; a query probes the nearest clusters and scans only those. <em>(Ch. 5)</em></dd>
+
+      <dt>k-nearest-neighbor (kNN)</dt>
+      <dd>Returning the <code>k</code> stored items closest to a query. Exact kNN compares against every item; approximate kNN does not. <em>(Ch. 5)</em></dd>
+
+      <dt>Lease</dt>
+      <dd>A time-limited, fenced claim on a namespace so exactly one indexing worker processes it at a time. <em>(Ch. 7)</em></dd>
+
+      <dt>Linearization point</dt>
+      <dd>The single instant — the CAS reservation on the commit cursor — at which a write is fixed to come before or after every other. <em>(Ch. 2)</em></dd>
+
+      <dt>Liveness vs. readiness</dt>
+      <dd><strong>Liveness</strong>: the process is running (else restart it). <strong>Readiness</strong>: it should get traffic now (else stop routing, but keep it alive). <em>(Ch. 7)</em></dd>
+
+      <dt>LSM tree (log-structured merge tree)</dt>
+      <dd>A stack of immutable sorted runs, newest on top, read newest-first and merged in the background. How Sana stores ever-changing data in never-changing files. <em>(Ch. 3)</em></dd>
+
+      <dt>Manifest</dt>
+      <dd>A namespace's catalog: the immutable file listing exactly which runs and vector files make up the current generation, named by the <code>manifest/current</code> pointer. <em>(Ch. 2)</em></dd>
+
+      <dt>Namespace</dt>
+      <dd>A named, self-contained collection of documents with its own data, indexes, and catalog. <em>(Ch. 1)</em></dd>
+
+      <dt>Object store</dt>
+      <dd>A service that holds named blobs of bytes (S3, or a local folder). Sana keeps every durable byte here and nothing else. <em>(Ch. 1)</em></dd>
+
+      <dt>Optimistic concurrency</dt>
+      <dd>Don't lock up front; attempt a change and let the store reject it if the world moved. Implemented with CAS. <em>(Ch. 2)</em></dd>
+
+      <dt>Orphan</dt>
+      <dd>An immutable file that was written but never became live (a lost race, or an interrupted write). Harmless; reclaimed later. <em>(Ch. 2)</em></dd>
+
+      <dt>Posting list</dt>
+      <dd>For a given value or term, the sorted list of document ids that have it. The building block of attribute and full-text indexes. <em>(Ch. 4)</em></dd>
+
+      <dt>Probes</dt>
+      <dd>How many of the nearest IVF clusters a query scans — the accuracy-versus-speed dial. <em>(Ch. 5)</em></dd>
+
+      <dt>Quantization</dt>
+      <dd>Storing numbers at lower precision to make comparisons cheap. RaBitQ goes down to one bit per dimension. <em>(Ch. 6)</em></dd>
+
+      <dt>RaBitQ</dt>
+      <dd>A quantization scheme that codes each vector's normalized residual as one bit per dimension, with an error bound, so distances can be estimated cheaply and pruned before exact reranking. <em>(Ch. 6)</em></dd>
+
+      <dt>Recall</dt>
+      <dd>The fraction of the true nearest neighbors an approximate search actually returned. The number you push toward 1.0 while reading as little as possible. <em>(Ch. 5)</em></dd>
+
+      <dt>Recheck (superset rule)</dt>
+      <dd>An index may return too many candidates but never too few; each candidate is verified against the live document before it enters the answer. <em>(Ch. 4)</em></dd>
+
+      <dt>Residual</dt>
+      <dd>A vector's offset from its cluster centroid (<code>o − c</code>). Within a cluster, residuals are what distinguish vectors, so RaBitQ codes them. <em>(Ch. 6)</em></dd>
+
+      <dt>Run</dt>
+      <dd>One sorted SST produced by a single flush; runs stack newest-first in the LSM. <em>(Ch. 3)</em></dd>
+
+      <dt>Snapshot</dt>
+      <dd>A single consistent view of a namespace captured at the start of a query, so every part of the answer reflects the same instant. <em>(Ch. 4)</em></dd>
+
+      <dt>SPFresh (LIRE)</dt>
+      <dd>A scheme for keeping a cluster index healthy with local split/merge/reassign repairs instead of global rebuilds. <em>(Ch. 6)</em></dd>
+
+      <dt>SSTable (SST)</dt>
+      <dd>An immutable file of key-value pairs sorted by key, split into blocks with an index, so any key is found in a few small reads. <em>(Ch. 3)</em></dd>
+
+      <dt>Token</dt>
+      <dd>A unit of text for full-text search — roughly a lowercased word. Documents are indexed and queried by their tokens. <em>(Ch. 4)</em></dd>
+
+      <dt>Tombstone</dt>
+      <dd>A marker in a newer run that records a deletion, hiding an older document without editing the run that still holds it. <em>(Ch. 3)</em></dd>
+
+      <dt>Vector</dt>
+      <dd>An ordered list of numbers, read as the coordinates of a point. Closeness between points is the basis of vector search. <em>(Ch. 5)</em></dd>
+
+      <dt>Version map (liveness)</dt>
+      <dd><code>versions.bin</code>: which version of each id's vector is live. Updates write a new copy and re-point the map; stale copies are ignored, never edited. <em>(Ch. 5)</em></dd>
+
+      <dt>WAL (write-ahead log)</dt>
+      <dd>An ordered, append-only record of every change, written before anything else. The source of truth for what has been accepted; a write is durable once its WAL entry commits. <em>(Ch. 2)</em></dd>
+    </dl>
+
+    <section class="refs">
+      <h2>Go deeper</h2>
+      <ul>
+        <li><a href="../ARCHITECTURE.md">docs/ARCHITECTURE.md — the engine as it stands</a></li>
+        <li><a href="../PROGRESS.md">docs/PROGRESS.md — every design decision, dated</a></li>
+        <li><a href="map.html">System map — the whole engine on one page</a></li>
+      </ul>
+    </section>
+  </article>
+  <aside class="side-toc" aria-label="Glossary navigation">
+    <strong>Glossary</strong>
+    <a href="intro.html">Ch 01 intro</a>
+    <a href="storage.html">Ch 02 storage</a>
+    <a href="sstable-lsm.html">Ch 03 sst + lsm</a>
+    <a href="query.html">Ch 04 query</a>
+    <a href="vector.html">Ch 05 vectors</a>
+    <a href="spfresh-rabitq.html">Ch 06 spfresh</a>
+    <a href="operations.html">Ch 07 operations</a>
+  </aside>
+</main>
+<nav class="pager" aria-label="Page links">
+  <a href="trace.html">Previous: A Full Trace</a>
+  <a href="map.html">Next: System Map</a>
+</nav>
+<footer class="site-footer">
+  <span>Sana book</span>
+  <a href="../index.html">contents</a>
+</footer>
+</body>
+</html>

@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A Full Trace - Sana Book</title>
+<link rel="stylesheet" href="style.css">
+<script defer src="book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+  <nav class="top-nav" aria-label="Book navigation">
+    <a class="brand" href="../index.html">sana book</a>
+    <div class="nav-links">
+      <a href="intro.html">intro</a>
+      <a href="storage.html">storage</a>
+      <a href="sstable-lsm.html">sst + lsm</a>
+      <a href="query.html">query</a>
+      <a href="vector.html">vectors</a>
+      <a href="spfresh-rabitq.html">spfresh + rabitq</a>
+      <a href="operations.html">operations</a>
+      <a href="glossary.html">glossary</a>
+    </div>
+  </nav>
+</header>
+<main id="main" class="book-page">
+  <article class="book-content">
+    <p class="chapter-kicker">appendix / capstone</p>
+    <h1>One query, end to end.</h1>
+    <p class="lede">
+      Every chapter added one layer. Here they run together. We follow a single
+      realistic search through the whole engine, from the pointer in the object
+      store to the ranked list that comes back — naming the chapter behind each
+      step.
+    </p>
+
+    <h2 id="setup">The setup</h2>
+    <p>
+      Our library is indexed, but a moment ago someone re-rated <em>The Hobbit</em>
+      (id 5). That write is durable in the WAL but not yet folded into the indexes —
+      so it lives only in the overlay. Now a reader asks a <strong>hybrid</strong>
+      question: <em>"fantasy books most similar in meaning to this embedding,
+      rated 4.5 or higher, top 3."</em> It touches storage, the overlay, filters,
+      and the full vector pipeline at once.
+    </p>
+    <pre class="diagram">recent write (not yet indexed):  id 5 rating 4.5 -> 4.9
+
+query:
+  filter      genre = "fantasy" AND rating >= 4.5
+  approx_vector  embedding ~ [0.91, 0.04, ...]  k = 3</pre>
+
+    <h2 id="walk">The walk</h2>
+    <ol class="step-list">
+      <li><span><strong>Fix a snapshot.</strong> Read <code>manifest/current</code>, then the manifest body it names, then the committed WAL cursor. This freezes one consistent view for the whole query. <em>(Ch. 2, Ch. 4)</em></span></li>
+      <li><span><strong>Build base + overlay.</strong> The SST runs and vector files named by the manifest are the base; the WAL slice after the indexed cursor is the overlay. The re-rating of id 5 is in that overlay, so this query will see 4.9, not 4.5. <em>(Ch. 3)</em></span></li>
+      <li><span><strong>Plan the query.</strong> It is a filtered vector search, so Sana takes the materialize path: narrow by filter, search vectors, recheck, rank. <em>(Ch. 4)</em></span></li>
+      <li><span><strong>Narrow by filter.</strong> The attribute index returns a superset of ids with <code>genre = "fantasy"</code> — generous on purpose, to be rechecked later. <em>(Ch. 4)</em></span></li>
+      <li><span><strong>Probe the IVF.</strong> Compare the query embedding to the centroids, pick the nearest few clusters, and scan only those — skipping clusters whose filter bitmap holds no fantasy row at all. <em>(Ch. 5)</em></span></li>
+      <li><span><strong>Estimate with RaBitQ, then prune.</strong> Use the one-bit codes to estimate each candidate's distance; drop any whose best-possible distance cannot reach the top 3. <em>(Ch. 6)</em></span></li>
+      <li><span><strong>Check liveness.</strong> Consult <code>versions.bin</code> and discard stale vector copies, keeping one live vector per id. <em>(Ch. 5)</em></span></li>
+      <li><span><strong>Exact rerank.</strong> Score the few survivors with full precision, and score the overlay's fresh vectors exactly too, then merge — so a just-written vector ranks correctly against indexed ones. <em>(Ch. 5)</em></span></li>
+      <li><span><strong>Recheck the filter.</strong> For each surviving candidate, load the live document and confirm it really is fantasy and really is rated ≥ 4.5. Id 5 passes <em>because</em> the overlay lifted it to 4.9. <em>(Ch. 4)</em></span></li>
+      <li><span><strong>Rank, limit, return.</strong> Order by score, keep the top 3, and return each document with its score. <em>(Ch. 4)</em></span></li>
+    </ol>
+
+    <h2 id="bytes">What actually got read</h2>
+    <p>
+      Notice how little of the store was touched. The query followed one pointer,
+      read one catalog, scanned a couple of clusters, and read a handful of
+      documents to recheck. Most of those objects are immutable, so on a warm cache
+      they never reached S3 at all — the difference the
+      <a href="operations.html#cache">latency demo</a> made visible.
+    </p>
+    <pre class="diagram">manifest/current          1 small read   (mutable, not cached)
+manifest/g/41.json        1 read         (immutable, cacheable)
+wal overlay               a few reads    (the fresh tail)
+attribute postings        filter superset
+ivf base + deltas         only probed clusters
+doc SSTs                  one block per rechecked id</pre>
+
+    <div class="callout">
+      <strong>The whole book, in one request.</strong> Durable storage and a CAS
+      pointer (Ch. 2); sorted runs plus a live overlay (Ch. 3); a snapshot with a
+      superset-and-recheck filter (Ch. 4); IVF approximate search with a version map
+      (Ch. 5); RaBitQ estimate-then-rerank and immutable deltas (Ch. 6); served and
+      cached by a role-split process (Ch. 7). No layer is wasted, and none is
+      trusted blindly.
+    </div>
+
+    <section class="refs">
+      <h2>References</h2>
+      <ul>
+        <li><a href="https://github.com/djakish/sana/blob/main/src/query.rs">src/query.rs — the planner</a></li>
+        <li><a href="../ARCHITECTURE.md">docs/ARCHITECTURE.md — the read &amp; query path (§6)</a></li>
+        <li><a href="../guide.md">docs/guide.md — the same queries as real requests</a></li>
+      </ul>
+    </section>
+  </article>
+  <aside class="side-toc" aria-label="Section navigation">
+    <strong>Capstone</strong>
+    <a href="#setup">the setup</a>
+    <a href="#walk">the walk</a>
+    <a href="#bytes">what got read</a>
+  </aside>
+</main>
+<nav class="pager" aria-label="Page links">
+  <a href="operations.html">Previous: Running the System</a>
+  <a href="glossary.html">Next: Glossary</a>
+</nav>
+<footer class="site-footer">
+  <span>Sana book</span>
+  <a href="../ARCHITECTURE.md">architecture</a>
+</footer>
+</body>
+</html>

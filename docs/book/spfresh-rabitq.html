@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SPFresh and RaBitQ - Sana Book</title>
+<link rel="stylesheet" href="style.css">
+<script defer src="book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+  <nav class="top-nav" aria-label="Book navigation">
+    <a class="brand" href="../index.html">sana book</a>
+    <div class="nav-links">
+      <a href="intro.html">intro</a>
+      <a href="storage.html">storage</a>
+      <a href="sstable-lsm.html">sst + lsm</a>
+      <a href="query.html">query</a>
+      <a href="vector.html">vectors</a>
+      <a href="spfresh-rabitq.html">spfresh + rabitq</a>
+      <a href="operations.html">operations</a>
+      <a href="glossary.html">glossary</a>
+    </div>
+  </nav>
+</header>
+<main id="main" class="book-page">
+  <article class="book-content">
+    <p class="chapter-kicker">06 / freshness and quantization</p>
+    <h1>Staying fresh, staying cheap.</h1>
+    <p class="lede">
+      The IVF index from Chapter 5 has two weaknesses once data keeps changing.
+      Its clusters drift out of shape, and scoring full-precision vectors is still
+      heavy. Two ideas fix them: SPFresh keeps the clusters healthy locally, and
+      RaBitQ makes each comparison almost free.
+    </p>
+
+    <h2 id="drift">Why a cluster index rots</h2>
+    <p>
+      The centroids were chosen by looking at the data <em>as it was</em> when the
+      index was built. As new books are added and old ones change, some clusters
+      swell huge and others empty out. A bloated cluster means scanning thousands
+      of vectors on a probe; a lopsided layout means the nearest centroid is no
+      longer a good guide to the nearest vector. Recall quietly drops.
+    </p>
+    <p>
+      There are two obvious responses, and both are bad. Rebuild the entire index
+      from scratch on every change — correct, but ruinously expensive at scale.
+      Or never rebuild — cheap, but the index decays until it is useless. We want
+      the middle: fix only the parts that actually went out of shape.
+    </p>
+    <div class="define">
+      <span class="term-name">SPFresh (LIRE)</span>
+      <p>
+        A design for keeping a cluster index healthy with <em>local</em> repairs
+        instead of global rebuilds. Its rule, LIRE, does three small things: split
+        a cluster that has grown too big, merge one that has shrunk too small, and
+        reassign the handful of boundary vectors near the clusters it just changed.
+        The rest of the index is left untouched.
+      </p>
+    </div>
+    <pre class="diagram">base IVF
+  c0: 1200 rows
+  c1:  980 rows
+  c2:  210 rows   (too small)
+  c3: 1810 rows   (too big)
+
+local plan
+  c3 -> split into two
+  c2 -> merge with its nearest neighbor
+  boundary vectors nearby -> reassign to the right cluster</pre>
+
+    <h2 id="sana">Sana's twist: immutable deltas</h2>
+    <p>
+      SPFresh as published edits the index in place. Sana cannot — every file is
+      immutable (<a href="storage.html">Chapter 2</a>). So instead of mutating the
+      base, Sana <em>publishes the repair as a new file</em>: a small delta segment
+      for each append, reassignment, or local rebuild. The version map from Chapter
+      5 then makes the newest copy of each vector the live one.
+    </p>
+    <pre class="diagram">vector family for "embedding"
+  ivf.bin                  base index
+  append-42.ivf.bin        new vectors since the base
+  reassign-43.ivf.bin      boundary vectors moved
+  local-rebuild-44.ivf.bin a cluster rebuilt locally
+  versions.bin             which copy is live per id
+
+query: scan base + deltas, drop stale versions, rerank the live ones</pre>
+    <p class="plain">
+      This is the same pattern as the LSM in Chapter 3: never edit, always append a
+      newer layer, and let a liveness rule decide what counts. Compaction later
+      folds the deltas back into a clean base, exactly as it merges SST runs.
+    </p>
+
+    <h2 id="rabitq">RaBitQ: shrink every vector to bits</h2>
+    <p>
+      The second weakness is raw cost. Even after IVF narrows the field, exact-
+      scoring each survivor means crunching hundreds of full-precision numbers.
+      <strong>Quantization</strong> is the fix: replace each number with a much
+      smaller approximation, so a first-pass comparison is cheap.
+    </p>
+    <div class="define">
+      <span class="term-name">Quantization</span>
+      <p>
+        Compressing numbers by storing them at lower precision — here, all the way
+        down to a single bit per dimension. The compressed form is too rough for a
+        final answer but plenty good for quickly deciding which vectors are worth a
+        full, exact comparison.
+      </p>
+    </div>
+    <p>
+      RaBitQ does this cleverly. For a vector <code>o</code> in a cluster with
+      centroid <code>c</code>, it works with the <strong>residual</strong> — the
+      offset from the centroid, <code>o − c</code> — because within a cluster the
+      residuals are what tell vectors apart. It normalizes that residual to unit
+      length, rotates it by a fixed random transform (which spreads information
+      evenly across the bits), and keeps just the <em>sign</em> of each dimension:
+      one bit. Alongside the bits it stores the residual's length and a small
+      correction term so the rough estimate can be de-biased.
+    </p>
+    <pre class="diagram">vector o, centroid c
+
+residual       r  = o - c
+unit residual  u  = r / length(r)
+rotated        u' = P * u            (fixed random rotation)
+code bits      b  = sign(u')         (one bit per dimension)
+stored         length(r), correction</pre>
+
+    <h2 id="bound">Estimate, prune, then rerank</h2>
+    <p>
+      At query time Sana rotates the query's residual once per cluster, then uses
+      fast bit operations to <em>estimate</em> the distance to every code. Crucially,
+      RaBitQ comes with a mathematical error bound, so each estimate has a known
+      best-case. If a candidate's best possible distance still can't beat the
+      current top-k, it is pruned without ever touching its full vector. Only the
+      genuine contenders are scored exactly.
+    </p>
+    <pre class="diagram">for each probed cluster
+  rotate the query residual
+  estimate distance from the bits        (cheap)
+  compute the lower bound
+  if the lower bound cannot win -> prune  (skip the full vector)
+  else -> exact distance against the full vector</pre>
+    <div class="callout">
+      RaBitQ is never the final answer; it is a cheap test that decides which
+      expensive comparisons are still worth paying for. The exact rerank — the same
+      one from Chapter 5 — always has the last word, so quantization speeds things
+      up without making the ranking wrong.
+    </div>
+
+    <h2 id="fit">Why the pieces fit</h2>
+    <p>
+      IVF gives clusters. SPFresh-style maintenance keeps those clusters the right
+      size and shape as data churns. RaBitQ reuses the very same clusters to store
+      a one-bit sketch per vector. And the object-store rules from Part II — immutable
+      files, a version map, catalog-last publication — let all of it be appended and
+      published without ever editing anything.
+    </p>
+    <table class="matrix">
+      <thead><tr><th>Idea</th><th>In Sana</th><th>The invariant it keeps</th></tr></thead>
+      <tbody>
+        <tr><td>SPFresh / LIRE</td><td>local split/merge/reassign deltas</td><td>fix local imbalance, never a global rebuild</td></tr>
+        <tr><td>Version map</td><td><code>versions.bin</code></td><td>exactly one live vector copy per id</td></tr>
+        <tr><td>RaBitQ code</td><td><code>*.rabitq.bin</code></td><td>estimate first, exact-rerank the survivors</td></tr>
+        <tr><td>Object store</td><td>immutable segment publication</td><td>data exists before the catalog names it</td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout">
+      <strong>What we earned.</strong> A vector index that stays accurate while
+      data changes and stays cheap while it is queried — both achieved by appending
+      immutable deltas rather than editing, exactly like the rest of Sana. The
+      engine is complete; what remains is running it.
+    </div>
+
+    <section class="refs">
+      <h2>References</h2>
+      <ul>
+        <li><a href="https://arxiv.org/abs/2410.14452">SPFresh: Incremental In-Place Update for Billion-Scale Vector Search</a></li>
+        <li><a href="https://arxiv.org/abs/2405.12497">RaBitQ: Quantizing High-Dimensional Vectors with a Theoretical Error Bound</a></li>
+        <li><a href="https://github.com/djakish/sana/blob/main/src/vector/maintenance.rs">src/vector/maintenance.rs</a></li>
+        <li><a href="https://github.com/djakish/sana/blob/main/src/rabitq.rs">src/rabitq.rs</a></li>
+      </ul>
+    </section>
+  </article>
+  <aside class="side-toc" aria-label="Chapter navigation">
+    <strong>Chapter 06</strong>
+    <a href="#drift">why it rots</a>
+    <a href="#sana">immutable deltas</a>
+    <a href="#rabitq">rabitq</a>
+    <a href="#bound">estimate + rerank</a>
+    <a href="#fit">why it fits</a>
+  </aside>
+</main>
+<nav class="pager" aria-label="Page links">
+  <a href="vector.html">Previous: Vector Search From Zero</a>
+  <a href="operations.html">Next: Running the System</a>
+</nav>
+<footer class="site-footer">
+  <span>Sana book</span>
+  <a href="../PROGRESS.md">progress</a>
+</footer>
+</body>
+</html>

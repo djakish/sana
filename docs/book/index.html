@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Book Directory - Sana Book</title>
+<link rel="stylesheet" href="style.css">
+<script defer src="book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+  <nav class="top-nav" aria-label="Book navigation">
+    <a class="brand" href="../index.html">sana book</a>
+    <div class="nav-links">
+      <a href="intro.html">intro</a>
+      <a href="storage.html">storage</a>
+      <a href="sstable-lsm.html">sst + lsm</a>
+      <a href="query.html">query</a>
+      <a href="vector.html">vectors</a>
+      <a href="spfresh-rabitq.html">spfresh + rabitq</a>
+      <a href="operations.html">operations</a>
+      <a href="glossary.html">glossary</a>
+    </div>
+  </nav>
+</header>
+<main id="main" class="book-home">
+  <aside class="home-toc" aria-label="Contents">
+    <strong>Contents</strong>
+    <a href="intro.html">01 Introduction</a>
+    <a href="storage.html">02 The durable boundary</a>
+    <a href="sstable-lsm.html">03 SSTables and LSM trees</a>
+    <a href="query.html">04 The query engine</a>
+    <a href="vector.html">05 Vector search</a>
+    <a href="spfresh-rabitq.html">06 SPFresh and RaBitQ</a>
+    <a href="operations.html">07 Running the system</a>
+    <a href="trace.html">A full trace</a>
+    <a href="glossary.html">Glossary</a>
+    <a href="map.html">System map</a>
+  </aside>
+  <article class="home-content">
+    <p class="eyebrow">Sana book</p>
+    <h1>Book directory.</h1>
+    <p class="lede">
+      These are the static HTML pages of the book. The canonical front page —
+      with the preface and grouped table of contents — is
+      <a href="../index.html">one directory up</a>.
+    </p>
+    <div class="toc-table">
+      <a class="toc-row" href="intro.html"><span>01</span><strong>Introduction</strong><span>Documents, the three questions, and object storage.</span></a>
+      <a class="toc-row" href="storage.html"><span>02</span><strong>The durable boundary</strong><span>Immutable files, compare-and-set, and the WAL.</span></a>
+      <a class="toc-row" href="sstable-lsm.html"><span>03</span><strong>SSTables and LSM trees</strong><span>Sorted runs, lookups, tombstones, compaction, overlay.</span></a>
+      <a class="toc-row" href="query.html"><span>04</span><strong>The query engine</strong><span>Snapshots, the recheck rule, filters, and BM25.</span></a>
+      <a class="toc-row" href="vector.html"><span>05</span><strong>Vector search from zero</strong><span>Vectors, embeddings, similarity, exact kNN, IVF.</span></a>
+      <a class="toc-row" href="spfresh-rabitq.html"><span>06</span><strong>SPFresh and RaBitQ</strong><span>Fresh clusters and one-bit distance estimates.</span></a>
+      <a class="toc-row" href="operations.html"><span>07</span><strong>Running the system</strong><span>Roles, health, the time budget, and the frontier.</span></a>
+      <a class="toc-row" href="trace.html"><span>—</span><strong>A full trace</strong><span>One query through every layer of the book.</span></a>
+      <a class="toc-row" href="glossary.html"><span>—</span><strong>Glossary</strong><span>Every term, in one place.</span></a>
+    </div>
+  </article>
+</main>
+<footer class="site-footer">
+  <span>Sana book</span>
+  <a href="../index.html">contents</a>
+</footer>
+</body>
+</html>

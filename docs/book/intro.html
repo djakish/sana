@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Introduction - Sana Book</title>
+<link rel="stylesheet" href="style.css">
+<script defer src="book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+  <nav class="top-nav" aria-label="Book navigation">
+    <a class="brand" href="../index.html">sana book</a>
+    <div class="nav-links">
+      <a href="intro.html">intro</a>
+      <a href="storage.html">storage</a>
+      <a href="sstable-lsm.html">sst + lsm</a>
+      <a href="query.html">query</a>
+      <a href="vector.html">vectors</a>
+      <a href="spfresh-rabitq.html">spfresh + rabitq</a>
+      <a href="operations.html">operations</a>
+      <a href="glossary.html">glossary</a>
+    </div>
+  </nav>
+</header>
+<main id="main" class="book-page">
+  <article class="book-content">
+    <p class="chapter-kicker">01 / introduction</p>
+    <h1>What a search database does.</h1>
+    <p class="lede">
+      Before any machinery, the question: what is the job? A search database
+      takes a pile of things and answers questions about them quickly. This
+      chapter sets up the words we will use for the rest of the book.
+    </p>
+
+    <h2 id="documents">Things and their fields</h2>
+    <p>
+      Everything starts with the things you want to keep. In Sana each thing is a
+      <strong>document</strong>: an item with an identifier and some named fields.
+      Our running example is a small library, where each document is a book.
+    </p>
+
+    <div class="define">
+      <span class="term-name">Document</span>
+      <p>
+        One record, identified by an <strong>id</strong>. It carries
+        <strong>attributes</strong> — named values like <code>title</code> or
+        <code>rating</code> — and optionally text and vectors, which we meet
+        soon. A document is the unit you store and the unit a search returns.
+      </p>
+    </div>
+
+    <pre class="diagram">document id 3
+  title   "Dune"
+  genre   "scifi"
+  rating  4.7
+  year    1965
+  text    "...the spice must flow..."
+  vector  [0.91, 0.04, 0.38, ...]</pre>
+
+    <p>
+      Documents that belong together live in a <strong>namespace</strong> — a
+      named, self-contained collection. Our five books live in a namespace called
+      <code>books</code>. A namespace is the boundary for everything that follows:
+      its own data, its own indexes, its own catalog. Two namespaces never share
+      files, so one can be rebuilt or deleted without touching another.
+    </p>
+
+    <pre class="diagram">namespace "books"
+  1  A Wizard of Earthsea     fantasy  4.5  1968
+  2  The Dispossessed         scifi    4.8  1974
+  3  Dune                     scifi    4.7  1965
+  4  The Left Hand of Darkness scifi   4.6  1969
+  5  The Hobbit               fantasy  4.7  1937</pre>
+
+    <h2 id="questions">Three kinds of question</h2>
+    <p>
+      "Search" is not one thing. People ask three different kinds of question of
+      a collection, and a useful engine answers all three over the same
+      documents. Sana is, in large part, the story of building one engine that
+      does so.
+    </p>
+    <table class="matrix">
+      <thead><tr><th>The question</th><th>In words</th><th>Example over the library</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Where X</strong> — a filter</td><td>Exact, factual conditions on fields.</td><td>"scifi books rated 4.6 or higher."</td></tr>
+        <tr><td><strong>Mentions Y</strong> — full-text</td><td>Documents whose words match yours, ranked by relevance.</td><td>"books whose title mentions <em>darkness</em>."</td></tr>
+        <tr><td><strong>Means Z</strong> — vector</td><td>Documents whose <em>meaning</em> is closest to an example.</td><td>"books that feel like <em>Dune</em>."</td></tr>
+      </tbody>
+    </table>
+    <p>
+      The first is a matter of yes-or-no facts. The second is about words and
+      relevance. The third is about meaning, and it is the one most people have
+      never seen explained — that is <a href="vector.html">Chapter 5</a>. The
+      payoff of putting all three in one engine is the <strong>hybrid</strong>
+      query: rank by meaning, then keep only the ones that also pass a filter.
+    </p>
+
+    <h2 id="index">Why searching naively is too slow</h2>
+    <p>
+      Suppose someone asks for "scifi books rated 4.6 or higher." The obvious way
+      to answer is to walk through every document and check each one. With five
+      books that is instant. With fifty million, reading every document on every
+      query is hopeless — most of the work is spent rejecting things.
+    </p>
+    <p>
+      The fix is an <strong>index</strong>. The word is borrowed from the back of
+      a textbook: instead of reading every page to find "mitochondria," you look
+      it up in the index and it tells you the three pages that matter. A database
+      index is the same trick — a structure prepared in advance so that a query
+      can jump straight to the few documents that could match, and skip the rest.
+    </p>
+
+    <div class="define">
+      <span class="term-name">Index</span>
+      <p>
+        A precomputed lookup structure that turns a question into a short list of
+        candidate documents without scanning the whole collection. Sana keeps a
+        different kind of index for each kind of question — one for filters, one
+        for text, one for vectors — and they are the subject of Parts III.
+      </p>
+    </div>
+
+    <p>
+      An index is a bargain, not magic: you pay to build and store it up front,
+      and in return every later query is cheap. Much of this book is about
+      building those structures so they stay correct while data keeps changing.
+    </p>
+
+    <h2 id="object-store">Where the data lives: object storage</h2>
+    <p>
+      A database has to put its bytes <em>somewhere</em>. Most databases manage
+      their own disks and replicate data across machines to survive failure. Sana
+      makes a different choice: it keeps every durable byte in an
+      <strong>object store</strong>, and nothing else.
+    </p>
+
+    <div class="define">
+      <span class="term-name">Object store</span>
+      <p>
+        A service that holds named blobs of bytes — Amazon S3 is the famous one;
+        a plain local folder is the simplest. You <code>put</code> bytes under a
+        key (a path-like name) and later <code>get</code> them back. It is not a
+        database: there are no rows, no queries, no transactions across keys.
+        Just keys and bytes.
+      </p>
+    </div>
+
+    <p>
+      Why build on something so bare? Because an object store is extraordinarily
+      good at the one thing a database needs most — not losing data. It keeps many
+      redundant copies, it is cheap, it is shared by every machine at once, and it
+      needs no operator to babysit a disk. The cost of the bargain is
+      <strong>speed</strong>: a single request to S3 takes tens of milliseconds,
+      an eternity next to local memory. Almost every clever thing later in the
+      book exists to hide that latency — caching, batching, and keeping a small
+      buffer of recent writes so the store is not consulted on every read.
+    </p>
+
+    <p>
+      There is one more thing the store gives us, and it is the hinge the whole
+      design turns on. A good object store can perform a
+      <strong>conditional write</strong>: "create this file, but only if it does
+      not already exist," or "replace this file, but only if it still holds the
+      version I last saw." That small guarantee is what lets many machines share
+      one bucket without corrupting each other's work. We unpack it in
+      <a href="storage.html">Chapter 2</a>.
+    </p>
+
+    <h2 id="journey">The shape of the journey</h2>
+    <p>
+      The rest of the book climbs from the bytes upward. Each rung adds one idea
+      and assumes the rung below it.
+    </p>
+    <ol class="step-list">
+      <li><span><strong>Durability</strong> (Ch. 2) — make a write survive a crash using only the object store's conditional writes.</span></li>
+      <li><span><strong>Shape</strong> (Ch. 3) — store data in sorted, never-edited files so a key can be found quickly and old files merged away.</span></li>
+      <li><span><strong>Filters and text</strong> (Ch. 4) — answer "where X" and "mentions Y" with indexes, over a consistent view that always includes your latest write.</span></li>
+      <li><span><strong>Meaning</strong> (Ch. 5–6) — represent documents as vectors and search by closeness, fast enough at scale and fresh as data changes.</span></li>
+      <li><span><strong>Operating</strong> (Ch. 7) — run the whole thing as real processes that can start, stop, and share work safely.</span></li>
+    </ol>
+
+    <div class="callout">
+      <strong>What we earned.</strong> A vocabulary: <em>document</em>,
+      <em>namespace</em>, the three kinds of question (filter, text, vector),
+      <em>index</em>, and <em>object store</em>. Everything from here on is built
+      out of exactly these pieces.
+    </div>
+
+    <section class="refs">
+      <h2>References</h2>
+      <ul>
+        <li><a href="https://github.com/djakish/sana/blob/main/README.md">Sana README — what works today</a></li>
+        <li><a href="../guide.md">User guide — the CLI and HTTP surface</a></li>
+        <li><a href="https://turbopuffer.com/docs/architecture">turbopuffer architecture (the inspiration)</a></li>
+      </ul>
+    </section>
+  </article>
+
+  <aside class="side-toc" aria-label="Chapter navigation">
+    <strong>Chapter 01</strong>
+    <a href="#documents">documents</a>
+    <a href="#questions">three questions</a>
+    <a href="#index">why index</a>
+    <a href="#object-store">object storage</a>
+    <a href="#journey">the journey</a>
+  </aside>
+</main>
+<nav class="pager" aria-label="Page links">
+  <a href="../index.html">Previous: Contents</a>
+  <a href="storage.html">Next: The Durable Boundary</a>
+</nav>
+<footer class="site-footer">
+  <span>Sana book</span>
+  <a href="../ARCHITECTURE.md">architecture</a>
+</footer>
+</body>
+</html>

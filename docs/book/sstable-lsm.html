@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SSTables and LSM Trees - Sana Book</title>
+<link rel="stylesheet" href="style.css">
+<script defer src="book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+  <nav class="top-nav" aria-label="Book navigation">
+    <a class="brand" href="../index.html">sana book</a>
+    <div class="nav-links">
+      <a href="intro.html">intro</a>
+      <a href="storage.html">storage</a>
+      <a href="sstable-lsm.html">sst + lsm</a>
+      <a href="query.html">query</a>
+      <a href="vector.html">vectors</a>
+      <a href="spfresh-rabitq.html">spfresh + rabitq</a>
+      <a href="operations.html">operations</a>
+      <a href="glossary.html">glossary</a>
+    </div>
+  </nav>
+</header>
+<main id="main" class="book-page">
+  <article class="book-content">
+    <p class="chapter-kicker">03 / storage shape</p>
+    <h1>Sorted files that are never edited.</h1>
+    <p class="lede">
+      Chapter 2 said every data file is immutable — written once, never changed.
+      That sounds incompatible with a database, where data is updated constantly.
+      This chapter shows the shape that makes the two fit: sorted files, stacked
+      newest-first, and quietly merged in the background.
+    </p>
+
+    <h2 id="problem">The tension</h2>
+    <p>
+      We want two things at once. Reads should be fast: finding book id 3 should
+      not mean scanning everything. And writes must stay immutable: we cannot
+      edit an old file in place. A single growing, sorted file would give fast
+      reads but would have to be rewritten on every change — exactly the editing
+      we banned. The answer is to keep <em>many</em> small sorted files and never
+      touch an old one. We build that up in two steps: first the file format,
+      then the stack of files.
+    </p>
+
+    <h2 id="sst">The SSTable</h2>
+    <p>
+      The file format is an <strong>SSTable</strong> — a "sorted string table." It
+      is a list of key-value pairs sorted by key and frozen. For our library the
+      key is the book id and the value is the whole document.
+    </p>
+    <div class="define">
+      <span class="term-name">SSTable (SST)</span>
+      <p>
+        An immutable file of key-value pairs sorted by key. Because it is sorted,
+        you can find any key with a few jumps instead of a linear scan; because it
+        is immutable, it can be cached and shared without fear of staleness.
+      </p>
+    </div>
+    <p>
+      Reading the whole file just to fetch one key would waste the sorting. So an
+      SST is split into <strong>blocks</strong> of consecutive keys, and a small
+      <strong>index</strong> at the end records the last key in each block and
+      where it sits. A <strong>footer</strong> points at the index and carries a
+      checksum so corruption is caught. To find a key, Sana reads the footer, then
+      the index, then exactly one block — three small ranged reads, no matter how
+      large the file.
+    </p>
+    <pre class="diagram">[ data block 0 | crc ]   keys 00..19
+[ data block 1 | crc ]   keys 20..39
+[ data block 2 | crc ]   keys 40..59
+[ data block 3 | crc ]   keys 60..79
+[ index: last key of each block -> offset, size ]
+[ footer: where the index is, checksum, magic ]</pre>
+
+    <div class="demo" data-sst-demo>
+      <div class="demo-header">
+        <span class="demo-title">Finding one key</span>
+        <label class="range-control">key
+          <input data-sst-key type="range" min="0" max="79" value="32">
+        </label>
+      </div>
+      <div class="demo-body sst-demo-layout">
+        <div class="sst-blocks">
+          <div class="sst-block" data-sst-block="0">block 0: keys 00..19</div>
+          <div class="sst-block" data-sst-block="1">block 1: keys 20..39</div>
+          <div class="sst-block" data-sst-block="2">block 2: keys 40..59</div>
+          <div class="sst-block" data-sst-block="3">block 3: keys 60..79</div>
+        </div>
+        <div class="sst-blocks">
+          <div class="sst-index-entry" data-sst-index="0">index &lt;= 19</div>
+          <div class="sst-index-entry" data-sst-index="1">index &lt;= 39</div>
+          <div class="sst-index-entry" data-sst-index="2">index &lt;= 59</div>
+          <div class="sst-index-entry" data-sst-index="3">index &lt;= 79</div>
+        </div>
+      </div>
+      <div class="demo-body">
+        <p class="demo-caption" data-sst-output></p>
+      </div>
+    </div>
+    <p class="plain">
+      Drag the slider: the index sends the lookup to a single block. The other
+      three blocks are never read.
+    </p>
+
+    <h2 id="lsm">A stack of runs</h2>
+    <p>
+      Now the second step. Each time Sana folds a batch of WAL writes into an SST,
+      it creates a brand-new file — a <strong>run</strong> — and leaves the older
+      runs untouched. Updates and deletes do not edit anything; they are simply
+      newer records in a newer run. This stack of runs, oldest at the bottom and
+      newest on top, is a <strong>log-structured merge tree</strong>, or LSM.
+    </p>
+    <div class="define">
+      <span class="term-name">Run</span>
+      <p>
+        One sorted SST produced by a single flush. Newer runs sit above older
+        ones. To read a key, Sana checks runs newest-first and stops at the first
+        one that contains it — so the latest version always wins.
+      </p>
+    </div>
+    <p>
+      How is a delete recorded without editing the old run that still holds the
+      document? With a <strong>tombstone</strong>: a small marker in a newer run
+      that says "this id is gone." Because newer wins, the tombstone hides the old
+      document on read, even though the old bytes are still sitting there.
+    </p>
+    <p>
+      The cost of never editing is that runs pile up, and a read may have to check
+      many of them. So a background job called <strong>compaction</strong> merges
+      runs together: it keeps only the newest record for each id, drops tombstones
+      whose victims no longer exist below them, and writes one tidy run in place of
+      many. Reads stay cheap; the old files become orphans and are reclaimed later.
+    </p>
+
+    <div class="demo" data-lsm-demo>
+      <div class="demo-header">
+        <span class="demo-title">From write to compaction</span>
+        <div class="demo-controls">
+          <button class="control" data-lsm-step="0" type="button">write</button>
+          <button class="control" data-lsm-step="1" type="button">flush</button>
+          <button class="control" data-lsm-step="2" type="button">tier</button>
+          <button class="control" data-lsm-step="3" type="button">compact</button>
+        </div>
+      </div>
+      <div class="demo-body">
+        <div class="lsm-stage">
+          <div class="lsm-row" data-lsm-row><span class="lsm-label">in memory</span><div class="lsm-cells"></div></div>
+          <div class="lsm-row" data-lsm-row><span class="lsm-label">new runs</span><div class="lsm-cells"></div></div>
+          <div class="lsm-row" data-lsm-row><span class="lsm-label">merged</span><div class="lsm-cells"></div></div>
+          <div class="lsm-row" data-lsm-row><span class="lsm-label">cleanup</span><div class="lsm-cells"></div></div>
+        </div>
+        <p class="demo-caption" data-lsm-caption></p>
+      </div>
+    </div>
+
+    <h2 id="overlay">The freshest writes: the overlay</h2>
+    <p>
+      One gap remains. A write is durable the instant it hits the WAL
+      (<a href="storage.html">Chapter 2</a>), but indexing into an SST happens a
+      little later. So at any moment the newest writes live only in the WAL, not
+      yet in any run. If queries read only the runs, they would miss those writes.
+    </p>
+    <p>
+      Sana closes the gap with the <strong>overlay</strong>. The manifest records
+      how far the indexes have absorbed the WAL (the <code>indexed_cursor</code>);
+      the commit state records how far writes are durable. The slice of WAL
+      between them is read live and applied on top of the runs at query time.
+    </p>
+    <div class="define">
+      <span class="term-name">Overlay</span>
+      <p>
+        The not-yet-indexed tail of the WAL — the range from the indexed cursor up
+        to the latest committed cursor. A query reads the SST runs as its
+        <strong>base</strong> and replays this short overlay on top, so it always
+        reflects the very latest write. This is what gives Sana
+        <strong>read-after-write</strong> consistency.
+      </p>
+    </div>
+    <pre class="diagram">indexed_cursor = 0:104     (runs contain everything up to here)
+committed      = 0:109     (writes are durable up to here)
+
+base     = the SST runs named by the manifest
+overlay  = wal/0/105 .. wal/0/109     (5 fresh writes)
+snapshot = base, with the overlay applied newest-wins</pre>
+
+    <h2 id="invariant">The one rule</h2>
+    <p>
+      Every read obeys a single rule: <strong>newest wins</strong>. For a full
+      scan, Sana merges the runs in order and then applies the overlay. For a
+      single-key lookup, it skips any run whose stored id range cannot contain the
+      key, then reads just the footer, index, and one block of the rest.
+    </p>
+    <div class="callout">
+      The LSM is not a cache that can be thrown away — it <em>is</em> the indexed
+      form of the durable log. The WAL remains the authority for any write that
+      has not yet become a run. Lose the runs and they can be rebuilt; lose the
+      WAL and you have lost data.
+    </div>
+
+    <div class="callout">
+      <strong>What we earned.</strong> A way to store ever-changing data in
+      never-changing files: sorted SSTs for fast lookups, a newest-first stack
+      with tombstones for updates and deletes, compaction to keep reads bounded,
+      and an overlay so the latest write is always visible. We can now answer real
+      questions over this shape.
+    </div>
+
+    <section class="refs">
+      <h2>References</h2>
+      <ul>
+        <li><a href="https://github.com/djakish/sana/blob/main/src/sst.rs">src/sst.rs</a></li>
+        <li><a href="https://github.com/djakish/sana/blob/main/src/indexer.rs">src/indexer.rs</a></li>
+        <li><a href="https://github.com/djakish/sana/blob/main/src/manifest.rs">src/manifest.rs</a></li>
+        <li><a href="https://doi.org/10.1007/s002360050048">O'Neil et al., The Log-Structured Merge-Tree</a></li>
+      </ul>
+    </section>
+  </article>
+  <aside class="side-toc" aria-label="Chapter navigation">
+    <strong>Chapter 03</strong>
+    <a href="#problem">the tension</a>
+    <a href="#sst">the sstable</a>
+    <a href="#lsm">a stack of runs</a>
+    <a href="#overlay">the overlay</a>
+    <a href="#invariant">newest wins</a>
+  </aside>
+</main>
+<nav class="pager" aria-label="Page links">
+  <a href="storage.html">Previous: The Durable Boundary</a>
+  <a href="query.html">Next: The Query Engine</a>
+</nav>
+<footer class="site-footer">
+  <span>Sana book</span>
+  <a href="../guide.md">guide</a>
+</footer>
+</body>
+</html>

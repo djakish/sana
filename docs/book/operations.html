@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Running the System - Sana Book</title>
+<link rel="stylesheet" href="style.css">
+<script defer src="book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+  <nav class="top-nav" aria-label="Book navigation">
+    <a class="brand" href="../index.html">sana book</a>
+    <div class="nav-links">
+      <a href="intro.html">intro</a>
+      <a href="storage.html">storage</a>
+      <a href="sstable-lsm.html">sst + lsm</a>
+      <a href="query.html">query</a>
+      <a href="vector.html">vectors</a>
+      <a href="spfresh-rabitq.html">spfresh + rabitq</a>
+      <a href="operations.html">operations</a>
+      <a href="glossary.html">glossary</a>
+    </div>
+  </nav>
+</header>
+<main id="main" class="book-page">
+  <article class="book-content">
+    <p class="chapter-kicker">07 / operations</p>
+    <h1>Running it for real.</h1>
+    <p class="lede">
+      A design is not finished until it says who is allowed to do work, how a
+      process starts and stops without dropping requests, and — honestly — what is
+      still missing. This chapter is about turning the engine into something you
+      can run and watch.
+    </p>
+
+    <h2 id="roles">Who does the work: roles</h2>
+    <p>
+      Three kinds of work happen in Sana: serving reads and writes, turning the WAL
+      into indexes, and background upkeep (compaction and vector maintenance). For
+      development, one process does all three — <code>sana serve</code> runs the
+      HTTP server with an indexing worker and a maintenance loop built in, so your
+      writes become searchable with no second process to manage.
+    </p>
+    <p>
+      For a real deployment you split them into <strong>roles</strong>, each scaled
+      on its own. The reason is concrete: if every query-serving process also
+      scanned namespaces and claimed indexing jobs, then adding capacity for reads
+      would multiply background traffic to the object store. Separating roles keeps
+      query scaling from dragging upkeep along with it.
+    </p>
+    <pre class="diagram">serve --role all          one process: http + indexing + maintenance (dev)
+
+serve-api                 http only — never touches background work
+work-indexing --loop      claim a namespace, fold its WAL, publish
+maintain --loop           compaction and vector maintenance across namespaces</pre>
+
+    <h2 id="queue">Coordinating safely: the queue</h2>
+    <p>
+      When a write commits, how does an indexing worker learn there is work to do?
+      Each commit drops a best-effort note into a shared <strong>queue</strong> — a
+      single JSON object in the store — naming the namespace that changed. Workers
+      claim namespaces from it under a fenced, time-limited <strong>lease</strong>,
+      so exactly one worker indexes a namespace at a time.
+    </p>
+    <p>
+      The subtle part is that the queue is only a hint. The WAL and manifest remain
+      the authority. If a notification is ever lost, a reconciliation pass compares
+      the committed cursor against the indexed cursor, notices a namespace fell
+      behind, and re-enqueues it. Nothing depends on the queue being perfect.
+    </p>
+    <pre class="diagram">write commits cursor 0:77
+  |
+  +-- best-effort: enqueue "books"
+
+if that note is lost:
+  reconcile sees committed 0:77 > indexed 0:70  ->  enqueue "books" again</pre>
+    <p class="plain">
+      Because it is one object updated by compare-and-set, heavy write traffic
+      means heavy contention on that single key — a known scaling limit, and the
+      reason the repository still tracks a future standalone queue broker.
+    </p>
+
+    <h2 id="health">Starting and stopping without dropping requests</h2>
+    <p>
+      A process that is alive is not always ready to serve. Sana exposes both
+      facts separately, which is exactly what an orchestrator like Kubernetes needs.
+    </p>
+    <div class="define">
+      <span class="term-name">Liveness vs. readiness</span>
+      <p>
+        <strong>Liveness</strong> says the process is running at all — if it fails,
+        restart the process. <strong>Readiness</strong> says the process should
+        receive traffic right now — if it fails, stop routing requests here, but do
+        not kill it. A process can be alive yet deliberately unready.
+      </p>
+    </div>
+    <p>
+      That distinction makes a clean shutdown possible. On Ctrl-C or a termination
+      signal, Sana first flips readiness off and rejects new namespace traffic, waits
+      a moment for load balancers to notice, and only then lets in-flight HTTP
+      requests <strong>drain</strong> to completion before exiting. Indexing and
+      maintenance loops check for the same signal between jobs, so they never start
+      new work mid-shutdown.
+    </p>
+    <table class="matrix">
+      <thead><tr><th>Endpoint</th><th>What it answers</th></tr></thead>
+      <tbody>
+        <tr><td><code>/livez</code>, <code>/healthz</code></td><td>Is the process alive? (does not depend on S3)</td></tr>
+        <tr><td><code>/readyz</code></td><td>Should it get traffic? Fails during startup, drain, overload, or backend trouble.</td></tr>
+        <tr><td><code>/metrics</code></td><td>Prometheus counters, gauges, and latency histograms.</td></tr>
+      </tbody>
+    </table>
+
+    <h2 id="cache">Where the milliseconds go</h2>
+    <p>
+      Recall the object store's one weakness: every request to it costs tens of
+      milliseconds. Sana's defense is a <strong>cache</strong> that holds immutable
+      objects in the process. Because those objects can never change (Chapter 2),
+      caching them is always safe; only mutable pointers and cursors skip the cache
+      and go straight to the store. Toggle a cache hit versus a miss to see why this
+      matters so much:
+    </p>
+
+    <div class="demo" data-latency-demo>
+      <div class="demo-header">
+        <span class="demo-title">A query's time budget</span>
+        <div class="demo-controls">
+          <button class="control" data-latency-mode="hit" type="button">cache hit</button>
+          <button class="control" data-latency-mode="miss" type="button">cache miss</button>
+        </div>
+      </div>
+      <div class="demo-body">
+        <div class="lat-track" data-lat-track></div>
+        <p class="demo-caption" data-latency-caption></p>
+      </div>
+    </div>
+
+    <p>
+      The request meter sits <em>below</em> the cache, so a cache hit is not counted
+      as backend traffic. That keeps the <code>/metrics</code> numbers honest: they
+      measure true round trips to S3, not work the cache absorbed. The same layering
+      gives latency histograms split by phase and gauges for cache temperature and
+      per-namespace indexing lag.
+    </p>
+    <pre class="diagram">query
+  v
+CachingObjectStore   immutable hit -> return bytes, store untouched
+  v                  mutable key   -> bypass
+MeteredObjectStore   counts true backend traffic only
+  v
+S3 or local filesystem</pre>
+
+    <h2 id="unfinished">What is honestly still unfinished</h2>
+    <p>
+      A teaching project earns trust by naming its edges. Several hard problems are
+      deliberately left fail-closed rather than done halfway. The biggest is safe
+      automatic deletion across many machines: reclaiming a file is only safe once
+      you can <em>prove</em> no reader and no in-flight publisher still needs it,
+      and that proof needs durable reader and publisher watermarks Sana does not yet
+      have. So automatic garbage collection is off by default; deletion stays an
+      operator action.
+    </p>
+    <pre class="diagram">safe deletion needs proof:
+  no reader still holds the old generation
+  no publisher can still attach the object
+  the candidate survived a durable safety check
+  a final reference check passes immediately before delete</pre>
+    <p>
+      Also not present: authentication and TLS on the HTTP service (bind to
+      localhost or front it with a reverse proxy), WAL epoch rotation, IAM-role S3
+      credentials, a standalone queue broker, and a turbopuffer-compatible wire
+      protocol. None of these are hidden; they are tracked in the repository.
+    </p>
+
+    <div class="callout">
+      <strong>What we earned.</strong> A system that can be split by role, scaled,
+      monitored, and shut down without dropping a request — plus an honest map of
+      its frontier. To see all the parts work together, the appendix follows one
+      query through every layer of the book.
+    </div>
+
+    <section class="refs">
+      <h2>References</h2>
+      <ul>
+        <li><a href="https://github.com/djakish/sana/blob/main/src/api.rs">src/api.rs</a></li>
+        <li><a href="https://github.com/djakish/sana/blob/main/src/metrics.rs">src/metrics.rs</a></li>
+        <li><a href="../TODO.md">docs/TODO.md — the frontier</a></li>
+        <li><a href="https://turbopuffer.com/blog/object-storage-queue">A distributed queue in one JSON file on object storage</a></li>
+      </ul>
+    </section>
+  </article>
+  <aside class="side-toc" aria-label="Chapter navigation">
+    <strong>Chapter 07</strong>
+    <a href="#roles">roles</a>
+    <a href="#queue">the queue</a>
+    <a href="#health">start &amp; stop</a>
+    <a href="#cache">milliseconds</a>
+    <a href="#unfinished">unfinished</a>
+  </aside>
+</main>
+<nav class="pager" aria-label="Page links">
+  <a href="spfresh-rabitq.html">Previous: SPFresh and RaBitQ</a>
+  <a href="trace.html">Next: A Full Trace</a>
+</nav>
+<footer class="site-footer">
+  <span>Sana book</span>
+  <a href="../TODO.md">todo</a>
+</footer>
+</body>
+</html>

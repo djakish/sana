@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Query Engine - Sana Book</title>
+<link rel="stylesheet" href="style.css">
+<script defer src="book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+  <nav class="top-nav" aria-label="Book navigation">
+    <a class="brand" href="../index.html">sana book</a>
+    <div class="nav-links">
+      <a href="intro.html">intro</a>
+      <a href="storage.html">storage</a>
+      <a href="sstable-lsm.html">sst + lsm</a>
+      <a href="query.html">query</a>
+      <a href="vector.html">vectors</a>
+      <a href="spfresh-rabitq.html">spfresh + rabitq</a>
+      <a href="operations.html">operations</a>
+      <a href="glossary.html">glossary</a>
+    </div>
+  </nav>
+</header>
+<main id="main" class="book-page">
+  <article class="book-content">
+    <p class="chapter-kicker">04 / execution</p>
+    <h1>Answering a question.</h1>
+    <p class="lede">
+      With durable, fast-to-read storage in place, we can finally search. A query
+      in Sana is four moves: fix a consistent view, gather a generous list of
+      candidates, recheck each one against the truth, then rank. Those four moves
+      cover filters, text, and — next chapter — vectors.
+    </p>
+
+    <h2 id="snapshot">First, a fixed view</h2>
+    <p>
+      Data is changing all the time. If a query read the catalog now, a run a
+      moment later, and the WAL after that, it could see an inconsistent mix —
+      half of one update, none of another. So a query begins by capturing one
+      <strong>snapshot</strong> and reading everything from it.
+    </p>
+    <div class="define">
+      <span class="term-name">Snapshot</span>
+      <p>
+        A single consistent view of a namespace, captured at the start of a query:
+        the manifest pointer, the catalog it names, and the committed WAL cursor.
+        From there Sana builds the base-plus-overlay (Chapter 3) and runs the whole
+        query against it, so every part of the answer reflects the same instant —
+        including your most recent write.
+      </p>
+    </div>
+    <pre class="diagram">read manifest/current        (which generation is live)
+read the manifest body       (which runs and vectors)
+read wal_commit/current      (how far writes are durable)
+read the WAL overlay         (the fresh tail)
+=> one base + overlay, frozen for this query</pre>
+
+    <h2 id="superset">Gather generously, then recheck</h2>
+    <p>
+      Here is the central idea of the whole query engine. An index does not have
+      to be perfectly up to date, as long as it errs in one safe direction. It may
+      return <em>too many</em> candidates, never too few.
+    </p>
+    <p>
+      Think about the two ways an index can be wrong. A <strong>false
+      positive</strong> is a candidate that turns out not to match — annoying, but
+      harmless, because we will check it. A <strong>false negative</strong> is a
+      real match the index forgot to mention — fatal, because a missing answer is
+      a silently wrong result. Sana designs every index to allow the first and
+      forbid the second.
+    </p>
+    <div class="callout">
+      The naive approach is to trust the index exactly and return what it says.
+      That breaks the moment the index lags a fresh write, or holds a stale value
+      from before an update. Sana's rule instead: the index returns a
+      <strong>superset</strong> of candidates, and each candidate is
+      <strong>rechecked</strong> against the live document before it is allowed
+      into the answer.
+    </div>
+    <pre class="diagram">attribute index says:   [1, 4, 9, 12]   (a superset — maybe too many)
+load those live docs:    1, 4, 9, 12
+recheck the filter:     [1, 9]          (4 and 12 didn't really match)
+rank / limit:           [9, 1]</pre>
+    <p>
+      Because the live document is always the final judge, the indexes are free to
+      be approximate and cheap. This one rule is what lets delta files, stale
+      values, and not-yet-merged updates all coexist without ever producing a
+      wrong answer. (The single exception is <code>Not</code>: a "everything
+      <em>except</em>" filter needs to know the full universe exactly, so it falls
+      back to a full scan.)
+    </p>
+
+    <h2 id="filters">Filters and aggregates</h2>
+    <p>
+      A <strong>filter</strong> answers the "where X" question. Equality
+      (<code>genre = "scifi"</code>) and range (<code>rating ≥ 4.6</code>)
+      predicates are served by the attribute index, which maps each value to a
+      sorted list of the ids that have it — a <strong>posting list</strong>.
+      <code>And</code> and <code>Or</code> intersect and union those lists.
+    </p>
+    <p>
+      An <strong>aggregate</strong> summarizes the matches rather than returning
+      them — a <code>Count</code>, or a <code>Sum</code> of ratings. Aggregates
+      are computed over <em>every</em> matching row, before the returned page is
+      cut down to the requested limit, so "sum of ratings" is honest even when you
+      only ask to see ten rows.
+    </p>
+    <table class="matrix">
+      <thead><tr><th>Request</th><th>Fast path (the superset)</th><th>Safety step</th></tr></thead>
+      <tbody>
+        <tr><td>Eq / Range</td><td>attribute posting lists</td><td>recheck the value on the live doc</td></tr>
+        <tr><td>Text</td><td>BM25 over term postings</td><td>full scoring if the overlay makes the index stale</td></tr>
+        <tr><td>Approx vector</td><td>IVF probes (Chapter 5)</td><td>liveness map, then exact rerank</td></tr>
+        <tr><td>Aggregate</td><td>materialize all candidates</td><td>compute over every match</td></tr>
+      </tbody>
+    </table>
+
+    <h2 id="text">Full-text search, from zero</h2>
+    <p>
+      The "mentions Y" question is different: a search for <em>darkness</em>
+      should find "The Left Hand of Darkness" and rank it by how relevant it is,
+      not just whether the word appears. This is <strong>full-text search</strong>,
+      and the standard recipe for relevance is <strong>BM25</strong>.
+    </p>
+    <p>
+      First the text is broken into <strong>tokens</strong> — roughly, the
+      lowercased words. For each token Sana keeps a posting list of which
+      documents contain it and how often. Scoring a query then balances three
+      intuitions:
+    </p>
+    <ol class="step-list">
+      <li><span><strong>Term frequency.</strong> A document that uses the word more is more about it — but with diminishing returns, so ten mentions is not ten times one.</span></li>
+      <li><span><strong>Rarity.</strong> A rare word is more telling than a common one. Matching "darkness" says far more than matching "the," so rare terms are weighted up.</span></li>
+      <li><span><strong>Length.</strong> A long document has more chances to contain any word, so its matches are discounted to keep things fair against short ones.</span></li>
+    </ol>
+    <div class="define">
+      <span class="term-name">BM25</span>
+      <p>
+        A ranking formula that scores a document for a text query by combining the
+        three intuitions above: how often the term appears, how rare the term is
+        across the collection, and how long the document is. Higher score, more
+        relevant.
+      </p>
+    </div>
+    <p>
+      Scoring every document for every term would be slow. Sana stores postings in
+      blocks tagged with each block's best possible score, so once it has a strong
+      top-k it can skip whole blocks that could not beat the current threshold.
+      This rank-safe skipping is called MAXSCORE.
+    </p>
+    <pre class="diagram">query: "darkness"
+
+term "darkness"
+  block 0  best possible = 3.1  ->  score these postings
+  block 1  best possible = 0.2  ->  skip: cannot enter the top-k</pre>
+
+    <h2 id="hybrid">Combining searches: hybrid queries</h2>
+    <p>
+      The three questions are strongest together. A <strong>multi-query</strong>
+      runs several rankings over the <em>one</em> snapshot — say a vector ranking
+      and a BM25 ranking — so their results share a single instant in time and can
+      be fused into one list afterward.
+    </p>
+    <div class="define">
+      <span class="term-name">Hybrid retrieval</span>
+      <p>
+        Blending results from different search types. A common recipe is
+        Reciprocal Rank Fusion: each result is scored by its <em>rank</em> in each
+        list, and the scores are added, so documents that do well in several
+        rankings rise to the top — no need to make incompatible scores comparable.
+      </p>
+    </div>
+    <pre class="diagram">one snapshot
+  |-- vector top 10   (books that mean like "Dune")
+  |-- BM25 top 10     (books mentioning "desert")
+  |-- filter          (rating >= 4.5)
+
+fuse the ranked lists  ->  one final ordering, one consistent time</pre>
+
+    <div class="callout">
+      <strong>What we earned.</strong> A query model that is correct by
+      construction: a frozen snapshot, indexes that may over-answer but are always
+      rechecked, exact filters and honest aggregates, BM25 relevance for text, and
+      a way to combine all of them. Two of the three questions are fully answered.
+      The third — search by meaning — needs vectors.
+    </div>
+
+    <section class="refs">
+      <h2>References</h2>
+      <ul>
+        <li><a href="https://github.com/djakish/sana/blob/main/src/query.rs">src/query.rs</a></li>
+        <li><a href="https://github.com/djakish/sana/blob/main/src/text.rs">src/text.rs</a></li>
+        <li><a href="https://github.com/djakish/sana/blob/main/src/attr.rs">src/attr.rs</a></li>
+        <li><a href="https://github.com/djakish/sana/blob/main/examples/hybrid.rs">examples/hybrid.rs</a></li>
+      </ul>
+    </section>
+  </article>
+  <aside class="side-toc" aria-label="Chapter navigation">
+    <strong>Chapter 04</strong>
+    <a href="#snapshot">a fixed view</a>
+    <a href="#superset">superset + recheck</a>
+    <a href="#filters">filters</a>
+    <a href="#text">full-text</a>
+    <a href="#hybrid">hybrid</a>
+  </aside>
+</main>
+<nav class="pager" aria-label="Page links">
+  <a href="sstable-lsm.html">Previous: SSTables and LSM Trees</a>
+  <a href="vector.html">Next: Vector Search From Zero</a>
+</nav>
+<footer class="site-footer">
+  <span>Sana book</span>
+  <a href="../guide.md">guide</a>
+</footer>
+</body>
+</html>

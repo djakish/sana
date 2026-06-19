@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Durable Boundary - Sana Book</title>
+<link rel="stylesheet" href="style.css">
+<script defer src="book.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+  <nav class="top-nav" aria-label="Book navigation">
+    <a class="brand" href="../index.html">sana book</a>
+    <div class="nav-links">
+      <a href="intro.html">intro</a>
+      <a href="storage.html">storage</a>
+      <a href="sstable-lsm.html">sst + lsm</a>
+      <a href="query.html">query</a>
+      <a href="vector.html">vectors</a>
+      <a href="spfresh-rabitq.html">spfresh + rabitq</a>
+      <a href="operations.html">operations</a>
+      <a href="glossary.html">glossary</a>
+    </div>
+  </nav>
+</header>
+<main id="main" class="book-page">
+  <article class="book-content">
+    <p class="chapter-kicker">02 / storage</p>
+    <h1>Making a write survive.</h1>
+    <p class="lede">
+      A database's first promise is simple: once it tells you a write succeeded,
+      that write is never lost — not to a crash, not to two clients at once. This
+      chapter earns that promise using only the handful of operations an object
+      store offers.
+    </p>
+
+    <h2 id="menu">The store's small menu</h2>
+    <p>
+      Recall from <a href="intro.html">Chapter 1</a> that the object store is not
+      a database. It offers about seven operations, and the entire engine is
+      arranged so they are enough.
+    </p>
+    <pre class="diagram">ObjectStore
+  get(key)                   -> bytes + version
+  get_range(key, start..end) -> a slice of the bytes
+  put(key, bytes)            -> overwrite, return new version
+  put_if_absent(key, bytes)  -> create only if the key is free
+  compare_and_set(key, expected, bytes)  -> replace only if unchanged
+  list(prefix)               -> keys under a prefix (recovery, not queries)
+  delete(key)</pre>
+    <p>
+      Two of these do the heavy lifting. <code>put_if_absent</code> writes a file
+      <em>only if no file already has that name</em>. <code>compare_and_set</code>
+      — usually shortened to <strong>CAS</strong> — replaces a file
+      <em>only if it still holds the exact bytes you last saw</em>. Both are
+      conditional: the store itself enforces the condition, and it can refuse.
+      That refusal is the feature.
+    </p>
+
+    <h2 id="naive">Why "just save the file" fails</h2>
+    <p>
+      Imagine storing the library as one file you overwrite on every change. Two
+      details sink it. First, a crash: if the machine dies halfway through
+      writing the file, you are left with a corrupt mixture of old and new. There
+      is no moment where the change is cleanly "done."
+    </p>
+    <p>
+      Second, and worse, two writers at once. Both read the current file, both
+      make their edit, both save. Whoever saves last wins, and the other person's
+      change silently vanishes. This is the <strong>lost update</strong>, the
+      oldest bug in shared storage.
+    </p>
+    <pre class="diagram">writer A reads file (rating 4.5)   writer B reads file (rating 4.5)
+A sets rating = 4.8                 B sets genre = "fantasy"
+A saves  ->  rating 4.8             B saves  ->  genre fantasy, rating 4.5
+                                    A's change is gone</pre>
+    <p>
+      Compare-and-set is the cure. A writer says "replace the file, but only if it
+      still holds the version I read." If someone changed it in between, the store
+      rejects the write and the loser simply re-reads and tries again. No edit is
+      ever silently overwritten.
+    </p>
+    <div class="callout">
+      This is <strong>optimistic concurrency</strong>: don't lock anything up
+      front; just attempt the change and let the store reject you if the world
+      moved. On S3 this check is enforced by the service, so it holds across
+      different machines — several Sana processes can share one bucket safely.
+    </div>
+
+    <h2 id="immutable">Write once, never edit</h2>
+    <p>
+      CAS handles the few files that must change. Sana's deeper move is to make
+      almost every file <strong>immutable</strong> — written exactly once and
+      never modified. New data means a new file with a new name, never an edit to
+      an old one.
+    </p>
+    <div class="define">
+      <span class="term-name">Immutable object</span>
+      <p>
+        A file written with <code>put_if_absent</code> and never changed
+        afterward. Because its contents are fixed, its name can be derived from
+        those contents (a <strong>content hash</strong>), and re-doing an
+        interrupted write just produces the identical file — a harmless no-op.
+        Immutable data can be cached forever and shared freely, because it can
+        never go stale.
+      </p>
+    </div>
+    <p>
+      Immutability dissolves the crash problem. A half-written immutable file is
+      never referenced by anything, so no reader can ever see it. It is just
+      stray bytes — an <strong>orphan</strong> — to be swept up later. The only
+      question that remains is: how does a new file become <em>official</em>?
+    </p>
+
+    <h2 id="publication">Publish the catalog last</h2>
+    <p>
+      Sana writes all the new data first, and only at the very end flips a single
+      pointer to make it live. That pointer is <code>manifest/current</code>, and
+      the file it names — the <strong>manifest</strong> — is the namespace's
+      catalog: a list of exactly which immutable files make up the current state.
+    </p>
+    <pre class="diagram">1. write immutable data files
+     index/g/41/doc/flush-900-….sst
+     index/g/41/vector/embedding/ivf-….bin
+
+2. compare_and_set(manifest/current, old -> points to generation 41)
+
+3. new readers follow the pointer and see generation 41</pre>
+    <div class="callout">
+      <strong>Catalog-last.</strong> Because the data exists before the pointer
+      names it, a reader can never follow the catalog to a missing file. And if
+      the final CAS loses a race, the freshly written data files are simply
+      orphans — they never became the catalog. Correctness lives in one pointer,
+      not in scanning a directory.
+    </div>
+
+    <h2 id="wal">Durable now, indexed soon</h2>
+    <p>
+      There is a tension. Building all the search indexes for a write takes real
+      work, but the client wants its write acknowledged <em>immediately</em>.
+      Sana resolves this by splitting "saved" from "searchable."
+    </p>
+    <p>
+      Every write first goes into the <strong>WAL</strong> — the write-ahead log,
+      an append-only sequence of the raw changes. A write is durable the moment
+      its entry is committed to the WAL. Turning that entry into search indexes
+      happens afterward, in the background. The client never waits for indexing.
+    </p>
+    <div class="define">
+      <span class="term-name">WAL (write-ahead log)</span>
+      <p>
+        An ordered, append-only record of every change, written before anything
+        else. It is the source of truth for what has been accepted. A position in
+        the log is a <strong>cursor</strong>; the latest committed cursor is the
+        high-water mark of durability. Indexes are just a faster-to-read summary
+        of the log so far.
+      </p>
+    </div>
+
+    <p>
+      Committing one WAL entry is a small five-step protocol, and every step is
+      designed so that a crash in the middle is recoverable. Step through it:
+    </p>
+
+    <div class="demo" data-writepath-demo>
+      <div class="demo-header">
+        <span class="demo-title">Committing one write</span>
+        <div class="demo-controls">
+          <button class="control" data-write-step="0" type="button">encode</button>
+          <button class="control" data-write-step="1" type="button">stage</button>
+          <button class="control" data-write-step="2" type="button">reserve</button>
+          <button class="control" data-write-step="3" type="button">publish</button>
+          <button class="control" data-write-step="4" type="button">commit</button>
+        </div>
+      </div>
+      <div class="demo-body">
+        <div class="lsm-stage">
+          <div class="lsm-row" data-write-row><span class="lsm-label">wal_staging</span><div class="lsm-cells"></div></div>
+          <div class="lsm-row" data-write-row><span class="lsm-label">wal_commit</span><div class="lsm-cells"></div></div>
+          <div class="lsm-row" data-write-row><span class="lsm-label">wal/</span><div class="lsm-cells"></div></div>
+          <div class="lsm-row" data-write-row><span class="lsm-label">durable?</span><div class="lsm-cells"></div></div>
+        </div>
+        <p class="demo-caption" data-write-caption></p>
+      </div>
+    </div>
+
+    <p>
+      The reserve step (the CAS on <code>wal_commit</code>) is the
+      <strong>linearization point</strong> — the single instant where a write is
+      declared to come before or after every other. Any writer that arrives and
+      finds a half-finished reservation <em>finishes it</em> before taking its own
+      turn, so a crash mid-protocol and two concurrent writers can neither lose
+      nor duplicate a batch.
+    </p>
+
+    <h2 id="layout">The files on disk</h2>
+    <p>
+      Putting it together, one namespace is just a tree of keys. Mutable pointers
+      (CAS) are marked; everything else is immutable.
+    </p>
+    <pre class="diagram">namespaces/books/
+  wal_commit/current          # committed cursor + pending reservation   (CAS)
+  wal_staging/0/7-….wal       # staged batch, not yet official           (immutable)
+  wal/0/7.wal                 # committed batch                          (immutable)
+  manifest/current            # pointer to the live generation           (CAS)
+  manifest/g/41.json          # the catalog for generation 41           (immutable)
+  index/g/41/…                # the SSTs and vector files it names       (immutable)</pre>
+
+    <h2 id="versions">What a "version" is</h2>
+    <p>
+      CAS needs to compare versions, so what is one? It is an opaque token. On a
+      local folder Sana computes a hash of the file's bytes; on S3 it uses the
+      store's own <strong>ETag</strong>. CAS only asks "is this token still equal
+      to the one I saw?" — never what it means. Each mutable file also embeds a
+      strictly increasing number, so a version can never accidentally repeat.
+    </p>
+    <table class="matrix">
+      <thead><tr><th>File</th><th>How it changes</th><th>Why it is safe</th></tr></thead>
+      <tbody>
+        <tr><td>WAL batch</td><td>created once</td><td>Its sequence number names exactly one accepted write.</td></tr>
+        <tr><td>SST / index file</td><td>created once</td><td>The manifest must name it before any reader needs it.</td></tr>
+        <tr><td><code>manifest/current</code></td><td>CAS replace</td><td>An increasing generation number can never repeat.</td></tr>
+        <tr><td><code>wal_commit/current</code></td><td>CAS replace</td><td>The cursor only ever moves forward.</td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout">
+      <strong>What we earned.</strong> Crash-proof, race-proof writes on top of a
+      plain object store: immutable files that can never be half-seen, one CAS
+      pointer that publishes a whole new state atomically, and a WAL that makes a
+      write durable long before it is indexed. Next we give those files a shape
+      that is fast to read.
+    </div>
+
+    <section class="refs">
+      <h2>References</h2>
+      <ul>
+        <li><a href="https://github.com/djakish/sana/blob/main/src/object_store.rs">src/object_store.rs</a></li>
+        <li><a href="https://github.com/djakish/sana/blob/main/src/namespace.rs">src/namespace.rs</a></li>
+        <li><a href="https://github.com/djakish/sana/blob/main/src/wal.rs">src/wal.rs</a></li>
+        <li><a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html">Amazon S3 conditional writes</a></li>
+      </ul>
+    </section>
+  </article>
+
+  <aside class="side-toc" aria-label="Chapter navigation">
+    <strong>Chapter 02</strong>
+    <a href="#menu">the menu</a>
+    <a href="#naive">why naive fails</a>
+    <a href="#immutable">write once</a>
+    <a href="#publication">publish last</a>
+    <a href="#wal">the wal</a>
+    <a href="#versions">versions</a>
+  </aside>
+</main>
+<nav class="pager" aria-label="Page links">
+  <a href="intro.html">Previous: Introduction</a>
+  <a href="sstable-lsm.html">Next: SSTables and LSM Trees</a>
+</nav>
+<footer class="site-footer">
+  <span>Sana book</span>
+  <a href="../ARCHITECTURE.md">architecture</a>
+</footer>
+</body>
+</html>
