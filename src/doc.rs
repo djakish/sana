@@ -58,8 +58,11 @@ pub fn decode_id(bytes: &[u8]) -> Result<Id> {
             Ok(Id::Uuid(arr))
         }
         Some(&TAG_STRING) => {
-            let s = std::str::from_utf8(&bytes[1..])
-                .map_err(|_| Error::Corrupt("doc id string not utf-8".into()))?;
+            let tail = bytes
+                .get(1..)
+                .ok_or_else(|| Error::Corrupt("doc id string out of bounds".into()))?;
+            let s = std::str::from_utf8(tail)
+                .map_err(|error| Error::Corrupt(format!("doc id string not utf-8: {error}")))?;
             Ok(Id::String(s.to_string()))
         }
         _ => Err(Error::Corrupt("unknown doc id tag".into())),

@@ -1,3 +1,5 @@
+#![allow(clippy::float_cmp, clippy::indexing_slicing, clippy::unwrap_used)]
+
 use std::sync::Arc;
 
 use sana::indexer;

@@ -413,7 +413,9 @@ impl PinningController {
             return Ok(None);
         }
         let index = route_hash(namespace, request_key) as usize % ready.len();
-        let (slot, assignment) = ready[index];
+        let Some((slot, assignment)) = ready.get(index).copied() else {
+            return Ok(None);
+        };
         Ok(Some(ReplicaRoute {
             slot,
             node_id: assignment.node_id.clone(),

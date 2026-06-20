@@ -5,6 +5,7 @@
 //! deliberately does not mix BM25 and vector score scales.
 //!
 //!   cargo run --example hybrid
+#![allow(clippy::float_cmp, clippy::indexing_slicing, clippy::unwrap_used)]
 
 use std::collections::HashMap;
 use std::sync::Arc;

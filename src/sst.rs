@@ -16,6 +16,8 @@
 //! paths share the same footer/index/block decoders, so the format is described
 //! once.
 
+use std::ops::Range;
+
 use bytes::Bytes;
 
 use crate::error::{Error, Result};
@@ -30,13 +32,26 @@ const DEFAULT_BLOCK_TARGET: usize = 4096;
 const DEFAULT_RESTART_INTERVAL: usize = 16;
 
 fn checked_u32(value: usize, field: &str) -> Result<u32> {
-    u32::try_from(value)
-        .map_err(|_| Error::InvalidWrite(format!("sst {field} exceeds u32 format limit")))
+    u32::try_from(value).map_err(|error| {
+        Error::InvalidWrite(format!("sst {field} exceeds u32 format limit: {error}"))
+    })
 }
 
 fn checked_u64(value: usize, field: &str) -> Result<u64> {
-    u64::try_from(value)
-        .map_err(|_| Error::InvalidWrite(format!("sst {field} exceeds u64 format limit")))
+    u64::try_from(value).map_err(|error| {
+        Error::InvalidWrite(format!("sst {field} exceeds u64 format limit: {error}"))
+    })
+}
+
+fn fixed<const N: usize>(buf: &[u8], range: Range<usize>, field: &str) -> Result<[u8; N]> {
+    let start = range.start;
+    let end = range.end;
+    let bytes = buf
+        .get(range)
+        .ok_or_else(|| Error::Corrupt(format!("sst {field} out of bounds ({start}..{end})")))?;
+    bytes
+        .try_into()
+        .map_err(|error| Error::Corrupt(format!("sst {field} has invalid length: {error}")))
 }
 
 fn put_uvarint(buf: &mut Vec<u8>, mut v: u64) {
@@ -108,7 +123,10 @@ impl BlockBuilder {
             checked_u64(non_shared, "unshared key length")?,
         );
         put_uvarint(&mut self.buf, checked_u64(value.len(), "value length")?);
-        self.buf.extend_from_slice(&key[shared..]);
+        self.buf.extend_from_slice(
+            key.get(shared..)
+                .ok_or_else(|| Error::InvalidWrite("sst shared prefix out of bounds".into()))?,
+        );
         self.buf.extend_from_slice(value);
         self.last_key.clear();
         self.last_key.extend_from_slice(key);
@@ -257,12 +275,17 @@ impl SstReader {
             return Err(Error::Corrupt("sst shorter than footer".into()));
         }
         let tail_start = n.saturating_sub(FOOTER_LEN);
-        let footer = parse_footer(&data[tail_start..])?;
+        let footer_tail = data
+            .get(tail_start..)
+            .ok_or_else(|| Error::Corrupt("sst footer tail out of bounds".into()))?;
+        let footer = parse_footer(footer_tail)?;
         validate_footer_layout(&footer, checked_u64(n, "object size")?)?;
-        let start = usize::try_from(footer.index_offset)
-            .map_err(|_| Error::Corrupt("sst index offset exceeds address space".into()))?;
-        let index_size = usize::try_from(footer.index_size)
-            .map_err(|_| Error::Corrupt("sst index size exceeds address space".into()))?;
+        let start = usize::try_from(footer.index_offset).map_err(|error| {
+            Error::Corrupt(format!("sst index offset exceeds address space: {error}"))
+        })?;
+        let index_size = usize::try_from(footer.index_size).map_err(|error| {
+            Error::Corrupt(format!("sst index size exceeds address space: {error}"))
+        })?;
         let end = start
             .checked_add(index_size)
             .ok_or_else(|| Error::Corrupt("sst index region overflow".into()))?;
@@ -301,11 +324,16 @@ impl SstReader {
     }
 
     fn decode_block(&self, bi: usize) -> Result<Vec<(Vec<u8>, Bytes)>> {
-        let entry = &self.index[bi];
-        let start = usize::try_from(entry.offset)
-            .map_err(|_| Error::Corrupt("sst block offset exceeds address space".into()))?;
-        let size = usize::try_from(entry.size)
-            .map_err(|_| Error::Corrupt("sst block size exceeds address space".into()))?;
+        let entry = self
+            .index
+            .get(bi)
+            .ok_or_else(|| Error::Corrupt("sst block index out of bounds".into()))?;
+        let start = usize::try_from(entry.offset).map_err(|error| {
+            Error::Corrupt(format!("sst block offset exceeds address space: {error}"))
+        })?;
+        let size = usize::try_from(entry.size).map_err(|error| {
+            Error::Corrupt(format!("sst block size exceeds address space: {error}"))
+        })?;
         let end = start
             .checked_add(size)
             .and_then(|e| e.checked_add(4))
@@ -336,17 +364,16 @@ fn parse_footer(tail: &[u8]) -> Result<Footer> {
         .len()
         .checked_sub(MAGIC.len())
         .ok_or_else(|| Error::Corrupt("sst footer truncated".into()))?;
-    if &tail[magic_start..] != MAGIC {
+    let got_magic = tail
+        .get(magic_start..)
+        .ok_or_else(|| Error::Corrupt("sst footer magic out of bounds".into()))?;
+    if got_magic != MAGIC {
         return Err(Error::Corrupt("bad sst magic".into()));
     }
     let version_start = magic_start
         .checked_sub(4)
         .ok_or_else(|| Error::Corrupt("sst footer version out of bounds".into()))?;
-    let version = u32::from_le_bytes(
-        tail[version_start..magic_start]
-            .try_into()
-            .expect("slice is a fixed-size window"),
-    );
+    let version = u32::from_le_bytes(fixed(tail, version_start..magic_start, "footer version")?);
     let footer_len = match version {
         FORMAT_VERSION_V1 => FOOTER_V1_LEN,
         FORMAT_VERSION => FOOTER_LEN,
@@ -356,45 +383,39 @@ fn parse_footer(tail: &[u8]) -> Result<Footer> {
         .len()
         .checked_sub(footer_len)
         .ok_or_else(|| Error::Corrupt("sst footer truncated".into()))?;
-    let footer = &tail[footer_start..];
+    let footer = tail
+        .get(footer_start..)
+        .ok_or_else(|| Error::Corrupt("sst footer out of bounds".into()))?;
 
     if version == FORMAT_VERSION {
-        let stored_crc = u32::from_le_bytes(
-            footer[20..24]
-                .try_into()
-                .expect("slice is a fixed-size window"),
-        );
+        let stored_crc = u32::from_le_bytes(fixed(footer, 20..24, "footer crc")?);
         let mut hasher = crc32fast::Hasher::new();
-        hasher.update(&footer[..20]);
-        hasher.update(&footer[24..]);
+        hasher.update(
+            footer
+                .get(..20)
+                .ok_or_else(|| Error::Corrupt("sst footer crc prefix out of bounds".into()))?,
+        );
+        hasher.update(
+            footer
+                .get(24..)
+                .ok_or_else(|| Error::Corrupt("sst footer crc suffix out of bounds".into()))?,
+        );
         if hasher.finalize() != stored_crc {
             return Err(Error::Corrupt("sst footer crc mismatch".into()));
         }
     }
 
     Ok(Footer {
-        index_offset: u64::from_le_bytes(
-            footer[0..8]
-                .try_into()
-                .expect("slice is a fixed-size window"),
-        ),
-        index_size: u64::from_le_bytes(
-            footer[8..16]
-                .try_into()
-                .expect("slice is a fixed-size window"),
-        ),
-        index_crc: u32::from_le_bytes(
-            footer[16..20]
-                .try_into()
-                .expect("slice is a fixed-size window"),
-        ),
+        index_offset: u64::from_le_bytes(fixed(footer, 0..8, "footer index offset")?),
+        index_size: u64::from_le_bytes(fixed(footer, 8..16, "footer index size")?),
+        index_crc: u32::from_le_bytes(fixed(footer, 16..20, "footer index crc")?),
         len: footer_len,
     })
 }
 
 fn validate_footer_layout(footer: &Footer, object_size: u64) -> Result<()> {
     let footer_len = u64::try_from(footer.len)
-        .map_err(|_| Error::Corrupt("sst footer length exceeds u64".into()))?;
+        .map_err(|error| Error::Corrupt(format!("sst footer length exceeds u64: {error}")))?;
     let footer_start = object_size
         .checked_sub(footer_len)
         .ok_or_else(|| Error::Corrupt("sst footer outside object".into()))?;
@@ -416,8 +437,11 @@ fn parse_index(idx: &[u8], index_crc: u32, data_end: u64) -> Result<Vec<IndexEnt
         return Err(Error::Corrupt("sst index crc mismatch".into()));
     }
     let mut pos = 0usize;
-    let count = usize::try_from(read_u32(idx, &mut pos)?)
-        .map_err(|_| Error::Corrupt("sst index entry count exceeds address space".into()))?;
+    let count = usize::try_from(read_u32(idx, &mut pos)?).map_err(|error| {
+        Error::Corrupt(format!(
+            "sst index entry count exceeds address space: {error}"
+        ))
+    })?;
     let max_entries = idx.len().saturating_sub(pos) / 20;
     if count > max_entries {
         return Err(Error::Corrupt("sst index entry count out of bounds".into()));
@@ -425,8 +449,11 @@ fn parse_index(idx: &[u8], index_crc: u32, data_end: u64) -> Result<Vec<IndexEnt
     let mut index = Vec::with_capacity(count);
     let mut expected_offset = 0u64;
     for _ in 0..count {
-        let klen = usize::try_from(read_u32(idx, &mut pos)?)
-            .map_err(|_| Error::Corrupt("sst index key length exceeds address space".into()))?;
+        let klen = usize::try_from(read_u32(idx, &mut pos)?).map_err(|error| {
+            Error::Corrupt(format!(
+                "sst index key length exceeds address space: {error}"
+            ))
+        })?;
         let key_end = pos
             .checked_add(klen)
             .ok_or_else(|| Error::Corrupt("sst index key region overflow".into()))?;
@@ -477,11 +504,11 @@ fn verify_block(block_with_crc: &Bytes) -> Result<Bytes> {
         .len()
         .checked_sub(4)
         .ok_or_else(|| Error::Corrupt("sst block crc out of bounds".into()))?;
-    let crc = u32::from_le_bytes(
-        block_with_crc[content_len..]
-            .try_into()
-            .expect("slice is a fixed-size window"),
-    );
+    let crc = u32::from_le_bytes(fixed(
+        block_with_crc,
+        content_len..block_with_crc.len(),
+        "block crc",
+    )?);
     let content = block_with_crc.slice(0..content_len);
     if crc32fast::hash(&content) != crc {
         return Err(Error::Corrupt("sst block crc mismatch".into()));
@@ -499,12 +526,12 @@ fn decode_block_entries(content: &Bytes) -> Result<Vec<(Vec<u8>, Bytes)>> {
         .len()
         .checked_sub(4)
         .ok_or_else(|| Error::Corrupt("sst block too small".into()))?;
-    let num_restarts = usize::try_from(u32::from_le_bytes(
-        content[restart_count_start..]
-            .try_into()
-            .expect("slice is a fixed-size window"),
-    ))
-    .map_err(|_| Error::Corrupt("sst restart count exceeds address space".into()))?;
+    let num_restarts = usize::try_from(u32::from_le_bytes(fixed(
+        content,
+        restart_count_start..content.len(),
+        "restart count",
+    )?))
+    .map_err(|error| Error::Corrupt(format!("sst restart count exceeds address space: {error}")))?;
     let restart_bytes = num_restarts
         .checked_mul(4)
         .ok_or_else(|| Error::Corrupt("sst block restart array overflow".into()))?;
@@ -529,14 +556,14 @@ fn decode_block_entries(content: &Bytes) -> Result<Vec<(Vec<u8>, Bytes)>> {
         let end = start
             .checked_add(4)
             .ok_or_else(|| Error::Corrupt("sst restart offset overflow".into()))?;
-        let restart = usize::try_from(u32::from_le_bytes(
-            content
-                .get(start..end)
-                .ok_or_else(|| Error::Corrupt("sst restart offset out of bounds".into()))?
-                .try_into()
-                .expect("slice is a fixed-size window"),
-        ))
-        .map_err(|_| Error::Corrupt("sst restart offset exceeds address space".into()))?;
+        let restart = usize::try_from(u32::from_le_bytes(fixed(
+            content,
+            start..end,
+            "restart offset",
+        )?))
+        .map_err(|error| {
+            Error::Corrupt(format!("sst restart offset exceeds address space: {error}"))
+        })?;
         if (restart_index == 0 && restart != 0)
             || restart >= entries_end
             || previous_restart.is_some_and(|previous| restart <= previous)
@@ -550,12 +577,17 @@ fn decode_block_entries(content: &Bytes) -> Result<Vec<(Vec<u8>, Bytes)>> {
     let mut last_key: Vec<u8> = Vec::new();
     let mut pos = 0usize;
     while pos < entries_end {
-        let shared = usize::try_from(get_uvarint(content, &mut pos)?)
-            .map_err(|_| Error::Corrupt("sst shared key length exceeds address space".into()))?;
-        let non_shared = usize::try_from(get_uvarint(content, &mut pos)?)
-            .map_err(|_| Error::Corrupt("sst key length exceeds address space".into()))?;
-        let value_len = usize::try_from(get_uvarint(content, &mut pos)?)
-            .map_err(|_| Error::Corrupt("sst value length exceeds address space".into()))?;
+        let shared = usize::try_from(get_uvarint(content, &mut pos)?).map_err(|error| {
+            Error::Corrupt(format!(
+                "sst shared key length exceeds address space: {error}"
+            ))
+        })?;
+        let non_shared = usize::try_from(get_uvarint(content, &mut pos)?).map_err(|error| {
+            Error::Corrupt(format!("sst key length exceeds address space: {error}"))
+        })?;
+        let value_len = usize::try_from(get_uvarint(content, &mut pos)?).map_err(|error| {
+            Error::Corrupt(format!("sst value length exceeds address space: {error}"))
+        })?;
         let key_end = pos
             .checked_add(non_shared)
             .ok_or_else(|| Error::Corrupt("sst entry key region overflow".into()))?;
@@ -566,8 +598,16 @@ fn decode_block_entries(content: &Bytes) -> Result<Vec<(Vec<u8>, Bytes)>> {
             .checked_add(non_shared)
             .ok_or_else(|| Error::Corrupt("sst reconstructed key length overflow".into()))?;
         let mut key = Vec::with_capacity(key_len);
-        key.extend_from_slice(&last_key[..shared]);
-        key.extend_from_slice(&content[pos..key_end]);
+        key.extend_from_slice(
+            last_key
+                .get(..shared)
+                .ok_or_else(|| Error::Corrupt("sst shared key out of bounds".into()))?,
+        );
+        key.extend_from_slice(
+            content
+                .get(pos..key_end)
+                .ok_or_else(|| Error::Corrupt("sst non-shared key out of bounds".into()))?,
+        );
         pos = key_end;
         let value_start = pos;
         let value_end = pos

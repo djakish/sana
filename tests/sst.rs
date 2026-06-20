@@ -1,3 +1,5 @@
+#![allow(clippy::float_cmp, clippy::indexing_slicing, clippy::unwrap_used)]
+
 mod common;
 
 use std::ops::Range;

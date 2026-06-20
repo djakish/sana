@@ -219,7 +219,10 @@ impl RabitqIndex {
                     "RaBitQ topology does not match vector posting".into(),
                 ));
             }
-            let centroid = &index.centroids[centroid_id];
+            let centroid = index
+                .centroids
+                .get(centroid_id)
+                .ok_or_else(|| Error::Corrupt("RaBitQ centroid id out of bounds".into()))?;
             let residual = query
                 .iter()
                 .zip(centroid)
@@ -301,7 +304,10 @@ impl RabitqCluster {
         }
         let residual_norm_sq = query_residual.iter().map(|v| v * v).sum();
         let mut rotated = vec![0.0f32; padded_dim];
-        rotated[..query_residual.len()].copy_from_slice(query_residual);
+        rotated
+            .get_mut(..query_residual.len())
+            .ok_or_else(|| Error::InvalidQuery("RaBitQ query residual out of bounds".into()))?
+            .copy_from_slice(query_residual);
         rotate(&mut rotated, self.transform_seed);
         let packed = PackedQuery::new(&rotated, self.transform_seed ^ 0x7175_6572_795f_3471);
         Ok(RotatedQuery {
@@ -392,7 +398,7 @@ impl RabitqCode {
     fn code_dot(&self, rotated_query: &[f32]) -> f32 {
         let mut acc = 0.0f32;
         for (dim, &value) in rotated_query.iter().enumerate() {
-            let bit = self.code_words[dim / 64] & (1u64 << (dim % 64)) != 0;
+            let bit = test_code_bit(&self.code_words, dim);
             acc += if bit { value } else { -value };
         }
         acc / (rotated_query.len() as f32).sqrt()
@@ -443,7 +449,9 @@ fn encode(
     for (dim, (value, centroid_value)) in vector.iter().zip(centroid).enumerate() {
         let residual = value - centroid_value;
         residual_norm_sq += residual * residual;
-        rotated[dim] = residual;
+        if let Some(slot) = rotated.get_mut(dim) {
+            *slot = residual;
+        }
     }
     let residual_norm = residual_norm_sq.sqrt();
 
@@ -469,7 +477,7 @@ fn encode(
     for (dim, &value) in rotated.iter().enumerate() {
         abs_sum += value.abs();
         if value > 0.0 {
-            code_words[dim / 64] |= 1u64 << (dim % 64);
+            set_code_bit(&mut code_words, dim);
         }
     }
     // ⟨ō_q, ō'⟩ with ō_q entries ±1/√n.
@@ -483,6 +491,22 @@ fn encode(
         dot_code,
         code_words,
     }
+}
+
+fn set_code_bit(words: &mut [u64], bit_index: usize) {
+    let word_index = bit_index / 64;
+    debug_assert!(word_index < words.len());
+    if let Some(word) = words.get_mut(word_index) {
+        *word |= 1u64 << (bit_index % 64);
+    }
+}
+
+fn test_code_bit(words: &[u64], bit_index: usize) -> bool {
+    let word_index = bit_index / 64;
+    debug_assert!(word_index < words.len());
+    words
+        .get(word_index)
+        .is_some_and(|word| (*word & (1u64 << (bit_index % 64))) != 0)
 }
 
 /// Apply the pseudo-orthonormal rotation in place: random ±1 diagonal, then a
@@ -508,11 +532,15 @@ fn walsh_hadamard(data: &mut [f32]) {
     while h < n {
         let mut i = 0;
         while i < n {
-            for j in i..i + h {
-                let x = data[j];
-                let y = data[j + h];
-                data[j] = x + y;
-                data[j + h] = x - y;
+            let Some(chunk) = data.get_mut(i..i + 2 * h) else {
+                return;
+            };
+            let (left, right) = chunk.split_at_mut(h);
+            for (left, right) in left.iter_mut().zip(right) {
+                let x = *left;
+                let y = *right;
+                *left = x + y;
+                *right = x - y;
             }
             i += 2 * h;
         }

@@ -1,0 +1,23 @@
+# Clippy configuration tunes configurable lint behavior. Lint levels still live
+# in code attributes or command-line flags; Clippy does not read allow/deny
+# levels from this file.
+
+# Match the current stable toolchain used for this repo. Revisit when bumping
+# the Rust toolchain.
+msrv = "1.95.0"
+
+# This is an application/database crate first; Clippy should not suppress useful
+# suggestions only because an item is currently public.
+avoid-breaking-exported-api = false
+
+# Tests in this repo intentionally use direct assertions and unwraps to keep
+# fixtures readable. Keep production code under the normal defaults.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-dbg-in-tests = false
+
+# Keep complexity warnings useful without fighting legitimate database plumbing.
+too-many-arguments-threshold = 8
+type-complexity-threshold = 250
+cognitive-complexity-threshold = 25

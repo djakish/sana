@@ -212,10 +212,9 @@ impl Namespace {
             let semaphore = semaphore.clone();
             let destination_root = destination_root.to_string();
             transfers.spawn(async move {
-                let _permit = semaphore
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| Error::Corrupt("snapshot transfer semaphore closed".into()))?;
+                let _permit = semaphore.acquire_owned().await.map_err(|error| {
+                    Error::Corrupt(format!("snapshot transfer semaphore closed: {error}"))
+                })?;
                 let source = source_store.get(&source_key).await?;
                 let checksum = version_of(&source.bytes);
                 let export_key =

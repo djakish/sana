@@ -9,6 +9,7 @@
 //! `S3ObjectStore::from_env(S3Config::from_location("s3://bucket")?)` instead
 //! of `FsObjectStore`. The HTTP service (`sana serve`) exposes these same
 //! calls as routes; see docs/guide.md.
+#![allow(clippy::float_cmp, clippy::indexing_slicing, clippy::unwrap_used)]
 
 use std::sync::Arc;
 

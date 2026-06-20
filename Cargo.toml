@@ -28,6 +28,38 @@ reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] 
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 
+[lints.clippy]
+# Adopted from https://emschwartz.me/your-clippy-config-should-be-stricter/.
+# Keep these at warn so new work sees the guardrails while existing warning
+# backlog can be burned down incrementally.
+
+# Do not fail silently.
+let_underscore_future = "warn"
+unused_result_ok = "warn"
+map_err_ignore = "warn"
+
+# Avoid async/concurrency footguns.
+await_holding_lock = "warn"
+large_futures = "warn"
+
+# Avoid panic-prone code. These are noisy today but worth phasing in.
+indexing_slicing = "warn"
+string_slice = "warn"
+unwrap_used = "warn"
+panic_in_result_fn = "warn"
+
+# Avoid unsafe memory and SIMD footguns.
+mem_forget = "warn"
+undocumented_unsafe_blocks = "warn"
+
+# Avoid suspicious numeric behavior.
+float_cmp = "warn"
+lossy_float_literal = "warn"
+invalid_upcast_comparisons = "warn"
+
+# Do not leave debug probes behind.
+dbg_macro = "warn"
+
 [[bench]]
 name = "distance"
 harness = false

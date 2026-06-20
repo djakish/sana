@@ -124,7 +124,11 @@ fn parse_uuid_hyphenated(s: &str) -> Option<[u8; 16]> {
     if bytes.len() != 36 {
         return None;
     }
-    if bytes[8] != b'-' || bytes[13] != b'-' || bytes[18] != b'-' || bytes[23] != b'-' {
+    if bytes.get(8).copied() != Some(b'-')
+        || bytes.get(13).copied() != Some(b'-')
+        || bytes.get(18).copied() != Some(b'-')
+        || bytes.get(23).copied() != Some(b'-')
+    {
         return None;
     }
     let mut out = [0u8; 16];
@@ -143,7 +147,8 @@ fn parse_uuid_hyphenated(s: &str) -> Option<[u8; 16]> {
         match high {
             None => high = Some(nibble),
             Some(h) => {
-                out[out_index] = (h << 4) | nibble;
+                let slot = out.get_mut(out_index)?;
+                *slot = (h << 4) | nibble;
                 out_index += 1;
                 high = None;
             }
@@ -186,7 +191,7 @@ impl<'de> Visitor<'de> for IdVisitor {
     fn visit_i64<E: de::Error>(self, v: i64) -> Result<Id, E> {
         u64::try_from(v)
             .map(Id::U64)
-            .map_err(|_| E::custom("integer id must be non-negative"))
+            .map_err(|error| E::custom(format!("integer id must be non-negative: {error}")))
     }
 
     fn visit_str<E>(self, v: &str) -> Result<Id, E> {
@@ -272,8 +277,10 @@ impl<'de> Visitor<'de> for ValueVisitor {
     }
 
     fn visit_u64<E: de::Error>(self, v: u64) -> Result<Value, E> {
-        i64::try_from(v).map(Value::Int).map_err(|_| {
-            E::custom("integer attribute exceeds i64::MAX; store wider integers as strings")
+        i64::try_from(v).map(Value::Int).map_err(|error| {
+            E::custom(format!(
+                "integer attribute exceeds i64::MAX; store wider integers as strings: {v} ({error})"
+            ))
         })
     }
 

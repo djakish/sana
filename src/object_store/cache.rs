@@ -240,10 +240,16 @@ fn cached_range(result: GetResult, key: &str, range: Range<u64>) -> Result<Bytes
             size,
         });
     }
-    let start = usize::try_from(range.start)
-        .map_err(|_| Error::Corrupt(format!("cached range start overflows usize for {key}")))?;
-    let end = usize::try_from(range.end)
-        .map_err(|_| Error::Corrupt(format!("cached range end overflows usize for {key}")))?;
+    let start = usize::try_from(range.start).map_err(|error| {
+        Error::Corrupt(format!(
+            "cached range start overflows usize for {key}: {error}"
+        ))
+    })?;
+    let end = usize::try_from(range.end).map_err(|error| {
+        Error::Corrupt(format!(
+            "cached range end overflows usize for {key}: {error}"
+        ))
+    })?;
     Ok(result.bytes.slice(start..end))
 }
 

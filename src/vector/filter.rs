@@ -144,7 +144,13 @@ impl VectorFilterValueBuilder {
         }
         let word = local_id / 64;
         let bit = local_id % 64;
-        self.rows[cluster_id][word] |= 1u64 << bit;
+        if let Some(slot) = self
+            .rows
+            .get_mut(cluster_id)
+            .and_then(|words| words.get_mut(word))
+        {
+            *slot |= 1u64 << bit;
+        }
     }
 
     fn finish(self) -> VectorFilterValue {
@@ -180,8 +186,10 @@ impl VectorFilterMask {
     fn all(row_counts: Vec<usize>) -> Self {
         let mut mask = Self::empty(row_counts);
         for cluster_id in 0..mask.rows.len() {
-            for word in &mut mask.rows[cluster_id] {
-                *word = u64::MAX;
+            if let Some(words) = mask.rows.get_mut(cluster_id) {
+                for word in words {
+                    *word = u64::MAX;
+                }
             }
             mask.trim_cluster(cluster_id);
         }
@@ -211,8 +219,10 @@ impl VectorFilterMask {
     pub fn not(&self) -> Self {
         let mut out = self.clone();
         for cluster_id in 0..out.rows.len() {
-            for word in &mut out.rows[cluster_id] {
-                *word = !*word;
+            if let Some(words) = out.rows.get_mut(cluster_id) {
+                for word in words {
+                    *word = !*word;
+                }
             }
             out.trim_cluster(cluster_id);
         }
@@ -261,7 +271,11 @@ impl VectorFilterMask {
         if extra == 0 {
             return;
         }
-        if let Some(last) = self.rows[cluster_id].last_mut() {
+        if let Some(last) = self
+            .rows
+            .get_mut(cluster_id)
+            .and_then(|words| words.last_mut())
+        {
             *last &= (1u64 << extra) - 1;
         }
     }

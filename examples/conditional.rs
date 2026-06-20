@@ -2,6 +2,7 @@
 //! primitives a client needs to be safe against retries and racing updates.
 //!
 //!   cargo run --example conditional
+#![allow(clippy::float_cmp, clippy::indexing_slicing, clippy::unwrap_used)]
 
 use std::sync::Arc;
 

@@ -159,7 +159,10 @@ pub fn ids_for_range(
         if !key.starts_with(&prefix) {
             continue;
         }
-        let Some(value) = decode_value_from_key(&key[prefix.len()..])? else {
+        let value_bytes = key
+            .get(prefix.len()..)
+            .ok_or_else(|| Error::Corrupt("attribute key prefix out of bounds".into()))?;
+        let Some(value) = decode_value_from_key(value_bytes)? else {
             continue;
         };
         if !range_bound_matches(&value, lower, upper) {
@@ -308,7 +311,12 @@ fn decode_value_from_key(bytes: &[u8]) -> Result<Option<Value>> {
             };
             Ok(Some(Value::Float(f64::from_bits(bits))))
         }
-        Some(VALUE_STRING) => Ok(Some(Value::String(decode_ordered_string(&bytes[1..])?))),
+        Some(VALUE_STRING) => {
+            let value_bytes = bytes
+                .get(1..)
+                .ok_or_else(|| Error::Corrupt("attribute string key out of bounds".into()))?;
+            Ok(Some(Value::String(decode_ordered_string(value_bytes)?)))
+        }
         None => Ok(None),
         Some(_) => Err(Error::Corrupt("unknown attribute value tag".into())),
     }
@@ -318,7 +326,9 @@ fn decode_ordered_string(bytes: &[u8]) -> Result<String> {
     let mut out = Vec::new();
     let mut pos = 0usize;
     while pos < bytes.len() {
-        let b = bytes[pos];
+        let b = *bytes
+            .get(pos)
+            .ok_or_else(|| Error::Corrupt("attribute string cursor out of bounds".into()))?;
         pos += 1;
         if b != 0 {
             out.push(b);
@@ -330,8 +340,9 @@ fn decode_ordered_string(bytes: &[u8]) -> Result<String> {
         pos += 1;
         match marker {
             0 => {
-                return String::from_utf8(out)
-                    .map_err(|_| Error::Corrupt("attribute string key not utf-8".into()));
+                return String::from_utf8(out).map_err(|error| {
+                    Error::Corrupt(format!("attribute string key not utf-8: {error}"))
+                });
             }
             0xff => out.push(0),
             _ => return Err(Error::Corrupt("bad attribute string escape".into())),

@@ -1,7 +1,12 @@
 //! Shared test helpers. Not compiled as its own test binary (it lives in a
 //! subdirectory), so unused items here would warn per-including-crate; keep it
 //! lean and `allow(dead_code)`.
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    clippy::float_cmp,
+    clippy::indexing_slicing,
+    clippy::unwrap_used
+)]
 
 use std::path::PathBuf;
 

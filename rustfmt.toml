@@ -1,0 +1,8 @@
+# Keep formatting aligned with the crate's Rust 2024 edition.
+edition = "2024"
+style_edition = "2024"
+
+# Restate the defaults this repo relies on so formatting stays stable across
+# toolchain upgrades unless we choose to change it deliberately.
+max_width = 100
+use_small_heuristics = "Default"

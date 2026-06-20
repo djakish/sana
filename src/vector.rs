@@ -157,12 +157,12 @@ impl VectorIndex {
         }
 
         let cluster_count = choose_cluster_count(entries.len()).clamp(1, entries.len());
-        let mut centroids = initial_centroids(&entries, cluster_count);
+        let mut centroids = initial_centroids(&entries, cluster_count)?;
         let mut assignments = vec![0usize; entries.len()];
 
         for _ in 0..KMEANS_ITERS {
             assign_entries(&entries, &centroids, metric, &mut assignments)?;
-            recompute_centroids(&entries, &assignments, &mut centroids, metric);
+            recompute_centroids(&entries, &assignments, &mut centroids, metric)?;
         }
         assign_entries(&entries, &centroids, metric, &mut assignments)?;
 
@@ -444,9 +444,20 @@ fn cluster_count(n: usize) -> usize {
         .min(n)
 }
 
-fn initial_centroids(entries: &[VectorEntry], cluster_count: usize) -> Vec<Vec<f32>> {
+fn initial_centroids(entries: &[VectorEntry], cluster_count: usize) -> Result<Vec<Vec<f32>>> {
+    if entries.is_empty() || cluster_count == 0 {
+        return Err(Error::Corrupt(
+            "cannot initialize vector centroids from an empty input".into(),
+        ));
+    }
     (0..cluster_count)
-        .map(|i| entries[i * entries.len() / cluster_count].vector.clone())
+        .map(|i| {
+            let index = i * entries.len() / cluster_count;
+            entries
+                .get(index)
+                .ok_or_else(|| Error::Corrupt("initial centroid index out of bounds".into()))
+                .map(|entry| entry.vector.clone())
+        })
         .collect()
 }
 
@@ -456,7 +467,12 @@ fn assign_entries(
     metric: DistanceMetric,
     assignments: &mut [usize],
 ) -> Result<()> {
-    for (entry_idx, entry) in entries.iter().enumerate() {
+    if assignments.len() != entries.len() {
+        return Err(Error::Corrupt(
+            "vector assignment buffer length does not match entries".into(),
+        ));
+    }
+    for (entry, assignment) in entries.iter().zip(assignments) {
         let mut best = (0usize, f32::NEG_INFINITY);
         for (centroid_idx, centroid) in centroids.iter().enumerate() {
             let score = score(&entry.vector, centroid, metric)?;
@@ -464,7 +480,7 @@ fn assign_entries(
                 best = (centroid_idx, score);
             }
         }
-        assignments[entry_idx] = best.0;
+        *assignment = best.0;
     }
     Ok(())
 }
@@ -474,30 +490,40 @@ fn recompute_centroids(
     assignments: &[usize],
     centroids: &mut [Vec<f32>],
     metric: DistanceMetric,
-) {
-    let dim = centroids[0].len();
+) -> Result<()> {
+    let Some(first_centroid) = centroids.first() else {
+        return Err(Error::Corrupt("vector index has no centroids".into()));
+    };
+    let dim = first_centroid.len();
     let mut sums = vec![vec![0.0f32; dim]; centroids.len()];
     let mut counts = vec![0usize; centroids.len()];
 
-    for (entry, centroid_id) in entries.iter().zip(assignments) {
-        counts[*centroid_id] += 1;
-        for (sum, value) in sums[*centroid_id].iter_mut().zip(&entry.vector) {
+    for (entry, &centroid_id) in entries.iter().zip(assignments) {
+        let count = counts
+            .get_mut(centroid_id)
+            .ok_or_else(|| Error::Corrupt("vector assignment id out of bounds".into()))?;
+        *count += 1;
+        let sum_values = sums
+            .get_mut(centroid_id)
+            .ok_or_else(|| Error::Corrupt("vector centroid sum out of bounds".into()))?;
+        for (sum, value) in sum_values.iter_mut().zip(&entry.vector) {
             *sum += *value;
         }
     }
 
-    for (idx, centroid) in centroids.iter_mut().enumerate() {
-        if counts[idx] == 0 {
+    for ((centroid, sum_values), count) in centroids.iter_mut().zip(&mut sums).zip(counts) {
+        if count == 0 {
             continue;
         }
-        for value in &mut sums[idx] {
-            *value /= counts[idx] as f32;
+        for value in sum_values.iter_mut() {
+            *value /= count as f32;
         }
         if metric == DistanceMetric::Cosine {
-            normalize(&mut sums[idx]);
+            normalize(sum_values);
         }
-        *centroid = sums[idx].clone();
+        *centroid = sum_values.clone();
     }
+    Ok(())
 }
 
 fn normalize(vector: &mut [f32]) {

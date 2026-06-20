@@ -9,6 +9,7 @@
 //!
 //! With no <dir> it uses a fresh temp directory. Numbers are local-disk and not
 //! comparable to S3; they exist to track regressions and exercise `/metrics`.
+#![allow(clippy::float_cmp, clippy::indexing_slicing, clippy::unwrap_used)]
 
 use std::sync::Arc;
 use std::time::Instant;

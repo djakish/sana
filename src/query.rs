@@ -902,12 +902,15 @@ async fn fetch_vector_segments(
     while let Some(res) = set.join_next().await {
         let (idx, segment) =
             res.map_err(|e| Error::Corrupt(format!("vector segment join error: {e}")))??;
-        slots[idx] = Some(segment);
+        let slot = slots
+            .get_mut(idx)
+            .ok_or_else(|| Error::Corrupt("vector segment slot index out of bounds".into()))?;
+        *slot = Some(segment);
     }
-    Ok(slots
+    slots
         .into_iter()
-        .map(|slot| slot.expect("every vector segment slot is filled exactly once"))
-        .collect())
+        .map(|slot| slot.ok_or_else(|| Error::Corrupt("vector segment slot was not loaded".into())))
+        .collect()
 }
 
 async fn load_vector_version_map(
@@ -1579,7 +1582,10 @@ fn score_vectors(
     let mut scores = vec![0.0f32; vectors.len()];
     vector::score_batch(&vector_query.vector, &vectors, metric, &mut scores)?;
     for ((idx, _), score) in candidates.into_iter().zip(scores) {
-        rows[idx].score = Some(score);
+        let row = rows
+            .get_mut(idx)
+            .ok_or_else(|| Error::Corrupt("scored row index out of bounds".into()))?;
+        row.score = Some(score);
     }
     Ok(())
 }

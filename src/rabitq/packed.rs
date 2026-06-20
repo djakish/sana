@@ -28,7 +28,7 @@ impl PackedQuery {
                 sum_quantized += quantized as u64;
                 for (bit, plane) in bit_planes.iter_mut().enumerate() {
                     if quantized & (1 << bit) != 0 {
-                        plane[dim / 64] |= 1u64 << (dim % 64);
+                        set_bit(plane, dim);
                     }
                 }
             }
@@ -45,7 +45,8 @@ impl PackedQuery {
 
     /// Approximate `<sign(code)/sqrt(D), rotated_query>` using Equation 20.
     pub(super) fn code_dot(&self, code_words: &[u64]) -> f32 {
-        debug_assert_eq!(code_words.len(), self.bit_planes[0].len());
+        let plane_words = self.bit_planes.first().map_or(0, Vec::len);
+        debug_assert_eq!(code_words.len(), plane_words);
         let (ones, selected_sum) = bit_counts(code_words, &self.bit_planes);
         let numerator = 2.0 * self.delta * selected_sum as f32 + 2.0 * self.lower * ones as f32
             - self.delta * self.sum_quantized as f32
@@ -57,6 +58,19 @@ impl PackedQuery {
     pub(super) fn error_radius(&self, epsilon: f32) -> f32 {
         self.delta * epsilon
     }
+}
+
+fn set_bit(words: &mut [u64], bit_index: usize) {
+    let word_index = bit_index / 64;
+    debug_assert!(word_index < words.len());
+    if let Some(word) = words.get_mut(word_index) {
+        *word |= 1u64 << (bit_index % 64);
+    }
+}
+
+fn word_at(words: &[u64], word_index: usize) -> u64 {
+    debug_assert!(word_index < words.len());
+    words.get(word_index).copied().unwrap_or(0)
 }
 
 fn bit_counts(code_words: &[u64], planes: &[Vec<u64>; QUERY_BITS]) -> (u64, u64) {
@@ -75,7 +89,8 @@ fn portable_bit_counts(code_words: &[u64], planes: &[Vec<u64>; QUERY_BITS]) -> (
     for (word_idx, &code) in code_words.iter().enumerate() {
         ones += code.count_ones() as u64;
         for (bit, plane) in planes.iter().enumerate() {
-            selected_sum += ((code & plane[word_idx]).count_ones() as u64) << bit;
+            let query = word_at(plane, word_idx);
+            selected_sum += ((code & query).count_ones() as u64) << bit;
         }
     }
     (ones, selected_sum)
@@ -108,19 +123,25 @@ mod aarch64 {
         let mut selected_sum = 0u64;
         let mut word_idx = 0;
         while word_idx + 2 <= code_words.len() {
+            // SAFETY: the loop condition guarantees two u64 words are available,
+            // and loading them as sixteen bytes preserves alignment requirements
+            // because `vld1q_u8` accepts unaligned addresses.
             let code = unsafe { vld1q_u8(code_words.as_ptr().add(word_idx).cast()) };
             ones += vaddvq_u8(vcntq_u8(code)) as u64;
             for (bit, plane) in planes.iter().enumerate() {
+                // SAFETY: callers build every query plane with the same word
+                // length as `code_words`, and the loop consumes two words.
                 let query = unsafe { vld1q_u8(plane.as_ptr().add(word_idx).cast()) };
                 selected_sum += (vaddvq_u8(vcntq_u8(vandq_u8(code, query))) as u64) << bit;
             }
             word_idx += 2;
         }
         while word_idx < code_words.len() {
-            let code = code_words[word_idx];
+            let code = super::word_at(code_words, word_idx);
             ones += code.count_ones() as u64;
             for (bit, plane) in planes.iter().enumerate() {
-                selected_sum += ((code & plane[word_idx]).count_ones() as u64) << bit;
+                let query = super::word_at(plane, word_idx);
+                selected_sum += ((code & query).count_ones() as u64) << bit;
             }
             word_idx += 1;
         }
@@ -130,6 +151,8 @@ mod aarch64 {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::float_cmp, clippy::indexing_slicing, clippy::unwrap_used)]
+
     use super::{PackedQuery, portable_bit_counts};
 
     #[test]

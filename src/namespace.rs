@@ -341,8 +341,9 @@ fn request_fingerprint<T: Serialize + ?Sized>(request: &T) -> Result<RequestFing
     Ok(RequestFingerprint {
         version: version_of(&encoded),
         legacy_version: Some(legacy_version_of(&encoded)),
-        size_bytes: u64::try_from(encoded.len())
-            .map_err(|_| Error::InvalidWrite("write batch exceeds u64 size".into()))?,
+        size_bytes: u64::try_from(encoded.len()).map_err(|error| {
+            Error::InvalidWrite(format!("write batch exceeds u64 size: {error}"))
+        })?,
         crc32: crc32fast::hash(&encoded),
     })
 }
@@ -570,12 +571,17 @@ impl Namespace {
         while let Some(res) = set.join_next().await {
             let (idx, batch_ops) =
                 res.map_err(|e| Error::Corrupt(format!("overlay join error: {e}")))??;
-            slots[idx] = Some(batch_ops);
+            let slot = slots
+                .get_mut(idx)
+                .ok_or_else(|| Error::Corrupt("overlay slot index out of bounds".into()))?;
+            *slot = Some(batch_ops);
         }
 
         let mut ops = Vec::new();
         for slot in slots {
-            ops.extend(slot.expect("every overlay slot is filled exactly once"));
+            let slot_ops =
+                slot.ok_or_else(|| Error::Corrupt("overlay slot was not loaded".into()))?;
+            ops.extend(slot_ops);
         }
         Ok(ops)
     }
@@ -1433,8 +1439,9 @@ impl Namespace {
             operations,
         };
         let encoded = batch.encode()?;
-        let wal_size_bytes = u64::try_from(encoded.len())
-            .map_err(|_| Error::InvalidWrite("encoded WAL batch is too large".into()))?;
+        let wal_size_bytes = u64::try_from(encoded.len()).map_err(|error| {
+            Error::InvalidWrite(format!("encoded WAL batch is too large: {error}"))
+        })?;
         if let Some(limit_bytes) = prepared.max_unindexed_wal_bytes {
             let manifest = self.load_manifest().await?;
             let Some(current_unindexed) = self
@@ -1523,8 +1530,9 @@ impl Namespace {
                     pending.staging_key
                 )));
             }
-            let staged_size = u64::try_from(staged.bytes.len())
-                .map_err(|_| Error::Corrupt("staged WAL object is too large".into()))?;
+            let staged_size = u64::try_from(staged.bytes.len()).map_err(|error| {
+                Error::Corrupt(format!("staged WAL object is too large: {error}"))
+            })?;
             if let Some(expected_size) = pending.wal_size_bytes
                 && staged_size != expected_size
             {

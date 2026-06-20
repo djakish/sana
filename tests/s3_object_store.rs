@@ -12,6 +12,7 @@
 //!   AWS_ACCESS_KEY_ID=sana AWS_SECRET_ACCESS_KEY=sana-secret \
 //!   cargo test --test s3_object_store
 //! ```
+#![allow(clippy::float_cmp, clippy::indexing_slicing, clippy::unwrap_used)]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

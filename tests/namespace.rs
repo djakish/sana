@@ -1,3 +1,5 @@
+#![allow(clippy::float_cmp, clippy::indexing_slicing, clippy::unwrap_used)]
+
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};

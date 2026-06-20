@@ -1,3 +1,5 @@
+#![allow(clippy::float_cmp, clippy::indexing_slicing, clippy::unwrap_used)]
+
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 

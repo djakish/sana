@@ -8,14 +8,34 @@
 //! magic[8] | format_version: u32 LE | body_len: u32 LE | crc32(body): u32 LE | body
 //! ```
 
+use std::ops::Range;
+
 use crate::error::{Error, Result};
 
 pub const HEADER_LEN: usize = 8 + 4 + 4 + 4;
 
+fn fixed<const N: usize>(
+    bytes: &[u8],
+    range: Range<usize>,
+    what: &str,
+    field: &str,
+) -> Result<[u8; N]> {
+    let start = range.start;
+    let end = range.end;
+    let window = bytes
+        .get(range)
+        .ok_or_else(|| Error::Corrupt(format!("{what} {field} out of bounds ({start}..{end})")))?;
+    window
+        .try_into()
+        .map_err(|error| Error::Corrupt(format!("{what} {field} has invalid length: {error}")))
+}
+
 /// Wrap `body` in the envelope: magic, version, length, CRC32, then the body.
 pub fn encode(magic: &[u8; 8], version: u32, body: &[u8]) -> Result<Vec<u8>> {
-    let body_len = u32::try_from(body.len()).map_err(|_| {
-        Error::InvalidWrite("framed object body exceeds the u32 format limit".into())
+    let body_len = u32::try_from(body.len()).map_err(|error| {
+        Error::InvalidWrite(format!(
+            "framed object body exceeds the u32 format limit: {error}"
+        ))
     })?;
     let capacity = HEADER_LEN
         .checked_add(body.len())
@@ -36,18 +56,21 @@ pub fn decode<'a>(bytes: &'a [u8], magic: &[u8; 8], version: u32, what: &str) ->
     if bytes.len() < HEADER_LEN {
         return Err(Error::Corrupt(format!("{what} frame shorter than header")));
     }
-    if &bytes[0..8] != magic {
+    if fixed::<8>(bytes, 0..8, what, "magic")? != *magic {
         return Err(Error::Corrupt(format!("bad {what} magic")));
     }
-    let got = u32::from_le_bytes(bytes[8..12].try_into().expect("fixed-size window"));
+    let got = u32::from_le_bytes(fixed(bytes, 8..12, what, "version")?);
     if got != version {
         return Err(Error::Corrupt(format!("unsupported {what} version {got}")));
     }
-    let body_len = usize::try_from(u32::from_le_bytes(
-        bytes[12..16].try_into().expect("fixed-size window"),
-    ))
-    .map_err(|_| Error::Corrupt(format!("{what} body length exceeds usize")))?;
-    let crc = u32::from_le_bytes(bytes[16..20].try_into().expect("fixed-size window"));
+    let body_len = usize::try_from(u32::from_le_bytes(fixed(
+        bytes,
+        12..16,
+        what,
+        "body length",
+    )?))
+    .map_err(|error| Error::Corrupt(format!("{what} body length exceeds usize: {error}")))?;
+    let crc = u32::from_le_bytes(fixed(bytes, 16..20, what, "crc")?);
     let body_end = HEADER_LEN
         .checked_add(body_len)
         .ok_or_else(|| Error::Corrupt(format!("{what} body length overflow")))?;

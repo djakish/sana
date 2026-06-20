@@ -261,7 +261,9 @@ impl Histogram {
             .iter()
             .position(|bound| micros <= *bound)
             .unwrap_or(BUCKET_BOUNDS_US.len());
-        self.buckets[slot].fetch_add(1, Ordering::Relaxed);
+        if let Some(bucket) = self.buckets.get(slot) {
+            bucket.fetch_add(1, Ordering::Relaxed);
+        }
         self.sum_micros.fetch_add(micros, Ordering::Relaxed);
     }
 
@@ -275,8 +277,8 @@ impl Histogram {
 
     fn snapshot(&self) -> HistogramSnapshot {
         let mut buckets = [0u64; BUCKETS];
-        for (slot, bucket) in buckets.iter_mut().enumerate() {
-            *bucket = self.buckets[slot].load(Ordering::Relaxed);
+        for (bucket, source) in buckets.iter_mut().zip(&self.buckets) {
+            *bucket = source.load(Ordering::Relaxed);
         }
         HistogramSnapshot {
             buckets,
@@ -655,15 +657,15 @@ fn render_histogram(
         let bucket_prefix = phase.map_or(String::new(), |phase| format!("phase=\"{phase}\","));
         let suffix_labels = phase.map_or(String::new(), |phase| format!("{{phase=\"{phase}\"}}"));
         let mut cumulative = 0u64;
-        for (slot, bound) in BUCKET_BOUNDS_US.iter().enumerate() {
-            cumulative += histogram.buckets[slot];
+        for (count, bound) in histogram.buckets.iter().zip(BUCKET_BOUNDS_US.iter()) {
+            cumulative += *count;
             let _ = writeln!(
                 out,
                 "{name}_bucket{{{bucket_prefix}le=\"{}\"}} {cumulative}",
                 seconds(*bound)
             );
         }
-        cumulative += histogram.buckets[BUCKETS - 1];
+        cumulative += histogram.buckets.last().copied().unwrap_or(0);
         let _ = writeln!(
             out,
             "{name}_bucket{{{bucket_prefix}le=\"+Inf\"}} {cumulative}"

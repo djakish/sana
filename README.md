@@ -36,6 +36,7 @@ cargo run --release --example latency     # benchmark harness
 [User guide](docs/guide.md) ·
 [Architecture](docs/ARCHITECTURE.md) ·
 [Build log & decisions](docs/PROGRESS.md) ·
+[Contributing](CONTRIBUTING.md) ·
 [Benchmarks](docs/benchmarks.md)
 
 ## License

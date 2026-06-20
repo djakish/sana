@@ -296,7 +296,10 @@ impl QueueFile {
             return Ok(Mutation::Unchanged(None));
         };
 
-        let job = &mut self.jobs[index];
+        let job = self
+            .jobs
+            .get_mut(index)
+            .ok_or_else(|| Error::Corrupt("claim job index out of bounds".into()))?;
         job.attempts = job
             .attempts
             .checked_add(1)
@@ -674,10 +677,10 @@ impl IndexQueueBroker {
                 response,
             })
             .await
-            .map_err(|_| Error::Corrupt("indexing queue broker stopped".into()))?;
-        receiver
-            .await
-            .map_err(|_| Error::Corrupt("indexing queue broker dropped a response".into()))?
+            .map_err(|error| Error::Corrupt(format!("indexing queue broker stopped: {error}")))?;
+        receiver.await.map_err(|error| {
+            Error::Corrupt(format!("indexing queue broker dropped a response: {error}"))
+        })?
     }
 }
 
@@ -887,7 +890,10 @@ fn matching_job_index(queue: &QueueFile, handle: &ClaimHandle) -> Result<usize> 
     let Some(index) = queue.jobs.iter().position(|job| job.id == handle.job_id) else {
         return Err(stale_claim(handle, "job no longer exists"));
     };
-    let job = &queue.jobs[index];
+    let job = queue
+        .jobs
+        .get(index)
+        .ok_or_else(|| stale_claim(handle, "job index out of bounds"))?;
     let matches = job.claim.as_ref().is_some_and(|claim| {
         claim.worker_id == handle.worker_id && claim.attempt == handle.attempt
     });
@@ -902,7 +908,10 @@ fn matching_job_mut<'a>(
     handle: &ClaimHandle,
 ) -> Result<&'a mut IndexJob> {
     let index = matching_job_index(queue, handle)?;
-    Ok(&mut queue.jobs[index])
+    queue
+        .jobs
+        .get_mut(index)
+        .ok_or_else(|| stale_claim(handle, "job index out of bounds"))
 }
 
 fn stale_claim(handle: &ClaimHandle, reason: &str) -> Error {
@@ -914,6 +923,8 @@ fn stale_claim(handle: &ClaimHandle, reason: &str) -> Error {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::float_cmp, clippy::indexing_slicing, clippy::unwrap_used)]
+
     use std::ops::Range;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

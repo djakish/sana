@@ -197,6 +197,18 @@ fn squared_norm(vector: &[f32]) -> f32 {
     vector.iter().map(|v| v * v).sum()
 }
 
+fn tail_pairs<'a>(
+    left: &'a [f32],
+    right: &'a [f32],
+    start: usize,
+) -> impl Iterator<Item = (f32, f32)> + 'a {
+    debug_assert!(start <= left.len());
+    debug_assert!(start <= right.len());
+    let (_, left_tail) = left.split_at(start);
+    let (_, right_tail) = right.split_at(start);
+    left_tail.iter().copied().zip(right_tail.iter().copied())
+}
+
 #[cfg(target_arch = "aarch64")]
 mod aarch64 {
     use std::arch::aarch64::{
@@ -208,6 +220,7 @@ mod aarch64 {
     #[target_feature(enable = "neon")]
     pub(super) unsafe fn l2_batch(query: &[f32], candidates: &[&[f32]], out: &mut [f32]) {
         for (candidate, score) in candidates.iter().zip(out) {
+            // SAFETY: caller validated NEON support and matching slice lengths.
             *score = -unsafe { l2(query, candidate) };
         }
     }
@@ -215,6 +228,7 @@ mod aarch64 {
     #[target_feature(enable = "neon")]
     pub(super) unsafe fn dot_batch(query: &[f32], candidates: &[&[f32]], out: &mut [f32]) {
         for (candidate, score) in candidates.iter().zip(out) {
+            // SAFETY: caller validated NEON support and matching slice lengths.
             *score = unsafe { dot(query, candidate) };
         }
     }
@@ -225,6 +239,8 @@ mod aarch64 {
         candidates: &[&[f32]],
         out: &mut [f32],
     ) -> Result<()> {
+        // SAFETY: caller validated NEON support; using the same slice for both
+        // operands trivially satisfies the matching-length precondition.
         let q_norm = unsafe { dot(query, query) }.sqrt();
         if q_norm == 0.0 {
             return Err(Error::InvalidQuery(
@@ -232,6 +248,7 @@ mod aarch64 {
             ));
         }
         for (candidate, score) in candidates.iter().zip(out) {
+            // SAFETY: caller validated NEON support and matching slice lengths.
             let (dot, norm_sq) = unsafe { dot_and_norm(query, candidate) };
             let c_norm = norm_sq.sqrt();
             if c_norm == 0.0 {
@@ -249,17 +266,18 @@ mod aarch64 {
         let mut acc = vdupq_n_f32(0.0);
         let mut i = 0;
         while i + 4 <= left.len() {
+            // SAFETY: the loop condition guarantees four `left` lanes.
             let a = unsafe { vld1q_f32(left.as_ptr().add(i)) };
+            // SAFETY: callers validate `right.len() == left.len()`.
             let b = unsafe { vld1q_f32(right.as_ptr().add(i)) };
             let diff = vsubq_f32(a, b);
             acc = vmlaq_f32(acc, diff, diff);
             i += 4;
         }
         let mut sum = vaddvq_f32(acc);
-        while i < left.len() {
-            let diff = left[i] - right[i];
+        for (left, right) in super::tail_pairs(left, right, i) {
+            let diff = left - right;
             sum += diff * diff;
-            i += 1;
         }
         sum
     }
@@ -269,15 +287,16 @@ mod aarch64 {
         let mut acc = vdupq_n_f32(0.0);
         let mut i = 0;
         while i + 4 <= left.len() {
+            // SAFETY: the loop condition guarantees four `left` lanes.
             let a = unsafe { vld1q_f32(left.as_ptr().add(i)) };
+            // SAFETY: callers validate `right.len() == left.len()`.
             let b = unsafe { vld1q_f32(right.as_ptr().add(i)) };
             acc = vmlaq_f32(acc, a, b);
             i += 4;
         }
         let mut sum = vaddvq_f32(acc);
-        while i < left.len() {
-            sum += left[i] * right[i];
-            i += 1;
+        for (left, right) in super::tail_pairs(left, right, i) {
+            sum += left * right;
         }
         sum
     }
@@ -288,7 +307,9 @@ mod aarch64 {
         let mut norm_acc: float32x4_t = vdupq_n_f32(0.0);
         let mut i = 0;
         while i + 4 <= left.len() {
+            // SAFETY: the loop condition guarantees four `left` lanes.
             let a = unsafe { vld1q_f32(left.as_ptr().add(i)) };
+            // SAFETY: callers validate `right.len() == left.len()`.
             let b = unsafe { vld1q_f32(right.as_ptr().add(i)) };
             dot_acc = vmlaq_f32(dot_acc, a, b);
             norm_acc = vmlaq_f32(norm_acc, b, b);
@@ -296,10 +317,9 @@ mod aarch64 {
         }
         let mut dot = vaddvq_f32(dot_acc);
         let mut norm = vaddvq_f32(norm_acc);
-        while i < left.len() {
-            dot += left[i] * right[i];
-            norm += right[i] * right[i];
-            i += 1;
+        for (left, right) in super::tail_pairs(left, right, i) {
+            dot += left * right;
+            norm += right * right;
         }
         (dot, norm)
     }
@@ -317,6 +337,7 @@ mod x86_64 {
     #[target_feature(enable = "avx2")]
     pub(super) unsafe fn l2_batch(query: &[f32], candidates: &[&[f32]], out: &mut [f32]) {
         for (candidate, score) in candidates.iter().zip(out) {
+            // SAFETY: caller validated AVX2 support and matching slice lengths.
             *score = -unsafe { l2(query, candidate) };
         }
     }
@@ -324,6 +345,7 @@ mod x86_64 {
     #[target_feature(enable = "avx2")]
     pub(super) unsafe fn dot_batch(query: &[f32], candidates: &[&[f32]], out: &mut [f32]) {
         for (candidate, score) in candidates.iter().zip(out) {
+            // SAFETY: caller validated AVX2 support and matching slice lengths.
             *score = unsafe { dot(query, candidate) };
         }
     }
@@ -334,6 +356,8 @@ mod x86_64 {
         candidates: &[&[f32]],
         out: &mut [f32],
     ) -> Result<()> {
+        // SAFETY: caller validated AVX2 support; using the same slice for both
+        // operands trivially satisfies the matching-length precondition.
         let q_norm = unsafe { dot(query, query) }.sqrt();
         if q_norm == 0.0 {
             return Err(Error::InvalidQuery(
@@ -341,6 +365,7 @@ mod x86_64 {
             ));
         }
         for (candidate, score) in candidates.iter().zip(out) {
+            // SAFETY: caller validated AVX2 support and matching slice lengths.
             let (dot, norm_sq) = unsafe { dot_and_norm(query, candidate) };
             let c_norm = norm_sq.sqrt();
             if c_norm == 0.0 {
@@ -358,17 +383,19 @@ mod x86_64 {
         let mut acc = _mm256_setzero_ps();
         let mut i = 0;
         while i + 8 <= left.len() {
+            // SAFETY: the loop condition guarantees eight `left` lanes.
             let a = unsafe { _mm256_loadu_ps(left.as_ptr().add(i)) };
+            // SAFETY: callers validate `right.len() == left.len()`.
             let b = unsafe { _mm256_loadu_ps(right.as_ptr().add(i)) };
             let diff = _mm256_sub_ps(a, b);
             acc = _mm256_add_ps(acc, _mm256_mul_ps(diff, diff));
             i += 8;
         }
+        // SAFETY: `horizontal_sum` only stores the local vector into stack lanes.
         let mut sum = unsafe { horizontal_sum(acc) };
-        while i < left.len() {
-            let diff = left[i] - right[i];
+        for (left, right) in super::tail_pairs(left, right, i) {
+            let diff = left - right;
             sum += diff * diff;
-            i += 1;
         }
         sum
     }
@@ -378,15 +405,17 @@ mod x86_64 {
         let mut acc = _mm256_setzero_ps();
         let mut i = 0;
         while i + 8 <= left.len() {
+            // SAFETY: the loop condition guarantees eight `left` lanes.
             let a = unsafe { _mm256_loadu_ps(left.as_ptr().add(i)) };
+            // SAFETY: callers validate `right.len() == left.len()`.
             let b = unsafe { _mm256_loadu_ps(right.as_ptr().add(i)) };
             acc = _mm256_add_ps(acc, _mm256_mul_ps(a, b));
             i += 8;
         }
+        // SAFETY: `horizontal_sum` only stores the local vector into stack lanes.
         let mut sum = unsafe { horizontal_sum(acc) };
-        while i < left.len() {
-            sum += left[i] * right[i];
-            i += 1;
+        for (left, right) in super::tail_pairs(left, right, i) {
+            sum += left * right;
         }
         sum
     }
@@ -397,24 +426,28 @@ mod x86_64 {
         let mut norm_acc = _mm256_setzero_ps();
         let mut i = 0;
         while i + 8 <= left.len() {
+            // SAFETY: the loop condition guarantees eight `left` lanes.
             let a = unsafe { _mm256_loadu_ps(left.as_ptr().add(i)) };
+            // SAFETY: callers validate `right.len() == left.len()`.
             let b = unsafe { _mm256_loadu_ps(right.as_ptr().add(i)) };
             dot_acc = _mm256_add_ps(dot_acc, _mm256_mul_ps(a, b));
             norm_acc = _mm256_add_ps(norm_acc, _mm256_mul_ps(b, b));
             i += 8;
         }
+        // SAFETY: `horizontal_sum` only stores the local vector into stack lanes.
         let mut dot = unsafe { horizontal_sum(dot_acc) };
+        // SAFETY: `horizontal_sum` only stores the local vector into stack lanes.
         let mut norm = unsafe { horizontal_sum(norm_acc) };
-        while i < left.len() {
-            dot += left[i] * right[i];
-            norm += right[i] * right[i];
-            i += 1;
+        for (left, right) in super::tail_pairs(left, right, i) {
+            dot += left * right;
+            norm += right * right;
         }
         (dot, norm)
     }
 
     unsafe fn horizontal_sum(value: __m256) -> f32 {
         let mut lanes = [0.0f32; 8];
+        // SAFETY: `lanes` has exactly eight contiguous f32 elements.
         unsafe { _mm256_storeu_ps(lanes.as_mut_ptr(), value) };
         lanes.into_iter().sum()
     }

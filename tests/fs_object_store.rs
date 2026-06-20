@@ -1,3 +1,5 @@
+#![allow(clippy::float_cmp, clippy::indexing_slicing, clippy::unwrap_used)]
+
 use bytes::Bytes;
 use sana::error::Error;
 use sana::object_store::{FsObjectStore, ObjectStore, version_of};

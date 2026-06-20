@@ -53,8 +53,8 @@ async fn main() -> CliResult {
         Some("pin") => pin(&args).await,
         Some("unpin") => unpin(&args).await,
         Some("pin-status") => pin_status(&args).await,
-        Some("serve") => serve(&args).await,
-        Some("serve-api") => serve_api(&args).await,
+        Some("serve") => Box::pin(serve(&args)).await,
+        Some("serve-api") => Box::pin(serve_api(&args)).await,
         Some("demo") => demo(&args).await,
         _ => {
             usage();
@@ -143,7 +143,7 @@ async fn upsert(args: &[String]) -> CliResult {
     let namespace = Namespace::create_or_open(store(dir)?, ns).await?;
 
     let mut doc = Document::new(parse_id(id));
-    for pair in &args[5.min(args.len())..] {
+    for pair in args.get(5..).unwrap_or_default() {
         let (k, v) = pair
             .split_once('=')
             .ok_or_else(|| format!("expected key=value, got '{pair}'"))?;
@@ -562,7 +562,7 @@ async fn serve(args: &[String]) -> CliResult {
         .copied()
         .ok_or_else(|| "missing argument #2".to_string())?;
     let role = serve_role(args)?;
-    run_serve_role(args, dir, role, "serve").await
+    Box::pin(run_serve_role(args, dir, role, "serve")).await
 }
 
 async fn serve_api(args: &[String]) -> CliResult {
@@ -571,7 +571,7 @@ async fn serve_api(args: &[String]) -> CliResult {
         .first()
         .copied()
         .ok_or_else(|| "missing argument #2".to_string())?;
-    run_serve_role(args, dir, ServeRole::Api, "serve-api").await
+    Box::pin(run_serve_role(args, dir, ServeRole::Api, "serve-api")).await
 }
 
 async fn run_serve_role(args: &[String], dir: &str, role: ServeRole, command: &str) -> CliResult {
@@ -591,7 +591,13 @@ async fn run_serve_role(args: &[String], dir: &str, role: ServeRole, command: &s
     match role {
         ServeRole::All => {
             println!("serving Sana all-in-one on http://{address} with {cache_bytes} cache bytes");
-            sana::api::serve_with_shutdown(cached, address, metrics, shutdown_signal()).await?;
+            Box::pin(sana::api::serve_with_shutdown(
+                cached,
+                address,
+                metrics,
+                shutdown_signal(),
+            ))
+            .await?;
         }
         ServeRole::Api => {
             println!("serving Sana API on http://{address} with {cache_bytes} cache bytes");
@@ -691,8 +697,8 @@ fn has_flag(args: &[String], flag: &str) -> bool {
 
 fn flag_value<'a>(args: &'a [String], flag: &str) -> Result<Option<&'a str>, String> {
     let mut i = 2;
-    while i < args.len() {
-        if args[i] == flag {
+    while let Some(arg) = args.get(i) {
+        if arg == flag {
             return args
                 .get(i + 1)
                 .map(String::as_str)
@@ -711,8 +717,8 @@ fn positional_args<'a>(
 ) -> Result<Vec<&'a str>, String> {
     let mut out = Vec::new();
     let mut i = 2;
-    while i < args.len() {
-        let value = args[i].as_str();
+    while let Some(arg) = args.get(i) {
+        let value = arg.as_str();
         if flags_with_value.contains(&value) {
             if i + 1 >= args.len() {
                 return Err(format!("{value} requires a value"));

@@ -350,7 +350,13 @@ fn router_with_metrics_and_health(
 }
 
 pub async fn serve(store: Arc<dyn ObjectStore>, address: SocketAddr) -> std::io::Result<()> {
-    serve_with_shutdown(store, address, Metrics::shared(), std::future::pending()).await
+    Box::pin(serve_with_shutdown(
+        store,
+        address,
+        Metrics::shared(),
+        std::future::pending(),
+    ))
+    .await
 }
 
 pub async fn serve_api_with_shutdown(
@@ -388,7 +394,7 @@ pub async fn serve_with_shutdown(
             run_maintenance_loop(store, worker_health),
         );
     };
-    run_server_and_worker(server, worker, WORKER_DRAIN_TIMEOUT).await
+    Box::pin(run_server_and_worker(server, worker, WORKER_DRAIN_TIMEOUT)).await
 }
 
 async fn drain_on_shutdown(health: Arc<HealthState>, shutdown: impl Future<Output = ()>) {
@@ -718,6 +724,8 @@ fn query_slots(query: &Query) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::float_cmp, clippy::indexing_slicing, clippy::unwrap_used)]
+
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;

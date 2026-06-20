@@ -1,3 +1,5 @@
+#![allow(clippy::float_cmp, clippy::indexing_slicing, clippy::unwrap_used)]
+
 use sana::doc::{DocRecord, decode_id, encode_id};
 use sana::value::{Document, Id, Value};
 

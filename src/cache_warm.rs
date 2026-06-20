@@ -167,10 +167,9 @@ impl Namespace {
             let semaphore = semaphore.clone();
             let object = object.clone();
             loads.spawn(async move {
-                let _permit = semaphore
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| Error::Corrupt("cache warm semaphore closed".into()))?;
+                let _permit = semaphore.acquire_owned().await.map_err(|error| {
+                    Error::Corrupt(format!("cache warm semaphore closed: {error}"))
+                })?;
                 let result = store.get(&object.key).await?;
                 let actual_size = result.bytes.len() as u64;
                 if object.size_bytes != 0 && actual_size != object.size_bytes {
