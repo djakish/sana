@@ -3,6 +3,121 @@
     return Array.prototype.slice.call((root || document).querySelectorAll(selector));
   }
 
+  // ---- Theme (light "paper" / dark "grid"), with a persisted reader choice ----
+  var themeRenders = [];
+
+  function prefersDark() {
+    return window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+  }
+
+  function currentTheme() {
+    return document.documentElement.getAttribute("data-theme") || (prefersDark() ? "dark" : "light");
+  }
+
+  function isDark() {
+    return currentTheme() === "dark";
+  }
+
+  // Canvas demos can't read CSS variables directly, so they pull from here.
+  function palette() {
+    return isDark()
+      ? {
+          bg: "#161614",
+          rule: "#38382f",
+          point: "#55534a",
+          ink: "#e9e7dd",
+          muted: "#8f8c81",
+          accents: ["#8ed29a", "#76c6cd", "#dcb45f", "#dd8e7e"]
+        }
+      : {
+          bg: "#e7dfcb",
+          rule: "#b3a98f",
+          point: "#c1b89f",
+          ink: "#1b1814",
+          muted: "#6f6a5d",
+          accents: ["#3f7d33", "#2f7d77", "#9a6a12", "#9c2b1b"]
+        };
+  }
+
+  function rerenderThemed() {
+    themeRenders.forEach(function (fn) {
+      try {
+        fn();
+      } catch (e) {
+        /* a single demo failing must not break the toggle */
+      }
+    });
+  }
+
+  function setupTheme() {
+    var root = document.documentElement;
+    var nav = document.querySelector(".nav-links") || document.querySelector(".top-nav");
+    var button = null;
+
+    function label() {
+      return isDark() ? "☀ light" : "☾ dark";
+    }
+
+    function apply(mode) {
+      root.setAttribute("data-theme", mode);
+      try {
+        localStorage.setItem("sana-theme", mode);
+      } catch (e) {
+        /* private mode: just don't persist */
+      }
+      if (button) button.textContent = label();
+      rerenderThemed();
+    }
+
+    if (nav) {
+      button = document.createElement("button");
+      button.type = "button";
+      button.className = "theme-toggle";
+      button.setAttribute("data-theme-toggle", "");
+      button.setAttribute("aria-label", "Toggle dark and light mode");
+      button.textContent = label();
+      button.addEventListener("click", function () {
+        apply(isDark() ? "light" : "dark");
+      });
+      nav.appendChild(button);
+    }
+
+    if (window.matchMedia) {
+      var mq = window.matchMedia("(prefers-color-scheme: dark)");
+      var onChange = function () {
+        if (!root.getAttribute("data-theme")) {
+          if (button) button.textContent = label();
+          rerenderThemed();
+        }
+      };
+      if (mq.addEventListener) mq.addEventListener("change", onChange);
+      else if (mq.addListener) mq.addListener(onChange);
+    }
+  }
+
+  // Highlight the current chapter in the persistent Contents rail.
+  function markCurrentNav() {
+    var here = location.pathname.split("/").pop() || "index.html";
+    selectAll(".rail-left a, .home-toc a").forEach(function (a) {
+      var target = (a.getAttribute("href") || "").split("/").pop().split("#")[0];
+      if (target && target === here) a.setAttribute("aria-current", "page");
+    });
+  }
+
+  // The left Contents is a <details>: open on desktop, collapsed on phones.
+  function setupContentsDisclosure() {
+    var rails = selectAll("details.rail-left");
+    if (!rails.length) return;
+    function sync() {
+      var wide = window.innerWidth > 900;
+      rails.forEach(function (d) {
+        d.open = wide;
+      });
+    }
+    sync();
+    window.addEventListener("resize", sync);
+  }
+
   function initLsmDemo(root) {
     var captions = [
       "A write enters the WAL first. The in-memory view can disappear; the WAL cannot.",
@@ -89,7 +204,7 @@
       { label: "truck", deg: 262, group: "vehicles" },
       { label: "bicycle", deg: 286, group: "vehicles" }
     ];
-    var groupColor = { animals: "#8bd88b", fruit: "#f0c15a", vehicles: "#7eb7b1" };
+    var groupIndex = { animals: 0, vehicles: 1, fruit: 2 };
 
     function rad(deg) {
       return (deg * Math.PI) / 180;
@@ -105,6 +220,7 @@
 
     function render() {
       resizeCanvas();
+      var pal = palette();
       var w = canvas.clientWidth;
       var h = canvas.clientHeight;
       var cx = w / 2;
@@ -112,6 +228,7 @@
       var r = Math.min(w, h) * 0.36;
       var queryDeg = Number(angleInput.value);
       var qa = rad(queryDeg);
+      ctx.font = '12px ui-monospace, Menlo, monospace';
 
       // Cosine similarity between two unit vectors is just cos(angle between).
       var ranked = items
@@ -127,10 +244,10 @@
       });
 
       ctx.clearRect(0, 0, w, h);
-      ctx.fillStyle = "#0a0a09";
+      ctx.fillStyle = pal.bg;
       ctx.fillRect(0, 0, w, h);
 
-      ctx.strokeStyle = "#2a2e33";
+      ctx.strokeStyle = pal.rule;
       ctx.lineWidth = 1;
       ctx.beginPath();
       ctx.arc(cx, cy, r, 0, Math.PI * 2);
@@ -139,13 +256,13 @@
       // Query direction.
       var qx = cx + Math.cos(qa) * r;
       var qy = cy - Math.sin(qa) * r;
-      ctx.strokeStyle = "#f3efe2";
+      ctx.strokeStyle = pal.ink;
       ctx.lineWidth = 2;
       ctx.beginPath();
       ctx.moveTo(cx, cy);
       ctx.lineTo(qx, qy);
       ctx.stroke();
-      ctx.fillStyle = "#f3efe2";
+      ctx.fillStyle = pal.ink;
       ctx.fillText("query", qx + 6, qy - 6);
 
       items.forEach(function (it) {
@@ -153,19 +270,20 @@
         var px = cx + Math.cos(a) * r;
         var py = cy - Math.sin(a) * r;
         var hot = topSet[it.label];
+        var color = pal.accents[groupIndex[it.group]];
         if (hot) {
-          ctx.strokeStyle = "#3a4047";
+          ctx.strokeStyle = pal.rule;
           ctx.lineWidth = 1;
           ctx.beginPath();
           ctx.moveTo(cx, cy);
           ctx.lineTo(px, py);
           ctx.stroke();
         }
-        ctx.fillStyle = hot ? groupColor[it.group] : "#494331";
+        ctx.fillStyle = hot ? color : pal.point;
         ctx.beginPath();
         ctx.arc(px, py, hot ? 6 : 4, 0, Math.PI * 2);
         ctx.fill();
-        ctx.fillStyle = hot ? "#f3efe2" : "#777c7b";
+        ctx.fillStyle = hot ? pal.ink : pal.muted;
         ctx.fillText(it.label, px + 8, py + 4);
       });
 
@@ -177,6 +295,7 @@
 
     angleInput.addEventListener("input", render);
     window.addEventListener("resize", render);
+    themeRenders.push(render);
     render();
   }
 
@@ -238,20 +357,20 @@
         total: 2.3,
         caption: "Cache hit: the manifest and the index blocks are already in this process. The object store is never touched. A couple of milliseconds, dominated by decoding and scoring.",
         segs: [
-          ["network in", 0.3, "#7eb7b1"],
-          ["cache read", 0.2, "#8bd88b"],
-          ["decode + score", 1.5, "#c8b675"],
-          ["network out", 0.3, "#7eb7b1"]
+          ["network in", 0.3, "#cdbf9e"],
+          ["cache read", 0.2, "#a9c08c"],
+          ["decode + score", 1.5, "#e0c178"],
+          ["network out", 0.3, "#cdbf9e"]
         ]
       },
       miss: {
         total: 30.1,
         caption: "Cache miss: Sana has to fetch objects from the store. On S3 each round trip is tens of milliseconds, and it dwarfs everything else. This is why Sana caches immutable objects, batches reads, and keeps a small WAL overlay instead of asking the store on every write.",
         segs: [
-          ["network in", 0.3, "#7eb7b1"],
-          ["object store", 28.0, "#c98888"],
-          ["decode + score", 1.5, "#c8b675"],
-          ["network out", 0.3, "#7eb7b1"]
+          ["network in", 0.3, "#cdbf9e"],
+          ["object store", 28.0, "#d98c7a"],
+          ["decode + score", 1.5, "#e0c178"],
+          ["network out", 0.3, "#cdbf9e"]
         ]
       }
     };
@@ -289,10 +408,10 @@
     var stat = root.querySelector("[data-vector-stat]");
     var ctx = canvas.getContext("2d");
     var centroids = [
-      { x: 0.18, y: 0.22, color: "#8bd88b" },
-      { x: 0.72, y: 0.26, color: "#70d6d0" },
-      { x: 0.28, y: 0.73, color: "#f0c15a" },
-      { x: 0.78, y: 0.72, color: "#e88989" }
+      { x: 0.18, y: 0.22 },
+      { x: 0.72, y: 0.26 },
+      { x: 0.28, y: 0.73 },
+      { x: 0.78, y: 0.72 }
     ];
     var points = [
       [0.13,0.18,0],[0.21,0.28,0],[0.26,0.18,0],[0.16,0.34,0],
@@ -322,9 +441,11 @@
 
     function render() {
       resizeCanvas();
+      var pal = palette();
       var w = canvas.clientWidth;
       var h = canvas.clientHeight;
       var probes = Number(probeInput.value);
+      ctx.font = '12px ui-monospace, Menlo, monospace';
       var ordered = centroids.map(function (c, i) {
         return { i: i, d: dist(query, c) };
       }).sort(function (a, b) {
@@ -335,12 +456,12 @@
       active.forEach(function (i) { activeMap[i] = true; });
 
       ctx.clearRect(0, 0, w, h);
-      ctx.fillStyle = "#0a0a09";
+      ctx.fillStyle = pal.bg;
       ctx.fillRect(0, 0, w, h);
 
       centroids.forEach(function (c, i) {
         var cxy = xy(c);
-        ctx.strokeStyle = activeMap[i] ? c.color : "#363326";
+        ctx.strokeStyle = activeMap[i] ? pal.accents[i] : pal.rule;
         ctx.lineWidth = activeMap[i] ? 2 : 1;
         ctx.beginPath();
         ctx.arc(cxy.x, cxy.y, activeMap[i] ? 82 : 55, 0, Math.PI * 2);
@@ -348,10 +469,9 @@
       });
 
       points.forEach(function (p) {
-        var c = centroids[p[2]];
         var px = p[0] * w;
         var py = p[1] * h;
-        ctx.fillStyle = activeMap[p[2]] ? c.color : "#494331";
+        ctx.fillStyle = activeMap[p[2]] ? pal.accents[p[2]] : pal.point;
         ctx.beginPath();
         ctx.arc(px, py, activeMap[p[2]] ? 5 : 3, 0, Math.PI * 2);
         ctx.fill();
@@ -359,19 +479,19 @@
 
       centroids.forEach(function (c, i) {
         var cxy = xy(c);
-        ctx.fillStyle = c.color;
-        ctx.strokeStyle = "#11110f";
+        ctx.fillStyle = pal.accents[i];
+        ctx.strokeStyle = pal.bg;
         ctx.lineWidth = 2;
         ctx.beginPath();
         ctx.rect(cxy.x - 6, cxy.y - 6, 12, 12);
         ctx.fill();
         ctx.stroke();
-        ctx.fillStyle = "#f3efe2";
+        ctx.fillStyle = pal.ink;
         ctx.fillText("c" + i, cxy.x + 10, cxy.y - 8);
       });
 
       var qxy = xy(query);
-      ctx.strokeStyle = "#f3efe2";
+      ctx.strokeStyle = pal.ink;
       ctx.lineWidth = 2;
       ctx.beginPath();
       ctx.moveTo(qxy.x - 8, qxy.y);
@@ -379,7 +499,7 @@
       ctx.moveTo(qxy.x, qxy.y - 8);
       ctx.lineTo(qxy.x, qxy.y + 8);
       ctx.stroke();
-      ctx.fillStyle = "#f3efe2";
+      ctx.fillStyle = pal.ink;
       ctx.fillText("q", qxy.x + 10, qxy.y + 4);
 
       var candidates = points.filter(function (p) { return activeMap[p[2]]; }).length;
@@ -388,10 +508,14 @@
 
     probeInput.addEventListener("input", render);
     window.addEventListener("resize", render);
+    themeRenders.push(render);
     render();
   }
 
   document.addEventListener("DOMContentLoaded", function () {
+    setupTheme();
+    markCurrentNav();
+    setupContentsDisclosure();
     selectAll("[data-lsm-demo]").forEach(initLsmDemo);
     selectAll("[data-sst-demo]").forEach(initSstDemo);
     selectAll("[data-vector-demo]").forEach(initVectorDemo);

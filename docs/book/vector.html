@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<script>(function(){try{var t=localStorage.getItem('sana-theme');if(t)document.documentElement.setAttribute('data-theme',t);}catch(e){}})();</script>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Vector Search From Zero - Sana Book</title>
 <link rel="stylesheet" href="style.css">
@@ -10,21 +11,34 @@
 <body>
 <a class="skip-link" href="#main">Skip to content</a>
 <header class="site-header">
-  <nav class="top-nav" aria-label="Book navigation">
-    <a class="brand" href="../index.html">sana book</a>
-    <div class="nav-links">
-      <a href="intro.html">intro</a>
-      <a href="storage.html">storage</a>
-      <a href="sstable-lsm.html">sst + lsm</a>
-      <a href="query.html">query</a>
-      <a href="vector.html">vectors</a>
-      <a href="spfresh-rabitq.html">spfresh + rabitq</a>
-      <a href="operations.html">operations</a>
-      <a href="glossary.html">glossary</a>
-    </div>
-  </nav>
+  <div class="top-nav">
+    <a class="brand" href="../index.html">Sana Book</a>
+    <nav class="nav-links" aria-label="Links">
+      <a href="https://github.com/djakish/sana">GitHub</a>
+      <a href="../guide.md">Guide</a>
+      <a href="../ARCHITECTURE.md">Architecture</a>
+    </nav>
+  </div>
 </header>
 <main id="main" class="book-page">
+  <details class="rail rail-left" open>
+    <summary class="rail-summary">Contents</summary>
+    <span class="rail-part">Part I — Foundations</span>
+    <a href="intro.html">01 Introduction</a>
+    <span class="rail-part">Part II — Storage</span>
+    <a href="storage.html">02 The durable boundary</a>
+    <a href="sstable-lsm.html">03 SSTables &amp; LSM trees</a>
+    <span class="rail-part">Part III — Search</span>
+    <a href="query.html">04 The query engine</a>
+    <a href="vector.html">05 Vector search</a>
+    <a href="spfresh-rabitq.html">06 SPFresh &amp; RaBitQ</a>
+    <span class="rail-part">Part IV — Operating</span>
+    <a href="operations.html">07 Running the system</a>
+    <span class="rail-part">Appendix</span>
+    <a href="trace.html">A full trace</a>
+    <a href="glossary.html">Glossary</a>
+    <a href="map.html">System map</a>
+  </details>
   <article class="book-content">
     <p class="chapter-kicker">05 / retrieval</p>
     <h1>Searching by meaning.</h1>
@@ -261,7 +275,7 @@ segment B:  id 17, version 4   ->  live, ranked</pre>
       </ul>
     </section>
   </article>
-  <aside class="side-toc" aria-label="Chapter navigation">
+  <aside class="rail rail-right" aria-label="Chapter navigation">
     <strong>Chapter 05</strong>
     <a href="#what-vector">what a vector is</a>
     <a href="#embedding">embeddings</a>

@@ -1,17 +1,72 @@
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,400;0,500;0,600;1,400&family=Space+Mono:wght@400;700&display=swap');
+
+/* ----------------------------------------------------------------------------
+   The Sana Book — a monospace, print-journal theme with two modes:
+   light (warm paper, dotted/double rules) and dark (near-black, dashed grid).
+   Colors are all variables so the two modes share one layout.
+---------------------------------------------------------------------------- */
+
 :root {
-  color-scheme: dark;
-  --bg: #111214;
-  --panel: #16181b;
-  --ink: #e8e8e3;
-  --muted: #a7aaa8;
-  --dim: #777c7b;
-  --line: #2a2e33;
-  --line-2: #3a4047;
-  --accent: #c8b675;
-  --accent-2: #7eb7b1;
-  --danger: #c98888;
-  --code: #101113;
+  color-scheme: light;
+  --bg: #f3efe3;
+  --panel: #ebe4d2;
+  --panel-2: #e4dcc6;
+  --ink: #1b1814;
+  --ink-soft: #4a443a;
+  --muted: #6f6a5d;
+  --dim: #8a8473;
+  --rule: #1b1814;
+  --rule-soft: #b3a98f;
+  --grid-dot: rgba(27, 24, 20, 0.07);
+  --spot: #9c2b1b;
+  --on-spot: #f3efe3;
+  --link: #1b1814;
+  --link-hover: #9c2b1b;
+  --display: "Space Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  --body: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
   --max: 78rem;
+  --rail: 14rem;
+  --gap: 2.5rem;
+}
+
+/* Dark mode — auto when the OS prefers it and the reader hasn't chosen. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) {
+    color-scheme: dark;
+    --bg: #0a0a0a;
+    --panel: #141413;
+    --panel-2: #1c1c1a;
+    --ink: #e9e7dd;
+    --ink-soft: #b8b5aa;
+    --muted: #8f8c81;
+    --dim: #6a675e;
+    --rule: #e9e7dd;
+    --rule-soft: #38382f;
+    --grid-dot: rgba(233, 231, 221, 0.05);
+    --spot: #e0a44a;
+    --on-spot: #0a0a0a;
+    --link: #e9e7dd;
+    --link-hover: #e0a44a;
+  }
+}
+
+/* Dark mode — explicit reader choice (wins over the OS setting). */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #0a0a0a;
+  --panel: #141413;
+  --panel-2: #1c1c1a;
+  --ink: #e9e7dd;
+  --ink-soft: #b8b5aa;
+  --muted: #8f8c81;
+  --dim: #6a675e;
+  --rule: #e9e7dd;
+  --rule-soft: #38382f;
+  --grid-dot: rgba(233, 231, 221, 0.05);
+  --spot: #e0a44a;
+  --on-spot: #0a0a0a;
+  --link: #e9e7dd;
+  --link-hover: #e0a44a;
 }
 
 * {
@@ -25,25 +80,29 @@ html {
 body {
   margin: 0;
   min-height: 100vh;
-  background: var(--bg);
+  background-color: var(--bg);
+  background-image: radial-gradient(var(--grid-dot) 1px, transparent 1px);
+  background-size: 22px 22px;
   color: var(--ink);
-  font: 16px/1.6 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font: 15px/1.7 var(--body);
   letter-spacing: 0;
 }
 
 a {
-  color: var(--accent-2);
-  text-decoration: none;
+  color: var(--link);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  text-decoration-thickness: 1px;
 }
 
 a:hover {
-  text-decoration: underline;
+  color: var(--link-hover);
 }
 
 code,
 pre,
 kbd {
-  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, "Liberation Mono", monospace;
+  font-family: var(--body);
 }
 
 img,
@@ -58,9 +117,9 @@ canvas {
   top: 0.75rem;
   transform: translateY(-4rem);
   padding: 0.5rem 0.75rem;
-  background: var(--accent);
-  color: #111214;
-  border-radius: 4px;
+  background: var(--spot);
+  color: var(--on-spot);
+  border-radius: 0;
   z-index: 20;
 }
 
@@ -68,29 +127,60 @@ canvas {
   transform: translateY(0);
 }
 
+/* ---- Masthead -------------------------------------------------------------- */
+
 .site-header {
   position: sticky;
   top: 0;
   z-index: 10;
-  background: rgba(17, 18, 20, 0.97);
-  border-bottom: 1px solid var(--line);
+  background: var(--bg);
+  border-top: 2px dotted var(--rule);
+  border-bottom: 5px double var(--rule);
 }
 
 .top-nav {
+  position: relative;
   max-width: var(--max);
   margin: 0 auto;
-  min-height: 3.25rem;
+  min-height: 3.5rem;
   padding: 0 1rem;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 1rem;
+  display: grid;
+  grid-template-columns: var(--rail) minmax(0, 1fr);
+  column-gap: var(--gap);
+  align-items: stretch;
+}
+
+/* The masthead's vertical rule is drawn exactly like the body's (a border-left
+   at the same left calc), so the two line up to the pixel across the double
+   rule that divides them. */
+.top-nav::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: calc(1rem + var(--rail));
+  border-left: 1px dashed var(--rule-soft);
+  pointer-events: none;
 }
 
 .brand {
+  display: flex;
+  align-items: center;
+  height: 100%;
   color: var(--ink);
+  font-family: var(--display);
   font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.13em;
+  font-size: 0.9rem;
   white-space: nowrap;
+  text-decoration: none;
+}
+
+.brand::before {
+  content: "✸";
+  margin-right: 0.6ch;
+  color: var(--spot);
 }
 
 .nav-links {
@@ -98,9 +188,43 @@ canvas {
   flex-wrap: wrap;
   align-items: center;
   justify-content: flex-end;
-  gap: 0.75rem 1rem;
-  font-size: 0.88rem;
+  gap: 0.55rem 1.05rem;
+  font-family: var(--display);
+  font-size: 0.74rem;
 }
+
+.nav-links a {
+  color: var(--ink);
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+  text-decoration: none;
+}
+
+.nav-links a:hover {
+  color: var(--link-hover);
+  text-decoration: none;
+}
+
+.theme-toggle {
+  font-family: var(--display);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--ink);
+  background: transparent;
+  border: 1px solid var(--rule);
+  padding: 0.25rem 0.55rem;
+  cursor: pointer;
+  border-radius: 0;
+}
+
+.theme-toggle:hover {
+  color: var(--on-spot);
+  background: var(--spot);
+  border-color: var(--spot);
+}
+
+/* ---- Layout shells --------------------------------------------------------- */
 
 main {
   width: 100%;
@@ -116,35 +240,42 @@ main {
   padding-right: 1rem;
 }
 
-.eyebrow {
+.eyebrow,
+.chapter-kicker {
   margin: 0 0 1rem;
-  color: var(--accent);
-  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  color: var(--spot);
+  font-family: var(--display);
   text-transform: uppercase;
-  font-size: 0.78rem;
+  letter-spacing: 0.12em;
+  font-size: 0.74rem;
 }
 
 h1,
 h2,
 h3 {
-  line-height: 1.12;
+  font-family: var(--display);
+  line-height: 1.16;
   letter-spacing: 0;
 }
 
 h1 {
   margin: 0;
-  max-width: 18ch;
-  font-size: 3rem;
+  max-width: 20ch;
+  font-size: 2.6rem;
+  font-weight: 700;
 }
 
 h2 {
-  margin: 2.4rem 0 0.85rem;
-  font-size: 1.55rem;
+  margin: 2.6rem 0 0.85rem;
+  font-size: 1.4rem;
+  font-weight: 700;
+  padding-bottom: 0.35rem;
+  border-bottom: 1px dashed var(--rule-soft);
 }
 
 h3 {
   margin: 1.8rem 0 0.65rem;
-  font-size: 1.05rem;
+  font-size: 1rem;
   color: var(--ink);
 }
 
@@ -155,69 +286,114 @@ p {
 .lede {
   max-width: 46rem;
   margin-top: 1rem;
-  color: var(--muted);
+  color: var(--ink-soft);
   font-size: 1.05rem;
-}
-
-button.control {
-  min-height: 2.5rem;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  border: 1px solid var(--line-2);
-  background: var(--panel);
-  color: var(--ink);
-  border-radius: 4px;
-  padding: 0.55rem 0.85rem;
-  font: inherit;
-  cursor: pointer;
-}
-
-button.control[aria-pressed="true"] {
-  border-color: var(--accent);
-  background: #242219;
-  color: var(--ink);
+  text-align: left;
 }
 
 .diagram {
-  min-height: 8rem;
-  margin: 0;
+  margin: 1.2rem 0;
   padding: 1rem;
   overflow-x: auto;
-  background: var(--code);
-  color: #d7dbd4;
-  border: 1px solid var(--line-2);
-  border-radius: 4px;
-  font-size: 0.9rem;
-  line-height: 1.45;
+  background: var(--panel);
+  color: var(--ink);
+  border: 1px solid var(--rule);
+  font-size: 0.86rem;
+  line-height: 1.5;
+  white-space: pre;
 }
+
+code {
+  background: var(--panel-2);
+  padding: 0.05rem 0.3rem;
+  border: 1px solid var(--rule-soft);
+}
+
+/* ---- Home / cover + contents ---------------------------------------------- */
 
 .book-home {
   display: grid;
-  grid-template-columns: 16rem minmax(0, 1fr);
-  gap: 2.5rem;
-  padding-top: 2rem;
+  grid-template-columns: var(--rail) minmax(0, 1fr) var(--rail);
+  gap: var(--gap);
+  padding-top: 2.5rem;
   padding-bottom: 3rem;
 }
 
-.home-toc {
-  position: sticky;
-  top: 4.5rem;
-  align-self: start;
-  border-right: 1px solid var(--line);
-  padding-right: 1rem;
+/* Rails: the persistent Contents on the left, "on this page" on the right.
+   Both sit in the shared --rail columns so their dividers line up with the
+   masthead's vertical rule. */
+.rail {
+  font-size: 0.82rem;
 }
 
-.home-toc strong {
+.rail strong,
+.rail-summary {
   display: block;
-  margin-bottom: 0.75rem;
+  margin-bottom: 0.6rem;
+  padding-bottom: 0.4rem;
+  border-bottom: 1px dashed var(--rule-soft);
+  color: var(--ink);
+  font-family: var(--display);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-size: 0.74rem;
 }
 
-.home-toc a {
+.rail a {
   display: block;
-  padding: 0.35rem 0;
+  margin: 0.32rem 0;
   color: var(--muted);
-  font-size: 0.92rem;
+  text-decoration: none;
+}
+
+.rail a:hover {
+  color: var(--link-hover);
+}
+
+.rail a[aria-current="page"] {
+  color: var(--spot);
+  font-weight: 700;
+}
+
+.rail-part {
+  display: block;
+  margin: 1rem 0 0.35rem;
+  color: var(--dim);
+  font-family: var(--display);
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.rail-part:first-of-type {
+  margin-top: 0.25rem;
+}
+
+.rail-left {
+  position: sticky;
+  top: 5rem;
+  align-self: start;
+  grid-column: 1;
+  padding-right: 1rem;
+  font-size: 0.82rem;
+}
+
+/* On desktop the Contents disclosure is just a labelled list. */
+.rail-summary {
+  cursor: pointer;
+  list-style: none;
+}
+
+.rail-summary::-webkit-details-marker {
+  display: none;
+}
+
+@media (min-width: 901px) {
+
+  /* Force-shown and non-interactive: clicking the label must not collapse it. */
+  .rail-summary {
+    pointer-events: none;
+  }
 }
 
 .home-content {
@@ -226,7 +402,7 @@ button.control[aria-pressed="true"] {
 
 .toc-table {
   display: grid;
-  border-top: 1px solid var(--line);
+  border-top: 3px double var(--rule);
   margin: 1.4rem 0 2rem;
 }
 
@@ -234,24 +410,46 @@ button.control[aria-pressed="true"] {
   display: grid;
   grid-template-columns: 3.4rem minmax(11rem, 0.8fr) minmax(0, 1.4fr);
   gap: 1rem;
-  padding: 0.85rem 0;
-  border-bottom: 1px solid var(--line);
+  padding: 0.9rem 0;
+  border-bottom: 1px dashed var(--rule-soft);
   color: var(--muted);
+  text-decoration: none;
 }
 
 .toc-row:hover {
-  text-decoration: none;
   color: var(--ink);
+}
+
+.toc-row>span:first-child {
+  font-family: var(--display);
+  color: var(--spot);
+  font-weight: 700;
 }
 
 .toc-row strong {
   color: var(--ink);
+  font-family: var(--display);
 }
+
+.toc-part {
+  margin: 1.8rem 0 0.5rem;
+  color: var(--dim);
+  font-family: var(--display);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+
+.toc-part:first-of-type {
+  margin-top: 0.5rem;
+}
+
+/* ---- Chapter page + left rail --------------------------------------------- */
 
 .book-page {
   display: grid;
-  grid-template-columns: 13rem minmax(0, 1fr);
-  gap: 2.5rem;
+  grid-template-columns: var(--rail) minmax(0, 1fr) var(--rail);
+  gap: var(--gap);
   padding-top: 2.5rem;
   padding-bottom: 3rem;
 }
@@ -262,153 +460,127 @@ button.control[aria-pressed="true"] {
 }
 
 .book-content h1 {
-  max-width: 16ch;
-  font-size: 2.7rem;
+  max-width: 18ch;
+  font-size: 2.4rem;
 }
 
-.book-content p,
+.book-content p {
+  color: var(--ink-soft);
+  text-align: justify;
+  hyphens: auto;
+}
+
 .book-content li {
-  color: var(--muted);
+  color: var(--ink-soft);
 }
 
 .book-content strong {
   color: var(--ink);
 }
 
-.book-content code {
-  color: #a8d7b0;
+.book-content .lede,
+.book-content .demo-caption {
+  text-align: left;
 }
 
-.side-toc {
+.rail-right {
   position: sticky;
-  top: 4.5rem;
+  top: 5rem;
   align-self: start;
-  grid-column: 1;
-  grid-row: 1;
-  border-right: 1px solid var(--line);
-  padding-right: 1rem;
-  font-size: 0.88rem;
+  grid-column: 3;
+  padding-left: 1rem;
 }
 
-.side-toc strong {
-  display: block;
-  margin-bottom: 0.6rem;
-  color: var(--ink);
+/* The vertical rules are drawn full-height on the page container (not on the
+   short, sticky rails), at exactly --rail from each edge — the same x as the
+   masthead's brand divider — so the line runs unbroken from top to bottom. */
+.book-page,
+.book-home {
+  position: relative;
 }
 
-.side-toc a {
-  display: block;
-  margin: 0.35rem 0;
-  color: var(--muted);
+.book-page::before,
+.book-home::before,
+.book-page::after,
+.book-home::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  border-left: 1px dashed var(--rule-soft);
+  pointer-events: none;
 }
 
-.side-toc a[aria-current="page"] {
-  color: var(--accent);
+.book-page::before,
+.book-home::before {
+  left: calc(1rem + var(--rail));
 }
 
-.chapter-kicker {
-  margin-bottom: 0.75rem;
-  color: var(--accent);
-  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+.book-page::after,
+.book-home::after {
+  right: calc(1rem + var(--rail));
 }
+
+/* ---- Notes, definitions, tables ------------------------------------------- */
 
 .callout {
   margin: 1.4rem 0;
   padding: 1rem;
-  border-left: 3px solid var(--accent);
+  border: 1px solid var(--rule);
+  border-left: 4px solid var(--spot);
   background: var(--panel);
-  color: var(--muted);
+  color: var(--ink-soft);
 }
 
 .callout strong {
   color: var(--ink);
 }
 
-/* Plain-language definition box: introduce one term, set apart from prose. */
 .define {
   margin: 1.4rem 0;
   padding: 0.9rem 1rem;
-  border: 1px solid var(--line-2);
-  border-left: 3px solid var(--accent-2);
+  border: 1px solid var(--rule);
+  border-left: 4px solid var(--spot);
   background: var(--panel);
-  border-radius: 4px;
 }
 
 .define .term-name {
   display: block;
   margin-bottom: 0.3rem;
-  color: var(--accent-2);
-  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
-  font-size: 0.74rem;
+  color: var(--spot);
+  font-family: var(--display);
+  font-size: 0.72rem;
   text-transform: uppercase;
-  letter-spacing: 0.05em;
+  letter-spacing: 0.08em;
 }
 
 .define p {
   margin: 0;
-  color: var(--muted);
+  color: var(--ink-soft);
+  text-align: left;
 }
 
-.define p + p {
+.define p+p {
   margin-top: 0.6rem;
 }
 
-/* "Why it matters" / plain-language aside, softer than a callout. */
 .plain {
   margin: 1.2rem 0;
   padding-left: 1rem;
-  border-left: 2px solid var(--line-2);
+  border-left: 2px dashed var(--rule-soft);
   color: var(--muted);
   font-style: italic;
-}
-
-/* Grouping labels on the home contents list. */
-.toc-part {
-  margin: 1.8rem 0 0.5rem;
-  color: var(--dim);
-  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
-  font-size: 0.74rem;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-}
-
-.toc-part:first-of-type {
-  margin-top: 0.5rem;
-}
-
-/* Glossary definition list. */
-dl.glossary {
-  margin: 1.5rem 0;
-  border-top: 1px solid var(--line);
-}
-
-dl.glossary dt {
-  margin-top: 1.1rem;
-  color: var(--ink);
-  font-weight: 700;
-}
-
-dl.glossary dd {
-  margin: 0.3rem 0 0;
-  padding-bottom: 1.1rem;
-  border-bottom: 1px solid var(--line);
-  color: var(--muted);
-}
-
-dl.glossary dd code {
-  color: #a8d7b0;
 }
 
 .matrix {
   width: 100%;
   border-collapse: collapse;
   margin: 1.5rem 0;
-  font-size: 0.95rem;
+  font-size: 0.9rem;
 }
 
 .matrix th,
 .matrix td {
-  border-bottom: 1px solid var(--line);
   padding: 0.7rem 0.5rem;
   text-align: left;
   vertical-align: top;
@@ -416,16 +588,78 @@ dl.glossary dd code {
 
 .matrix th {
   color: var(--ink);
+  font-family: var(--display);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.78rem;
+  border-bottom: 3px double var(--rule);
 }
 
 .matrix td {
-  color: var(--muted);
+  color: var(--ink-soft);
+  border-bottom: 1px dashed var(--rule-soft);
 }
+
+.step-list {
+  counter-reset: steps;
+  padding-left: 0;
+  list-style: none;
+}
+
+.step-list li {
+  counter-increment: steps;
+  display: grid;
+  grid-template-columns: 2.4rem 1fr;
+  gap: 0.75rem;
+  margin: 1rem 0;
+}
+
+.step-list li::before {
+  content: counter(steps, decimal-leading-zero);
+  color: var(--spot);
+  font-family: var(--display);
+  font-weight: 700;
+}
+
+.refs {
+  margin-top: 3rem;
+  padding-top: 1rem;
+  border-top: 3px double var(--rule);
+}
+
+.refs h2 {
+  border: 0;
+  padding: 0;
+}
+
+.refs ul {
+  padding-left: 1.15rem;
+}
+
+dl.glossary {
+  margin: 1.5rem 0;
+  border-top: 3px double var(--rule);
+}
+
+dl.glossary dt {
+  margin-top: 1.1rem;
+  color: var(--ink);
+  font-family: var(--display);
+  font-weight: 700;
+}
+
+dl.glossary dd {
+  margin: 0.3rem 0 0;
+  padding-bottom: 1.1rem;
+  border-bottom: 1px dashed var(--rule-soft);
+  color: var(--ink-soft);
+}
+
+/* ---- Interactive demos ----------------------------------------------------- */
 
 .demo {
   margin: 1.5rem 0;
-  border: 1px solid var(--line-2);
-  border-radius: 4px;
+  border: 1px solid var(--rule);
   background: var(--panel);
   overflow: hidden;
 }
@@ -438,12 +672,16 @@ dl.glossary dd code {
   justify-content: space-between;
   gap: 0.75rem;
   padding: 0.75rem;
-  border-bottom: 1px solid var(--line);
+  border-bottom: 1px dashed var(--rule-soft);
 }
 
 .demo-title {
   color: var(--ink);
+  font-family: var(--display);
   font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-size: 0.82rem;
 }
 
 .demo-controls {
@@ -455,6 +693,30 @@ dl.glossary dd code {
 
 .demo-body {
   padding: 1rem;
+}
+
+button.control {
+  min-height: 2.4rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--rule);
+  background: var(--bg);
+  color: var(--ink);
+  border-radius: 0;
+  padding: 0.5rem 0.8rem;
+  font: inherit;
+  font-family: var(--display);
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  cursor: pointer;
+}
+
+button.control[aria-pressed="true"] {
+  border-color: var(--spot);
+  background: var(--spot);
+  color: var(--on-spot);
 }
 
 .lsm-stage {
@@ -470,8 +732,11 @@ dl.glossary dd code {
 }
 
 .lsm-label {
-  color: var(--dim);
-  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  color: var(--muted);
+  font-family: var(--display);
+  text-transform: uppercase;
+  font-size: 0.72rem;
+  letter-spacing: 0.05em;
 }
 
 .lsm-cells {
@@ -488,33 +753,35 @@ dl.glossary dd code {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border: 1px solid var(--line-2);
-  border-radius: 4px;
+  border: 1px solid var(--rule-soft);
   color: var(--muted);
-  background: var(--code);
-  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
-  font-size: 0.84rem;
+  background: var(--bg);
+  font-family: var(--body);
+  font-size: 0.82rem;
 }
 
 .cell.hot {
-  border-color: #8fbf98;
-  color: #a8d7b0;
+  border-color: var(--spot);
+  color: var(--spot);
 }
 
 .cell.merge {
-  border-color: var(--accent);
-  color: var(--accent);
+  border-color: var(--ink);
+  background: var(--ink);
+  color: var(--bg);
 }
 
 .cell.dead {
-  border-color: var(--danger);
-  color: var(--danger);
+  border-style: dashed;
+  color: var(--muted);
+  text-decoration: line-through;
 }
 
 .demo-caption {
   min-height: 3rem;
   margin-top: 0.85rem;
-  color: var(--muted);
+  margin-bottom: 0;
+  color: var(--ink-soft);
 }
 
 .sst-demo-layout {
@@ -532,37 +799,40 @@ dl.glossary dd code {
 .sst-block,
 .sst-index-entry {
   padding: 0.65rem;
-  border: 1px solid var(--line);
-  border-radius: 4px;
-  background: var(--code);
+  border: 1px solid var(--rule-soft);
+  background: var(--bg);
   color: var(--muted);
-  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
-  font-size: 0.86rem;
+  font-family: var(--body);
+  font-size: 0.84rem;
 }
 
 .sst-block.active,
 .sst-index-entry.active {
-  border-color: var(--accent-2);
-  color: var(--accent-2);
+  border-color: var(--spot);
+  color: var(--spot);
 }
 
 .range-control {
   display: grid;
   gap: 0.4rem;
-  color: var(--muted);
+  color: var(--ink-soft);
+  font-family: var(--display);
+  text-transform: uppercase;
+  font-size: 0.74rem;
+  letter-spacing: 0.05em;
 }
 
 .range-control input {
   width: 100%;
+  accent-color: var(--spot);
 }
 
 .vector-canvas {
   width: 100%;
   height: 26rem;
   display: block;
-  background: var(--code);
-  border: 1px solid var(--line);
-  border-radius: 4px;
+  background: var(--panel-2);
+  border: 1px solid var(--rule);
 }
 
 .stat-line {
@@ -570,18 +840,17 @@ dl.glossary dd code {
   flex-wrap: wrap;
   gap: 0.65rem 1rem;
   margin-top: 0.75rem;
-  color: var(--muted);
-  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
-  font-size: 0.9rem;
+  color: var(--ink-soft);
+  font-family: var(--body);
+  font-size: 0.86rem;
 }
 
 .lat-track {
   display: flex;
   height: 2.4rem;
-  border: 1px solid var(--line-2);
-  border-radius: 4px;
+  border: 1px solid var(--rule);
   overflow: hidden;
-  background: var(--code);
+  background: var(--panel-2);
 }
 
 .lat-seg {
@@ -589,55 +858,34 @@ dl.glossary dd code {
   align-items: center;
   justify-content: center;
   min-width: 0;
-  color: #11110f;
-  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  color: #161310;
+  font-family: var(--body);
   font-size: 0.72rem;
   white-space: nowrap;
   overflow: hidden;
 }
 
-.step-list {
-  counter-reset: steps;
-  padding-left: 0;
-  list-style: none;
-}
-
-.step-list li {
-  counter-increment: steps;
-  display: grid;
-  grid-template-columns: 2.2rem 1fr;
-  gap: 0.75rem;
-  margin: 1rem 0;
-}
-
-.step-list li::before {
-  content: counter(steps, decimal-leading-zero);
-  color: var(--accent);
-  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
-}
-
-.refs {
-  margin-top: 3rem;
-  padding-top: 1rem;
-  border-top: 1px solid var(--line);
-}
-
-.refs ul {
-  padding-left: 1.15rem;
-}
+/* ---- Page-flip + colophon -------------------------------------------------- */
 
 .pager {
   display: flex;
   justify-content: space-between;
   gap: 1rem;
   padding-top: 1rem;
-  padding-bottom: 3rem;
-  border-top: 1px solid var(--line);
+  padding-bottom: 2rem;
+  border-top: 5px double var(--rule);
 }
 
 .pager a {
   max-width: 18rem;
   color: var(--ink);
+  font-family: var(--display);
+  font-size: 0.82rem;
+  text-decoration: none;
+}
+
+.pager a:hover {
+  color: var(--link-hover);
 }
 
 .site-footer {
@@ -647,25 +895,92 @@ dl.glossary dd code {
   align-items: center;
   justify-content: space-between;
   gap: 0.75rem;
-  color: var(--dim);
-  border-top: 1px solid var(--line);
-  font-size: 0.9rem;
+  margin-top: 0;
+  padding-top: 1.2rem;
+  padding-bottom: 2.5rem;
+  color: var(--muted);
+  border-top: 2px dashed var(--rule-soft);
+  font-family: var(--display);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 0.74rem;
 }
 
+.site-footer a {
+  color: var(--muted);
+  text-decoration: none;
+}
+
+.site-footer a:hover {
+  color: var(--link-hover);
+}
+
+/* ---- Responsive ------------------------------------------------------------ */
+
+/* Tablet: there isn't room for the right "on this page" rail. */
+@media (max-width: 1100px) {
+
+  .book-home,
+  .book-page {
+    grid-template-columns: var(--rail) minmax(0, 1fr);
+  }
+
+  .rail-right {
+    display: none;
+  }
+
+  .book-page::after,
+  .book-home::after {
+    display: none;
+  }
+}
+
+/* Phone: single column; the Contents collapses to a tappable disclosure. */
 @media (max-width: 900px) {
+
   .book-home,
   .book-page {
     grid-template-columns: 1fr;
   }
 
-  .home-toc,
-  .side-toc {
+  .rail-left {
     position: static;
     grid-column: auto;
-    grid-row: auto;
-    border-right: 0;
-    border-top: 1px solid var(--line);
-    padding: 1rem 0 0;
+    padding-right: 0;
+  }
+
+  /* The cover already lists every chapter, so its contents rail is redundant. */
+  .book-home .rail-left {
+    display: none;
+  }
+
+  .book-page::before,
+  .book-home::before {
+    display: none;
+  }
+
+  .rail-left {
+    margin-bottom: 1.6rem;
+    padding-bottom: 0.5rem;
+    border-bottom: 1px dashed var(--rule);
+  }
+
+  .rail-summary {
+    margin-bottom: 0;
+    border-bottom: 0;
+  }
+
+  .rail-summary::after {
+    content: " ▾";
+    color: var(--spot);
+  }
+
+  details.rail-left[open] .rail-summary::after {
+    content: " ▴";
+  }
+
+  .top-nav::before {
+    display: none;
   }
 
   .book-content {
@@ -687,8 +1002,8 @@ dl.glossary dd code {
 
 @media (max-width: 620px) {
   .top-nav {
-    align-items: flex-start;
-    flex-direction: column;
+    grid-template-columns: 1fr;
+    row-gap: 0.5rem;
     padding-top: 0.75rem;
     padding-bottom: 0.75rem;
   }
@@ -699,11 +1014,11 @@ dl.glossary dd code {
 
   h1,
   .book-content h1 {
-    font-size: 2.25rem;
+    font-size: 2rem;
   }
 
   h2 {
-    font-size: 1.9rem;
+    font-size: 1.25rem;
   }
 
   .lede {

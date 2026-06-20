@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<script>(function(){try{var t=localStorage.getItem('sana-theme');if(t)document.documentElement.setAttribute('data-theme',t);}catch(e){}})();</script>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>The Sana Book — A search database, explained from the ground up</title>
 <link rel="stylesheet" href="book/style.css">
@@ -10,36 +11,31 @@
 <body>
 <a class="skip-link" href="#main">Skip to content</a>
 <header class="site-header">
-  <nav class="top-nav" aria-label="Book navigation">
-    <a class="brand" href="./index.html">sana book</a>
-    <div class="nav-links">
-      <a href="book/intro.html">intro</a>
-      <a href="book/storage.html">storage</a>
-      <a href="book/sstable-lsm.html">sst + lsm</a>
-      <a href="book/query.html">query</a>
-      <a href="book/vector.html">vectors</a>
-      <a href="book/spfresh-rabitq.html">spfresh + rabitq</a>
-      <a href="book/operations.html">operations</a>
-      <a href="book/glossary.html">glossary</a>
-    </div>
-  </nav>
+  <div class="top-nav">
+    <a class="brand" href="./index.html">Sana Book</a>
+    <nav class="nav-links" aria-label="Links">
+      <a href="https://github.com/djakish/sana">GitHub</a>
+      <a href="guide.md">Guide</a>
+      <a href="ARCHITECTURE.md">Architecture</a>
+    </nav>
+  </div>
 </header>
 
 <main id="main" class="book-home">
-  <aside class="home-toc" aria-label="Contents">
+  <aside class="rail rail-left" aria-label="Contents">
     <strong>Contents</strong>
-    <p class="toc-part">Part I — Foundations</p>
+    <span class="rail-part">Part I — Foundations</span>
     <a href="book/intro.html">01 Introduction</a>
-    <p class="toc-part">Part II — Storing data that lasts</p>
+    <span class="rail-part">Part II — Storage</span>
     <a href="book/storage.html">02 The durable boundary</a>
-    <a href="book/sstable-lsm.html">03 SSTables and LSM trees</a>
-    <p class="toc-part">Part III — Answering questions</p>
+    <a href="book/sstable-lsm.html">03 SSTables &amp; LSM trees</a>
+    <span class="rail-part">Part III — Search</span>
     <a href="book/query.html">04 The query engine</a>
     <a href="book/vector.html">05 Vector search</a>
-    <a href="book/spfresh-rabitq.html">06 SPFresh and RaBitQ</a>
-    <p class="toc-part">Part IV — Running it for real</p>
+    <a href="book/spfresh-rabitq.html">06 SPFresh &amp; RaBitQ</a>
+    <span class="rail-part">Part IV — Operating</span>
     <a href="book/operations.html">07 Running the system</a>
-    <p class="toc-part">Appendices</p>
+    <span class="rail-part">Appendix</span>
     <a href="book/trace.html">A full trace</a>
     <a href="book/glossary.html">Glossary</a>
     <a href="book/map.html">System map</a>
@@ -142,6 +138,15 @@
       final authority; this book is a guided reading of it.
     </div>
   </article>
+
+  <aside class="rail rail-right" aria-label="Elsewhere">
+    <strong>Elsewhere</strong>
+    <a href="https://github.com/djakish/sana">Repository</a>
+    <a href="guide.md">User guide</a>
+    <a href="ARCHITECTURE.md">Architecture</a>
+    <a href="PROGRESS.md">Build log</a>
+    <a href="book/map.html">System map</a>
+  </aside>
 </main>
 
 <footer class="site-footer">
