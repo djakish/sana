@@ -96,12 +96,121 @@ pub struct Document {
 }
 
 impl Document {
-    pub fn new(id: Id) -> Self {
+    /// Create an empty document with the given primary key. Accepts anything
+    /// convertible into an [`Id`] — a `u64`, a 16-byte UUID, or a string.
+    pub fn new(id: impl Into<Id>) -> Self {
         Self {
-            id,
+            id: id.into(),
             vectors: BTreeMap::new(),
             attributes: BTreeMap::new(),
         }
+    }
+
+    /// Chainable: set one attribute and return the document, e.g.
+    /// `Document::new(1u64).attr("title", "Dune").attr("rating", 4.7)`.
+    #[must_use]
+    pub fn attr(mut self, name: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.attributes.insert(name.into(), value.into());
+        self
+    }
+
+    /// Chainable: set one vector column and return the document.
+    #[must_use]
+    pub fn vector(mut self, name: impl Into<String>, vector: impl Into<VectorValue>) -> Self {
+        self.vectors.insert(name.into(), vector.into());
+        self
+    }
+}
+
+// Ergonomic `From` conversions for the common library shapes. These are surface
+// sugar only: the persisted postcard/JSON encodings are untouched, so they
+// cannot affect storage compatibility.
+
+impl From<u64> for Id {
+    fn from(v: u64) -> Self {
+        Id::U64(v)
+    }
+}
+
+impl From<[u8; 16]> for Id {
+    fn from(bytes: [u8; 16]) -> Self {
+        Id::Uuid(bytes)
+    }
+}
+
+impl From<String> for Id {
+    fn from(s: String) -> Self {
+        // Mirror the JSON wire: a canonical hyphenated UUID becomes `Uuid`,
+        // anything else a `String` id, so `Id::from(s)` matches a parsed key.
+        parse_uuid_hyphenated(&s).map_or(Id::String(s), Id::Uuid)
+    }
+}
+
+impl From<&str> for Id {
+    fn from(s: &str) -> Self {
+        parse_uuid_hyphenated(s)
+            .map(Id::Uuid)
+            .unwrap_or_else(|| Id::String(s.to_string()))
+    }
+}
+
+impl From<bool> for Value {
+    fn from(v: bool) -> Self {
+        Value::Bool(v)
+    }
+}
+
+impl From<i64> for Value {
+    fn from(v: i64) -> Self {
+        Value::Int(v)
+    }
+}
+
+impl From<i32> for Value {
+    fn from(v: i32) -> Self {
+        Value::Int(i64::from(v))
+    }
+}
+
+impl From<f64> for Value {
+    fn from(v: f64) -> Self {
+        Value::Float(v)
+    }
+}
+
+impl From<f32> for Value {
+    fn from(v: f32) -> Self {
+        Value::Float(f64::from(v))
+    }
+}
+
+impl From<String> for Value {
+    fn from(v: String) -> Self {
+        Value::String(v)
+    }
+}
+
+impl From<&str> for Value {
+    fn from(v: &str) -> Self {
+        Value::String(v.to_string())
+    }
+}
+
+impl From<Vec<Value>> for Value {
+    fn from(v: Vec<Value>) -> Self {
+        Value::Array(v)
+    }
+}
+
+impl From<Vec<f32>> for VectorValue {
+    fn from(v: Vec<f32>) -> Self {
+        VectorValue::F32(v)
+    }
+}
+
+impl From<&[f32]> for VectorValue {
+    fn from(v: &[f32]) -> Self {
+        VectorValue::F32(v.to_vec())
     }
 }
 
@@ -400,6 +509,40 @@ impl<'de> Deserialize<'de> for VectorValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn from_conversions_and_builders() {
+        assert_eq!(Id::from(7u64), Id::U64(7));
+        assert_eq!(Id::from("plain"), Id::String("plain".into()));
+        assert_eq!(
+            Id::from("00000000-0000-0000-0000-000000000000"),
+            Id::Uuid([0u8; 16])
+        );
+
+        assert_eq!(Value::from(true), Value::Bool(true));
+        assert_eq!(Value::from(3_i32), Value::Int(3));
+        assert_eq!(Value::from(4.5_f64), Value::Float(4.5));
+        assert_eq!(Value::from("x"), Value::String("x".into()));
+        assert_eq!(
+            VectorValue::from(vec![1.0_f32, 2.0]),
+            VectorValue::F32(vec![1.0, 2.0])
+        );
+
+        let doc = Document::new(1u64)
+            .attr("title", "Dune")
+            .attr("rating", 4.7)
+            .vector("embedding", vec![0.1_f32, 0.2]);
+        assert_eq!(doc.id, Id::U64(1));
+        assert_eq!(
+            doc.attributes.get("title"),
+            Some(&Value::String("Dune".into()))
+        );
+        assert_eq!(doc.attributes.get("rating"), Some(&Value::Float(4.7)));
+        assert_eq!(
+            doc.vectors.get("embedding"),
+            Some(&VectorValue::F32(vec![0.1, 0.2]))
+        );
+    }
 
     #[test]
     fn value_json_is_plain() {

@@ -596,29 +596,34 @@ Current code:
 
 ## P2: Improve public library ergonomics
 
-**Status:** the wire format now accepts plain JSON values, and the cookbook
-covers HTTP examples. The Rust library API still asks users to assemble common
-documents and filters from low-level enum variants.
+**Status:** mostly done. `From` conversions, chainable `Document` builders,
+`FilterExpr`/`RangeBound` constructors, and crate-root re-exports now let an
+embedder write documents and filters without naming low-level enum variants;
+`examples/usage.rs` is rewritten to use them. The only remaining item is the
+optional `Namespace::flush()`/`scan()` aliases.
 
 Current code:
 
-- [`examples/usage.rs`](../examples/usage.rs) imports many modules and manually
-  inserts `Value::String`, `Value::Float`, and `VectorValue::F32`.
-- [`Document::new`](../src/value.rs) requires an `Id`; there are no chainable
-  `attr` or `vector` builders.
-- Query helpers such as `FilterExpr::eq`, `FilterExpr::range`, and
-  `Namespace::flush` do not exist, and crate-root re-exports are minimal.
-- `Namespace::replay` is the public "scan everything" method name.
+- [`Document::new`](../src/value.rs) takes `impl Into<Id>` and has chainable
+  `attr`/`vector` builders; `From` impls cover `Id`, `Value`, and
+  `VectorValue` for the common scalar/vector inputs.
+- [`FilterExpr`](../src/query.rs) has `eq`/`range`/`gte`/`gt`/`lte`/`lt`/
+  `and`/`or`/`not` constructors and `RangeBound::included`/`excluded`.
+- The crate root re-exports `Namespace`, `Document`, `Id`, `Value`,
+  `VectorValue`, `Query`, `FilterExpr`, `RangeBound`, `ObjectStore`,
+  `FsObjectStore`.
+- `Namespace::replay` is still the public "scan everything" method name, and
+  flush is still reached via `indexer::flush`.
 
 ### Required work
 
-- [ ] Add `From` implementations for common `Id`, `Value`, and `VectorValue`
+- [x] Add `From` implementations for common `Id`, `Value`, and `VectorValue`
       inputs without changing persisted binary formats.
-- [ ] Add chainable document builders for attributes and vectors.
-- [ ] Add filter/query helper constructors for the common cookbook shapes.
+- [x] Add chainable document builders for attributes and vectors.
+- [x] Add filter/query helper constructors for the common cookbook shapes.
 - [ ] Consider `Namespace::flush()` and `Namespace::scan()` aliases while
       keeping existing APIs for compatibility.
-- [ ] Re-export the public types needed by most examples from the crate root.
+- [x] Re-export the public types needed by most examples from the crate root.
 
 ## Suggested order
 

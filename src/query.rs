@@ -104,6 +104,118 @@ pub enum RangeBound {
     Excluded(Value),
 }
 
+impl FilterExpr {
+    /// `column == value`.
+    pub fn eq(column: impl Into<String>, value: impl Into<Value>) -> Self {
+        FilterExpr::Eq {
+            column: column.into(),
+            value: value.into(),
+        }
+    }
+
+    /// A range with explicit lower/upper bounds; either may be open (`None`).
+    pub fn range(
+        column: impl Into<String>,
+        lower: Option<RangeBound>,
+        upper: Option<RangeBound>,
+    ) -> Self {
+        FilterExpr::Range {
+            column: column.into(),
+            lower,
+            upper,
+        }
+    }
+
+    /// `column >= value`.
+    pub fn gte(column: impl Into<String>, value: impl Into<Value>) -> Self {
+        Self::range(column, Some(RangeBound::Included(value.into())), None)
+    }
+
+    /// `column > value`.
+    pub fn gt(column: impl Into<String>, value: impl Into<Value>) -> Self {
+        Self::range(column, Some(RangeBound::Excluded(value.into())), None)
+    }
+
+    /// `column <= value`.
+    pub fn lte(column: impl Into<String>, value: impl Into<Value>) -> Self {
+        Self::range(column, None, Some(RangeBound::Included(value.into())))
+    }
+
+    /// `column < value`.
+    pub fn lt(column: impl Into<String>, value: impl Into<Value>) -> Self {
+        Self::range(column, None, Some(RangeBound::Excluded(value.into())))
+    }
+
+    /// All sub-filters must match (intersection).
+    pub fn and(exprs: impl IntoIterator<Item = FilterExpr>) -> Self {
+        FilterExpr::And(exprs.into_iter().collect())
+    }
+
+    /// Any sub-filter may match (union).
+    pub fn or(exprs: impl IntoIterator<Item = FilterExpr>) -> Self {
+        FilterExpr::Or(exprs.into_iter().collect())
+    }
+
+    /// Negation. (A `Not` falls back to a full-scan recheck; see the query
+    /// chapter for why the index cannot serve a complement directly.)
+    // A named constructor mirroring the `Not` variant, parallel to `eq`/`and`/
+    // `or` — deliberately an associated fn over the inner expr, not the
+    // `std::ops::Not` operator.
+    #[allow(clippy::should_implement_trait)]
+    pub fn not(expr: FilterExpr) -> Self {
+        FilterExpr::Not(Box::new(expr))
+    }
+}
+
+impl RangeBound {
+    pub fn included(value: impl Into<Value>) -> Self {
+        RangeBound::Included(value.into())
+    }
+
+    pub fn excluded(value: impl Into<Value>) -> Self {
+        RangeBound::Excluded(value.into())
+    }
+}
+
+#[cfg(test)]
+mod ergonomics_tests {
+    use super::{FilterExpr, RangeBound};
+    use crate::value::Value;
+
+    #[test]
+    fn filter_expr_constructors() {
+        assert_eq!(
+            FilterExpr::eq("genre", "scifi"),
+            FilterExpr::Eq {
+                column: "genre".into(),
+                value: Value::String("scifi".into()),
+            }
+        );
+        assert_eq!(
+            FilterExpr::gte("rating", 4.5_f64),
+            FilterExpr::Range {
+                column: "rating".into(),
+                lower: Some(RangeBound::Included(Value::Float(4.5))),
+                upper: None,
+            }
+        );
+        assert_eq!(
+            FilterExpr::lt("year", 2000_i32),
+            FilterExpr::Range {
+                column: "year".into(),
+                lower: None,
+                upper: Some(RangeBound::Excluded(Value::Int(2000))),
+            }
+        );
+
+        let combined = FilterExpr::and([
+            FilterExpr::eq("genre", "scifi"),
+            FilterExpr::not(FilterExpr::lt("rating", 4.0_f64)),
+        ]);
+        assert!(matches!(combined, FilterExpr::And(parts) if parts.len() == 2));
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrderBy {
     pub target: OrderTarget,

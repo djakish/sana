@@ -14,12 +14,8 @@
 use std::sync::Arc;
 
 use sana::indexer;
-use sana::namespace::Namespace;
-use sana::object_store::{FsObjectStore, ObjectStore};
-use sana::query::{
-    Aggregate, ApproxVectorQuery, ExactVectorQuery, FilterExpr, MultiQuery, Query, TextQuery,
-};
-use sana::value::{Document, Id, Value, VectorValue};
+use sana::query::{Aggregate, ApproxVectorQuery, ExactVectorQuery, MultiQuery, TextQuery};
+use sana::{Document, FilterExpr, FsObjectStore, Id, Namespace, ObjectStore, Query};
 
 #[tokio::main]
 async fn main() -> sana::Result<()> {
@@ -31,22 +27,23 @@ async fn main() -> sana::Result<()> {
 
     // Write a few books. Every write is durable in object storage when the
     // call returns; the schema (types per column) is inferred and enforced.
-    let books = [
+    let books: [(u64, &str, &str, f64, [f32; 2]); 4] = [
         (1, "The Left Hand of Darkness", "scifi", 4.7, [0.9, 0.1]),
         (2, "A Wizard of Earthsea", "fantasy", 4.5, [0.8, 0.3]),
         (3, "The Dispossessed", "scifi", 4.8, [0.95, 0.05]),
         (4, "Piranesi", "fantasy", 4.2, [0.2, 0.9]),
     ];
     for (id, title, genre, rating, embedding) in books {
-        let mut doc = Document::new(Id::U64(id));
-        doc.attributes
-            .insert("title".into(), Value::String(title.into()));
-        doc.attributes
-            .insert("genre".into(), Value::String(genre.into()));
-        doc.attributes.insert("rating".into(), Value::Float(rating));
-        doc.vectors
-            .insert("embedding".into(), VectorValue::F32(embedding.to_vec()));
-        ns.upsert(doc).await?;
+        // `From` conversions and the chainable builders keep this terse; the
+        // schema (types per column) is still inferred and enforced on write.
+        ns.upsert(
+            Document::new(id)
+                .attr("title", title)
+                .attr("genre", genre)
+                .attr("rating", rating)
+                .vector("embedding", embedding.to_vec()),
+        )
+        .await?;
     }
 
     // Fold the WAL into immutable SSTs and build the attribute, full-text,
@@ -57,10 +54,7 @@ async fn main() -> sana::Result<()> {
     // 1. Filtered query with an aggregate: scifi books, count them.
     let result = ns
         .query(Query {
-            filter: Some(FilterExpr::Eq {
-                column: "genre".into(),
-                value: Value::String("scifi".into()),
-            }),
+            filter: Some(FilterExpr::eq("genre", "scifi")),
             aggregates: vec![Aggregate::Count],
             ..Query::all()
         })

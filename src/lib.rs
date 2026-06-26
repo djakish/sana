@@ -31,4 +31,10 @@ pub mod vector;
 pub mod wal;
 pub mod write;
 
+// Re-export the types most embedders touch, so a typical program imports from
+// the crate root rather than reaching into individual modules.
 pub use error::{Error, Result};
+pub use namespace::Namespace;
+pub use object_store::{FsObjectStore, ObjectStore};
+pub use query::{FilterExpr, Query, RangeBound};
+pub use value::{Document, Id, Value, VectorValue};
