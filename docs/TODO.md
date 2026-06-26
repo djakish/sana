@@ -440,6 +440,186 @@ rankings as permutations over `1..|D|`, so the first result should contribute
 
 Source: [Cormack, Clarke, and Buettcher, Reciprocal Rank Fusion](https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf).
 
+## P1: Add a guarded namespace drop lifecycle
+
+**Status:** namespaces can be created, branched, copied, exported, written, and
+queried, but there is no `sana drop` or library equivalent.
+
+Current code:
+
+- [`Namespace::create`](../src/namespace.rs) and [`Namespace::open`](../src/namespace.rs)
+  define the entry path.
+- [`operations::branch_namespace`](../src/operations.rs) creates child manifests
+  that may reference immutable objects owned by the source namespace.
+- [`indexer::foreign_references_into_namespace`](../src/indexer.rs) already
+  scans branch references so GC does not delete parent objects still used by a
+  child branch.
+
+### Gap
+
+1. A namespace can be created accidentally or become obsolete.
+2. Operators can delete rows, but not the namespace's manifest pointer, WAL,
+   idempotency records, indexes, pinning state, and queue jobs as one lifecycle
+   operation.
+3. Deleting the prefix manually can break branches that still reference parent
+   objects.
+
+### Required work
+
+- [ ] Add `sana drop <store> <namespace>` and a library/API entry point.
+- [ ] Refuse by default while any other manifest references the namespace's
+      immutable objects.
+- [ ] Decide whether `--force` only tombstones the namespace or also schedules
+      object deletion through the safe GC protocol.
+- [ ] Remove or fence queue, reader-lease, pinning, and maintenance state for
+      the namespace.
+- [ ] Add tests for branch-held objects, concurrent readers/writers, and retry
+      after partial drop progress.
+
+## P1: Retry transient S3 failures safely
+
+**Status:** done. Every S3 verb now routes its presigned request through
+`send_retrying`, which retries transient transport errors and retryable 5xx
+responses (`500`/`502`/`503` `SlowDown`/`504`) with bounded exponential backoff
+and full jitter, on top of the existing 409 conditional-conflict retries.
+`404`, precondition failures, and corruption errors stay non-retryable. The two
+conditional verbs reconcile an ambiguous success — a write whose 2xx was lost
+behind a transient failure — by re-reading the current bytes after any retry,
+so an already-committed write is reported as success instead of a spurious
+`AlreadyExists`/`CasMismatch`.
+
+Current code:
+
+- [`S3ObjectStore::send_retrying`](../src/object_store/s3.rs) owns the transient
+  retry loop, re-signing the URL per attempt and reporting whether a retry
+  occurred. [`is_retryable_status`](../src/object_store/s3.rs) and
+  [`backoff_delay`](../src/object_store/s3.rs) are pure and unit-tested.
+- [`S3ObjectStore::reconcile_conditional`](../src/object_store/s3.rs) re-reads
+  the key after an ambiguous conditional write and decides the outcome by byte
+  equality (S3 ETags are not Sana content versions).
+- The WAL, manifest, and immutable-object protocols tolerate ambiguous success,
+  so re-`put`ting identical immutable bytes or re-running a CAS is safe.
+
+### Gap
+
+1. S3 returns `503 SlowDown`, a transient `500`, or a temporary transport error.
+2. Sana surfaces that as a hard database operation failure.
+3. The object-store protocol remains safe, but operators see avoidable write,
+   query, indexing, or maintenance failures.
+
+### Required work
+
+- [x] Add bounded exponential backoff with jitter for retryable transport
+      errors and S3 `500`, `502`, `503`, and `504` responses.
+- [x] Keep `404`, failed preconditions, and deterministic corruption errors
+      non-retryable.
+- [x] Treat conditional `PUT` and CAS retries as ambiguous-success safe:
+      verify existing bytes or re-read current object state where needed.
+- [x] Add tests with an injected S3/HTTP failure sequence for every object-store
+      verb (mock-HTTP per-verb retry tests plus pure backoff/classification
+      unit tests; MinIO conformance still covers the real-backend contract).
+
+## P1: Add randomized object-store adversary tests
+
+**Status:** crash-window and race tests exist for many known protocols, but
+there is no seeded adversarial object-store test that searches for unknown
+interleavings.
+
+Current code:
+
+- Tests use small custom `ObjectStore` decorators for specific scenarios, such
+  as ambiguous WAL commits and GC publish races.
+- There is no dev dependency such as `proptest`, no reusable fault-injecting
+  store, and no fuzz target for WAL/SST/frame decoders.
+
+### Required work
+
+- [ ] Add a seeded `FaultingObjectStore` test decorator that can delay, fail,
+      or report ambiguous success on configured operations.
+- [ ] Run random write/flush/compact/query episodes and check invariants after
+      every step: committed cursor never regresses, accepted writes are readable,
+      manifests parse, and referenced immutable objects exist.
+- [ ] Add property tests that generate documents and filter expressions, then
+      assert indexed query results equal a full-scan reference across flush,
+      tiering, and compaction.
+- [ ] Add codec fuzzing or property tests for frame, WAL, manifest, and SST
+      decoders.
+
+## P2: Reduce full-compaction write spikes
+
+**Status:** minor tiering exists for document and attribute SSTs, but the
+operator `compact` path still rewrites a whole namespace and is the only path
+that drops tombstones, rebuilds stale-free attribute/text snapshots, and resets
+the vector append chain.
+
+Current code:
+
+- [`tier_doc_ssts`](../src/indexer.rs) and [`tier_attr_ssts`](../src/indexer.rs)
+  merge runs within one level.
+- [`compact`](../src/indexer.rs) merges all runs, drops tombstones, rebuilds
+  attribute/text indexes, rebuilds the vector base, and clears appends.
+- [`MaintenancePolicy::default`](../src/maintenance.rs) triggers full compaction
+  at eight doc/attr runs or four vector appends.
+
+### Required work
+
+- [ ] Add a compaction plan that bounds bytes rewritten per maintenance pass.
+- [ ] Separate tombstone cleanup, stale attribute cleanup, text rebuild, and
+      vector-base reset so they do not always require one full rewrite.
+- [ ] Make compaction thresholds byte-aware, not only run-count based.
+- [ ] Expose compaction bytes in metrics before changing automatic policy.
+
+## P2: Surface background work in metrics and logs
+
+**Status:** object-store, cache, query/search, queue, and index-lag metrics
+exist. Background maintenance and worker failures still mostly go to `eprintln!`,
+and maintenance outcomes are not first-class metrics.
+
+Current code:
+
+- [`api::run_maintenance_loop`](../src/api.rs) and the indexing worker print
+  failures to stderr.
+- [`MaintenanceReport`](../src/maintenance.rs) records compactions, vector
+  maintenance, GC deletions, pending GC objects, and errors for the caller, but
+  those fields are not exported by [`Metrics`](../src/metrics.rs).
+
+### Required work
+
+- [ ] Add counters for maintenance passes, skipped leased passes, compactions,
+      vector-maintenance publications, GC candidates, GC deletions, and
+      maintenance errors.
+- [ ] Add worker counters for claims, successful flushes, retries/failures, and
+      stale-claim publication rejections.
+- [ ] Decide whether to add feature-gated `tracing` for structured logs while
+      preserving the low-dependency default.
+- [ ] Document which metrics operators should alert on.
+
+## P2: Improve public library ergonomics
+
+**Status:** the wire format now accepts plain JSON values, and the cookbook
+covers HTTP examples. The Rust library API still asks users to assemble common
+documents and filters from low-level enum variants.
+
+Current code:
+
+- [`examples/usage.rs`](../examples/usage.rs) imports many modules and manually
+  inserts `Value::String`, `Value::Float`, and `VectorValue::F32`.
+- [`Document::new`](../src/value.rs) requires an `Id`; there are no chainable
+  `attr` or `vector` builders.
+- Query helpers such as `FilterExpr::eq`, `FilterExpr::range`, and
+  `Namespace::flush` do not exist, and crate-root re-exports are minimal.
+- `Namespace::replay` is the public "scan everything" method name.
+
+### Required work
+
+- [ ] Add `From` implementations for common `Id`, `Value`, and `VectorValue`
+      inputs without changing persisted binary formats.
+- [ ] Add chainable document builders for attributes and vectors.
+- [ ] Add filter/query helper constructors for the common cookbook shapes.
+- [ ] Consider `Namespace::flush()` and `Namespace::scan()` aliases while
+      keeping existing APIs for compatibility.
+- [ ] Re-export the public types needed by most examples from the crate root.
+
 ## Suggested order
 
 1. Disable automatic GC.
@@ -452,3 +632,6 @@ Source: [Cormack, Clarke, and Buettcher, Reciprocal Rank Fusion](https://plg.uwa
 7. Add Kubernetes lifecycle, probes, renewable AWS credentials, and the HTTP
    trust boundary.
 8. Add cache-aware routing after the basic multi-pod deployment is correct.
+9. Work through the Fable 5 follow-ups above: namespace drop, S3 retries,
+   adversarial tests, compaction planning, observability, and library
+   ergonomics.

@@ -60,7 +60,7 @@ repeats.
 | Layer | Role |
 |---|---|
 | `FsObjectStore` | local filesystem; CAS via a per-root in-process lock + atomic temp-file rename. Crash-safe, but **single-process only** (D4). |
-| `S3ObjectStore` | presigned SigV4 over `reqwest`; CAS is S3-native (`If-None-Match: *`, `If-Match: <etag>`), so it holds **across processes and nodes**. |
+| `S3ObjectStore` | presigned SigV4 over `reqwest`; CAS is S3-native (`If-None-Match: *`, `If-Match: <etag>`), so it holds **across processes and nodes**. Transient transport errors and retryable 5xx (`500`/`502`/`503` `SlowDown`/`504`) are retried with bounded exponential backoff + jitter; conditional verbs reconcile an ambiguous success against the current bytes after a retry. |
 | `MeteredObjectStore` | decorator that counts requests, bytes, and CAS rejections — placed *below* the cache so hits don't inflate backend counts. |
 | `CachingObjectStore` | byte-bounded LRU that admits **only immutable** objects (manifest bodies, `index/g/...`); mutable pointers/cursors/queue always bypass. |
 

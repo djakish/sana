@@ -1142,6 +1142,27 @@ Stage 12 decisions / notes:
   credentials are env-vars (+ session token), no IAM-role/SSO chain; swapping
   in `aws-sdk-s3` later touches exactly one file behind `ObjectStore`.
 
+- **D73 — Transient S3 failures retry at the backend boundary, ambiguous-success
+  safe.** Object stores throttle (`503 SlowDown`) and return transient gateway
+  faults (`500`/`502`/`504`); failing the database operation on the first one is
+  avoidable. Every verb now routes its presigned request through `send_retrying`,
+  which retries transport errors and those retryable 5xx codes with bounded
+  exponential backoff and full jitter (capped at `RETRY_CAP`, `TRANSIENT_RETRIES`
+  beyond the first attempt), re-signing the URL each attempt. `404`, precondition
+  failures (`412`), and `Corrupt` decode errors stay non-retryable; the `409`
+  conditional-conflict retry is unchanged and composes on top. Conditional writes
+  are the subtle case: a retry after a transient failure can resend `If-None-Match`
+  / `If-Match` and see `412` even though the *first* attempt already committed.
+  `reconcile_conditional` therefore re-reads the key after any retried conditional
+  PUT and decides by **byte equality** — not ETag/content-hash equality, since S3
+  ETags are not Sana content versions — reporting our own bytes as success and a
+  genuine divergence as `AlreadyExists`/`CasMismatch` (now carrying the actual
+  version). The common, non-ambiguous path takes no extra GET. Retry logic is
+  proven by a localhost mock-HTTP server scripting per-verb `503`/dropped-connection
+  sequences plus pure `backoff_delay`/`is_retryable_status` unit tests; the MinIO
+  conformance suite (6/6) confirms the refactored verbs still satisfy the
+  real-backend contract.
+
 ---
 
 ## Stage 13 — Automatic Maintenance (done)
