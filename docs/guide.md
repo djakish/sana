@@ -74,17 +74,45 @@ deletion is off by default.
 For multi-pod deployments, split the roles:
 
 ```sh
+sana queue-broker s3://my-bucket/sana 0.0.0.0:8090 \
+  http://10.0.0.42:8090 broker-0
 sana serve-api s3://my-bucket/sana 0.0.0.0:8080 268435456
 sana work-indexing s3://my-bucket/sana indexer-0 --loop
-sana maintain s3://my-bucket/sana --loop
+sana maintain s3://my-bucket/sana maintenance-0 --loop
 
 # Equivalent single-node/dev form:
 sana serve s3://my-bucket/sana 0.0.0.0:8080 268435456 --role all
 ```
 
 API-only pods do not reconcile the queue, claim indexing jobs, or scan all
-namespaces for maintenance. See [`kubernetes-roles.yaml`](kubernetes-roles.yaml)
-for a minimal separate-Deployment example.
+namespaces for maintenance. The broker registers its advertised URL and owner
+generation in `jobs/indexing_queue.json`. API and indexer processes discover
+that address from object storage; there is no static broker URL or Kubernetes
+Service in the data path.
+
+The broker acknowledges a request only after its group-committed queue CAS is
+durable. A replacement broker CAS-registers a higher generation. An overlapping
+old broker is fenced on its next mutation, and clients re-read `queue.json` and
+move to the replacement. A broker group-commit timeout fails liveness so
+Kubernetes starts a replacement. The filesystem backend is still
+single-process-only; use S3 for this deployment.
+
+The maintenance loop uses `jobs/maintenance_leader.json`, a store-global CAS
+lease, so only one live maintenance process scans and publishes compaction or
+vector-maintenance work at a time. The `owner-id` should be stable and unique
+per pod, such as `POD_NAME`. Background publishers heartbeat their queue claim
+or maintenance lease immediately before manifest publication. API query and
+recall pods publish active reader snapshots under `jobs/readers/`, which GC
+treats as live when it is explicitly run; after publishing a reader lease, the
+query path rechecks `manifest/current` and retries if it moved. This is not yet
+per-namespace maintenance jobs or automatic online GC: manual `flush`,
+`compact`, and `maintain-vectors` can still publish outside the maintenance
+leader lease, and publisher safety points remain unfinished.
+
+See [`kubernetes-roles.yaml`](kubernetes-roles.yaml) for the separate
+Deployments. The broker Deployment intentionally has one replica; a rolling
+replacement may overlap briefly, which the queue CAS and broker generation are
+designed to tolerate.
 
 ### Routes
 
@@ -328,8 +356,13 @@ cargo run --example hybrid
 `GET /metrics` exposes object-store traffic and latency (counted below the
 cache, so it measures true backend round trips), write/query latency
 histograms split by phase, cache hit/miss/byte gauges, per-namespace
-unindexed-WAL gauges, and ANN/FTS work counters. See `src/metrics.rs` for the
-full series list.
+unindexed-WAL gauges, ANN/FTS work counters, and indexing-queue metrics.
+
+Queue metrics include live/available/claimed jobs, oldest-job age, queue CAS
+attempts/successes/retries, broker group-commit batch size, and claim wait. In
+multi-pod mode, scrape the `sana queue-broker` process for these queue-owner
+series; API pods expose their own API/cache/query metrics. See `src/metrics.rs`
+for the full series list.
 
 ## Benchmark
 
@@ -346,6 +379,6 @@ filtered queries, plus the true object-store traffic the run generated. See
 
 - `docs/ARCHITECTURE.md` — how the engine works today: the object-store
   boundary, on-disk layout, write/read paths, and the core invariants.
-- `docs/PROGRESS.md` — staged build log and every design decision (D1–D74).
+- `docs/PROGRESS.md` — staged build log and every design decision (D1–D85).
 - `sana --help` (no args) — the complete CLI verb list: branch, copy, export,
   pin, gc, recall, and friends.

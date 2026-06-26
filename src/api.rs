@@ -17,12 +17,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::cache_warm::CacheWarmOptions;
 use crate::error::Error;
+use crate::index_queue::{IndexQueue, IndexQueueBroker, QueueClient};
 use crate::metrics::Metrics;
 use crate::namespace::Namespace;
 use crate::object_store::ObjectStore;
 use crate::query::{
     MultiQuery, MultiQueryResult, Query, QueryOptions, QueryResult, RecallRequest, RecallResult,
 };
+use crate::reader_lease::{ReaderLeaseController, default_reader_owner_id};
 use crate::wal::{WalCursor, WalOp};
 use crate::write::{
     ConditionalWriteOp, DeleteByFilterRequest, PatchByFilterRequest, WriteOptions, WriteOutcome,
@@ -34,10 +36,13 @@ const QUERY_SLOT_WAIT: Duration = Duration::from_millis(800);
 const READY_BACKEND_TIMEOUT: Duration = Duration::from_millis(500);
 const READINESS_DRAIN_DELAY: Duration = Duration::from_secs(5);
 const WORKER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const READER_LEASE_MS: u64 = 300_000;
 
 #[derive(Clone)]
 struct ApiState {
     store: Arc<dyn ObjectStore>,
+    queue: Arc<dyn QueueClient>,
+    reader_leases: Arc<ReaderLeaseController>,
     query_limiter: Arc<QueryLimiter>,
     metrics: Arc<Metrics>,
     health: Arc<HealthState>,
@@ -288,7 +293,10 @@ impl IntoResponse for ApiError {
                     | Error::InvalidSchema(_)
                     | Error::InvalidQuery(_)
                     | Error::InvalidQueueClaim(_)
-                    | Error::InvalidPinningClaim(_) => (StatusCode::BAD_REQUEST, "invalid_request"),
+                    | Error::InvalidQueueBroker(_)
+                    | Error::InvalidPinningClaim(_)
+                    | Error::InvalidMaintenanceLease(_)
+                    | Error::InvalidReaderLease(_) => (StatusCode::BAD_REQUEST, "invalid_request"),
                     Error::Corrupt(_) | Error::Codec(_) | Error::Io(_) => {
                         (StatusCode::INTERNAL_SERVER_ERROR, "internal")
                     }
@@ -324,6 +332,25 @@ fn router_with_metrics_and_health(
     metrics: Arc<Metrics>,
     health: Arc<HealthState>,
 ) -> Router {
+    let queue: Arc<dyn QueueClient> =
+        Arc::new(IndexQueue::new(store.clone()).with_metrics(metrics.clone()));
+    router_with_metrics_health_and_queue(store, queue, metrics, health)
+}
+
+fn router_with_metrics_health_and_queue(
+    store: Arc<dyn ObjectStore>,
+    queue: Arc<dyn QueueClient>,
+    metrics: Arc<Metrics>,
+    health: Arc<HealthState>,
+) -> Router {
+    let reader_leases = Arc::new(
+        ReaderLeaseController::new(
+            store.clone(),
+            default_reader_owner_id("api-reader"),
+            READER_LEASE_MS,
+        )
+        .expect("default reader lease owner id and duration are valid"),
+    );
     Router::new()
         .route("/healthz", get(livez))
         .route("/livez", get(livez))
@@ -340,6 +367,8 @@ fn router_with_metrics_and_health(
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .with_state(ApiState {
             store,
+            queue,
+            reader_leases,
             query_limiter: Arc::new(QueryLimiter::new(
                 MAX_CONCURRENT_QUERY_SLOTS,
                 QUERY_SLOT_WAIT,
@@ -365,9 +394,21 @@ pub async fn serve_api_with_shutdown(
     metrics: Arc<Metrics>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
+    let queue: Arc<dyn QueueClient> =
+        Arc::new(IndexQueue::new(store.clone()).with_metrics(metrics.clone()));
+    serve_api_with_queue_and_shutdown(store, queue, address, metrics, shutdown).await
+}
+
+pub async fn serve_api_with_queue_and_shutdown(
+    store: Arc<dyn ObjectStore>,
+    queue: Arc<dyn QueueClient>,
+    address: SocketAddr,
+    metrics: Arc<Metrics>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(address).await?;
     let health = Arc::new(HealthState::starting());
-    let router = router_with_metrics_and_health(store, metrics, health.clone());
+    let router = router_with_metrics_health_and_queue(store, queue, metrics, health.clone());
     health.mark_ready();
     axum::serve(listener, router)
         .with_graceful_shutdown(drain_on_shutdown(health, shutdown))
@@ -382,7 +423,18 @@ pub async fn serve_with_shutdown(
 ) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(address).await?;
     let health = Arc::new(HealthState::starting());
-    let router = router_with_metrics_and_health(store.clone(), metrics.clone(), health.clone());
+    let queue: Arc<dyn QueueClient> = Arc::new(IndexQueueBroker::start_with_metrics(
+        store.clone(),
+        1_024,
+        256,
+        metrics.clone(),
+    ));
+    let router = router_with_metrics_health_and_queue(
+        store.clone(),
+        queue.clone(),
+        metrics.clone(),
+        health.clone(),
+    );
     health.mark_ready();
     let server = axum::serve(listener, router)
         .with_graceful_shutdown(drain_on_shutdown(health.clone(), shutdown))
@@ -390,7 +442,7 @@ pub async fn serve_with_shutdown(
     let worker = async {
         let worker_health = health.clone();
         tokio::join!(
-            run_index_worker(store.clone(), metrics, worker_health.clone()),
+            run_index_worker(store.clone(), queue, metrics, worker_health.clone()),
             run_maintenance_loop(store, worker_health),
         );
     };
@@ -407,15 +459,28 @@ async fn drain_on_shutdown(health: Arc<HealthState>, shutdown: impl Future<Outpu
 /// compacts and maintains vector topology but does not delete orphaned objects.
 async fn run_maintenance_loop(store: Arc<dyn ObjectStore>, health: Arc<HealthState>) {
     const MAINTENANCE_INTERVAL_MS: u64 = 60_000;
+    const MAINTENANCE_LEASE_MS: u64 = 180_000;
 
     let policy = crate::maintenance::MaintenancePolicy::default();
     let mut state = crate::maintenance::MaintenanceState::default();
+    let owner_id = crate::maintenance::default_maintenance_owner_id("serve-maintenance");
     loop {
         if sleep_or_drain(&health, Duration::from_millis(MAINTENANCE_INTERVAL_MS)).await {
             return;
         }
-        match crate::maintenance::run_once(store.clone(), &policy, &mut state).await {
+        match crate::maintenance::run_once_leased(
+            store.clone(),
+            &policy,
+            &mut state,
+            &owner_id,
+            MAINTENANCE_LEASE_MS,
+        )
+        .await
+        {
             Ok(report) => {
+                if report.skipped_leader_lease {
+                    continue;
+                }
                 for error in &report.errors {
                     eprintln!("maintenance: {error}");
                 }
@@ -443,6 +508,7 @@ async fn run_server_and_worker(
 
 async fn run_index_worker(
     store: Arc<dyn ObjectStore>,
+    queue: Arc<dyn QueueClient>,
     metrics: Arc<Metrics>,
     health: Arc<HealthState>,
 ) {
@@ -460,7 +526,9 @@ async fn run_index_worker(
         }
         if tokio::time::Instant::now() >= next_reconcile {
             // The reconcile scan doubles as the per-namespace lag observation.
-            match crate::index_queue::reconcile_unindexed(store.clone()).await {
+            match crate::index_queue::reconcile_unindexed_with_client(store.clone(), queue.clone())
+                .await
+            {
                 Ok(report) => metrics.index_lag.record(report.lag),
                 Err(error) => eprintln!("index reconciliation failed: {error}"),
             }
@@ -468,8 +536,14 @@ async fn run_index_worker(
                 + std::time::Duration::from_millis(RECONCILE_INTERVAL_MS);
         }
 
-        match crate::index_queue::run_worker_once(store.clone(), &worker_id, LEASE_MS, HEARTBEAT_MS)
-            .await
+        match crate::index_queue::run_worker_once_with_client(
+            store.clone(),
+            queue.clone(),
+            &worker_id,
+            LEASE_MS,
+            HEARTBEAT_MS,
+        )
+        .await
         {
             Ok(Some(_)) => {}
             Ok(None) => {
@@ -538,8 +612,9 @@ async fn write(
 ) -> Result<Json<WriteResponse>, ApiError> {
     ensure_accepting_traffic(&state)?;
     let Json(request) = request.map_err(json_rejection)?;
-    let namespace = Namespace::create_or_open(state.store, &namespace)
+    let namespace = Namespace::create_or_open(state.store.clone(), &namespace)
         .await?
+        .with_queue_client(state.queue.clone())
         .with_metrics(state.metrics.clone());
     let response = match request {
         WriteRequest::Append {
@@ -604,7 +679,8 @@ async fn query(
     let Json(request) = request.map_err(json_rejection)?;
     let namespace_handle = Namespace::open(state.store, &namespace)
         .await?
-        .with_metrics(state.metrics.clone());
+        .with_metrics(state.metrics.clone())
+        .with_reader_lease(state.reader_leases.clone());
     let _permit = state
         .query_limiter
         .acquire(&namespace, query_request_slots(&request))
@@ -640,7 +716,8 @@ async fn recall(
     let Json(request) = request.map_err(json_rejection)?;
     let namespace_handle = Namespace::open(state.store, &namespace)
         .await?
-        .with_metrics(state.metrics.clone());
+        .with_metrics(state.metrics.clone())
+        .with_reader_lease(state.reader_leases.clone());
     let _permit = state.query_limiter.acquire(&namespace, 4).await?;
     Ok(Json(
         namespace_handle
@@ -827,11 +904,22 @@ mod tests {
         let store: Arc<dyn ObjectStore> = Arc::new(FsObjectStore::new(dir.path()));
         let limiter = Arc::new(super::QueryLimiter::new(1, Duration::from_millis(1)));
         let _permit = limiter.acquire("docs", 1).await.unwrap();
+        let queue = Arc::new(crate::index_queue::IndexQueue::new(store.clone()));
+        let reader_leases = Arc::new(
+            crate::reader_lease::ReaderLeaseController::new(
+                store.clone(),
+                "readiness-test",
+                super::READER_LEASE_MS,
+            )
+            .unwrap(),
+        );
         let app = axum::Router::new()
             .route("/livez", get(super::livez))
             .route("/readyz", get(super::readyz))
             .with_state(super::ApiState {
                 store,
+                queue,
+                reader_leases,
                 query_limiter: limiter,
                 metrics: crate::metrics::Metrics::shared(),
                 health: Arc::new(super::HealthState::ready()),

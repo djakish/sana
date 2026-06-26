@@ -14,6 +14,46 @@ tests, and keep the docs in sync.
 5. Check the worktree with `git status --short`. Do not overwrite unrelated
    local changes.
 
+## Agentic Task Workflow
+
+Use the same loop for human-led and agent-led work. This follows OpenAI's
+current Codex guidance: give the task explicit context and done conditions,
+store durable repository guidance in `AGENTS.md`, validate the result, and
+review the final diff before accepting it.
+
+1. **Frame the task.** Write down the goal, relevant files or evidence,
+   architectural constraints, and concrete done conditions.
+2. **Inspect before editing.** Trace callers, tests, persisted formats, failure
+   paths, and the relevant decisions in this repository.
+3. **Plan when needed.** Use a short, current plan for multi-file,
+   architectural, or ambiguous work. Skip ceremony for a trivial change.
+4. **Implement one coherent task.** Keep the diff scoped, but finish the
+   behavior, tests, and documentation needed for that task.
+5. **Verify from narrow to broad.** Run the closest regression test first,
+   followed by the repository checks below.
+6. **Review the diff.** Use [`docs/CODE_REVIEW.md`](docs/CODE_REVIEW.md) as an
+   adversarial pass over correctness, crash behavior, distributed ownership,
+   storage compatibility, and missing tests. Fix confirmed findings.
+7. **Update project state.** Update architecture, progress decisions, TODO
+   checkboxes, examples, and operational docs when their evidence changed.
+8. **Retrospect repeated mistakes.** If an agent makes the same class of error
+   twice, add a concise rule to `AGENTS.md` or the review checklist.
+
+For architecture inspired by turbopuffer, fidelity is a standing constraint:
+read the matching checked-in exports first, preserve their published semantics
+as far as Sana's scope allows, and document every intentional deviation. Do not
+replace a published distributed protocol with a merely similar local design.
+Default to turbopuffer's published shape when the exports cover the subsystem;
+choose a different coordination, storage, queue, or deployment shape only when
+the reason is explicit in [`docs/PROGRESS.md`](docs/PROGRESS.md) and the current
+behavior is reflected in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
+OpenAI references:
+
+- [Codex best practices](https://developers.openai.com/codex/learn/best-practices)
+- [Custom instructions with AGENTS.md](https://developers.openai.com/codex/guides/agents-md)
+- [Review changes in the Codex app](https://developers.openai.com/codex/app/review)
+
 ## Decision Log Workflow
 
 Use [`docs/PROGRESS.md`](docs/PROGRESS.md) for decisions that change durable
@@ -165,8 +205,12 @@ Guidelines:
 
 Before asking for review or pushing:
 
+- Did you run the task loop and the repository review in
+  [`docs/CODE_REVIEW.md`](docs/CODE_REVIEW.md)?
 - Does the change preserve the object-store invariants?
 - Is every new publisher fenced or otherwise safe under retries?
+- Does any turbopuffer-inspired subsystem follow the checked-in turbopuffer
+  shape, or document the intentional deviation?
 - Are readers safe across concurrent writes, compaction, and maintenance?
 - Are error cases explicit and tested?
 - Are query/API limits bounded by default?

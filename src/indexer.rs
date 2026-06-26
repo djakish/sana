@@ -15,6 +15,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use async_trait::async_trait;
 use bytes::Bytes;
 
 use crate::attr;
@@ -37,6 +38,22 @@ use crate::text;
 use crate::value::{Document, Id};
 use crate::vector::{VectorEntry, VectorIndex, VectorVersionMap, vector_to_f32};
 use crate::wal::WalCursor;
+
+/// Final ownership check before a manifest CAS makes already-written immutable
+/// index objects reachable.
+#[async_trait]
+pub trait ManifestPublishFence: Send + Sync {
+    async fn verify(&self) -> Result<()>;
+}
+
+pub struct NoopManifestPublishFence;
+
+#[async_trait]
+impl ManifestPublishFence for NoopManifestPublishFence {
+    async fn verify(&self) -> Result<()> {
+        Ok(())
+    }
+}
 
 fn vector_family_bytes(meta: &VectorIndexMeta) -> u64 {
     meta.size_bytes
@@ -480,6 +497,12 @@ fn build_sst(records: &BTreeMap<Id, DocRecord>) -> Result<BuiltSst> {
 /// Flush the WAL delta since `indexed_cursor` into a new document SST. Returns
 /// `true` if work was done.
 pub async fn flush(ns: &Namespace) -> Result<bool> {
+    flush_with_fence(ns, &NoopManifestPublishFence).await
+}
+
+/// Like [`flush`], but verifies `fence` immediately before publishing the new
+/// manifest pointer.
+pub async fn flush_with_fence(ns: &Namespace, fence: &dyn ManifestPublishFence) -> Result<bool> {
     let snapshot = ns.load_manifest_snapshot().await?;
     let mut manifest = snapshot.manifest;
     let (commit, committed_wal_bytes) = ns.wal_commit_stats().await?;
@@ -508,6 +531,7 @@ pub async fn flush(ns: &Namespace) -> Result<bool> {
         manifest.wal_commit_cursor = Some(commit);
         manifest.indexed_cursor = Some(commit);
         manifest.indexed_wal_bytes = committed_wal_bytes;
+        fence.verify().await?;
         ns.publish_manifest(snapshot.pointer_version, &manifest)
             .await?;
         return Ok(true);
@@ -611,6 +635,7 @@ pub async fn flush(ns: &Namespace) -> Result<bool> {
     manifest.approx_row_count = row_count;
     manifest.approx_logical_bytes = manifest_logical_bytes(&manifest);
 
+    fence.verify().await?;
     ns.publish_manifest(snapshot.pointer_version, &manifest)
         .await?;
     Ok(true)
@@ -755,6 +780,12 @@ async fn tier_attr_ssts(
 /// Merge all document SSTs into a single file, dropping shadowed values and
 /// tombstones. Returns `true` if work was done.
 pub async fn compact(ns: &Namespace) -> Result<bool> {
+    compact_with_fence(ns, &NoopManifestPublishFence).await
+}
+
+/// Like [`compact`], but verifies `fence` immediately before publishing the new
+/// manifest pointer.
+pub async fn compact_with_fence(ns: &Namespace, fence: &dyn ManifestPublishFence) -> Result<bool> {
     let snapshot = ns.load_manifest_snapshot().await?;
     let mut manifest = snapshot.manifest;
     if manifest.doc_ssts.len() <= 1 {
@@ -805,6 +836,7 @@ pub async fn compact(ns: &Namespace) -> Result<bool> {
     }];
     manifest.approx_logical_bytes = manifest_logical_bytes(&manifest);
 
+    fence.verify().await?;
     ns.publish_manifest(snapshot.pointer_version, &manifest)
         .await?;
     Ok(true)
@@ -836,6 +868,86 @@ pub struct GcReport {
 /// concurrent reader still holding an older manifest could reference an object
 /// being deleted. Run it when the namespace is idle.
 pub async fn gc(ns: &Namespace, apply: bool) -> Result<GcReport> {
+    let scan = scan_gc(ns).await?;
+    if !apply {
+        return Ok(scan.into_report(false));
+    }
+    delete_gc_candidates(ns, scan.orphan_keys()).await
+}
+
+/// Delete candidate keys only if a fresh GC scan still proves they are orphaned.
+///
+/// This is the final reference check shared by apply-mode `gc` and the legacy
+/// opt-in maintenance GC. It intentionally remains a namespace-local safety
+/// check: production online GC still needs publisher safety points and durable
+/// GC candidates before automatic deletion can be enabled by default.
+pub async fn delete_gc_candidates(
+    ns: &Namespace,
+    candidate_keys: BTreeSet<String>,
+) -> Result<GcReport> {
+    delete_gc_candidates_with_fence(ns, candidate_keys, None).await
+}
+
+pub async fn delete_gc_candidates_with_fence(
+    ns: &Namespace,
+    candidate_keys: BTreeSet<String>,
+    fence: Option<&dyn ManifestPublishFence>,
+) -> Result<GcReport> {
+    let scan = scan_gc(ns).await?;
+    let candidates: BTreeSet<&str> = candidate_keys.iter().map(String::as_str).collect();
+    let mut orphan_keys = Vec::new();
+    let mut orphan_bytes = 0u64;
+
+    for (key, size) in &scan.orphans {
+        if candidates.contains(key.as_str()) {
+            orphan_keys.push(key.clone());
+            orphan_bytes = orphan_bytes.checked_add(*size).ok_or_else(|| {
+                Error::Corrupt("GC orphan byte count overflowed during deletion".into())
+            })?;
+        }
+    }
+
+    if !orphan_keys.is_empty()
+        && let Some(fence) = fence
+    {
+        fence.verify().await?;
+    }
+
+    for key in &orphan_keys {
+        ns.store().delete(key).await?;
+    }
+
+    Ok(GcReport {
+        orphan_keys,
+        orphan_bytes,
+        live_count: scan.live_count,
+        applied: true,
+    })
+}
+
+#[derive(Debug, Default)]
+struct GcScan {
+    orphans: BTreeMap<String, u64>,
+    orphan_bytes: u64,
+    live_count: usize,
+}
+
+impl GcScan {
+    fn orphan_keys(&self) -> BTreeSet<String> {
+        self.orphans.keys().cloned().collect()
+    }
+
+    fn into_report(self, applied: bool) -> GcReport {
+        GcReport {
+            orphan_keys: self.orphans.keys().cloned().collect(),
+            orphan_bytes: self.orphan_bytes,
+            live_count: self.live_count,
+            applied,
+        }
+    }
+}
+
+async fn scan_gc(ns: &Namespace) -> Result<GcScan> {
     let snapshot = ns.load_manifest_snapshot().await?;
     let manifest = &snapshot.manifest;
     let (commit, pending_staging_keys) = ns.wal_gc_state().await?;
@@ -849,6 +961,7 @@ pub async fn gc(ns: &Namespace, apply: bool) -> Result<GcReport> {
     }
     live.insert(manifest_body_key_for_pointer(ns.name(), &snapshot.pointer));
     live.extend(manifest.referenced_index_keys());
+    live.extend(crate::reader_lease::active_reader_references(ns.store(), ns.name()).await?);
     live.extend(foreign_references_into_namespace(ns).await?);
     // The unindexed WAL overlay the read path still merges: `(indexed_cursor,
     // commit]`. WAL at or before `indexed_cursor` is already in the SSTs.
@@ -885,7 +998,7 @@ pub async fn gc(ns: &Namespace, apply: bool) -> Result<GcReport> {
         .store()
         .list(&format!("namespaces/{}/", ns.name()))
         .await?;
-    let mut orphan_keys = Vec::new();
+    let mut orphans = BTreeMap::new();
     let mut orphan_bytes = 0u64;
     let mut live_count = 0usize;
     let idempotency_prefix = idempotency_prefix(ns.name());
@@ -893,22 +1006,17 @@ pub async fn gc(ns: &Namespace, apply: bool) -> Result<GcReport> {
         if live.contains(&object.key) || object.key.starts_with(&idempotency_prefix) {
             live_count += 1;
         } else {
-            orphan_bytes += object.size;
-            orphan_keys.push(object.key.clone());
+            orphan_bytes = orphan_bytes.checked_add(object.size).ok_or_else(|| {
+                Error::Corrupt("GC orphan byte count overflowed during scan".into())
+            })?;
+            orphans.insert(object.key.clone(), object.size);
         }
     }
 
-    if apply {
-        for key in &orphan_keys {
-            ns.store().delete(key).await?;
-        }
-    }
-
-    Ok(GcReport {
-        orphan_keys,
+    Ok(GcScan {
+        orphans,
         orphan_bytes,
         live_count,
-        applied: apply,
     })
 }
 
@@ -953,6 +1061,15 @@ async fn foreign_references_into_namespace(ns: &Namespace) -> Result<BTreeSet<St
 /// Execute one bounded vector maintenance pass from the manifest's planned
 /// split/merge tasks. Returns `true` if it published at least one vector delta.
 pub async fn maintain_vectors(ns: &Namespace) -> Result<bool> {
+    maintain_vectors_with_fence(ns, &NoopManifestPublishFence).await
+}
+
+/// Like [`maintain_vectors`], but verifies `fence` immediately before publishing
+/// the new manifest pointer.
+pub async fn maintain_vectors_with_fence(
+    ns: &Namespace,
+    fence: &dyn ManifestPublishFence,
+) -> Result<bool> {
     let snapshot = ns.load_manifest_snapshot().await?;
     let mut manifest = snapshot.manifest;
     let commit = ns.commit_cursor().await?;
@@ -1127,6 +1244,7 @@ pub async fn maintain_vectors(ns: &Namespace) -> Result<bool> {
             .map(vector_family_bytes)
             .sum::<u64>();
 
+    fence.verify().await?;
     ns.publish_manifest(snapshot.pointer_version, &manifest)
         .await?;
     Ok(true)

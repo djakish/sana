@@ -4,12 +4,14 @@
 
 use std::sync::Arc;
 
+use sana::index_queue::QueueClient;
 use sana::metrics::Metrics;
 use sana::namespace::Namespace;
 use sana::object_store::{
     CachingObjectStore, FsObjectStore, MeteredObjectStore, ObjectStore, S3Config, S3ObjectStore,
 };
 use sana::query::{MultiQuery, Query, RecallRequest};
+use sana::queue_broker::DiscoveredQueueClient;
 use sana::value::{Document, Id, Value};
 
 type CliResult = Result<(), Box<dyn std::error::Error>>;
@@ -19,6 +21,7 @@ const INDEX_RETRY_MS: u64 = 1_000;
 const INDEX_IDLE_MS: u64 = 100;
 const INDEX_RECONCILE_MS: u64 = 30_000;
 const MAINTENANCE_INTERVAL_MS: u64 = 60_000;
+const MAINTENANCE_LEASE_MS: u64 = 180_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ServeRole {
@@ -47,6 +50,7 @@ async fn main() -> CliResult {
         Some("maintain") => maintain(&args).await,
         Some("reconcile-indexing") => reconcile_indexing(&args).await,
         Some("work-indexing") => work_indexing(&args).await,
+        Some("queue-broker") => queue_broker(&args).await,
         Some("branch") => branch(&args).await,
         Some("copy") => copy(&args).await,
         Some("export") => export(&args).await,
@@ -81,9 +85,10 @@ fn usage() {
     eprintln!("  sana compact <dir> <ns>   # merge SSTs, drop tombstones");
     eprintln!("  sana gc      <dir> <ns> [--apply]   # report (or delete) orphaned objects");
     eprintln!("  sana maintain-vectors <dir> <ns>   # run one vector maintenance pass");
-    eprintln!("  sana maintain <dir> [--loop]   # run all-namespace maintenance");
+    eprintln!("  sana maintain <dir> [owner-id] [--loop]   # run all-namespace maintenance");
     eprintln!("  sana reconcile-indexing <dir>   # restore missed indexing notifications");
     eprintln!("  sana work-indexing <dir> [worker-id] [--loop]   # run indexing worker");
+    eprintln!("  sana queue-broker <dir> [listen-address] [advertised-url] [owner-id]");
     eprintln!("  sana branch <dir> <source-ns> <child-ns>   # zero-copy indexed snapshot");
     eprintln!("  sana copy <source-dir> <source-ns> <target-dir> <target-ns>");
     eprintln!("  sana export <source-dir> <ns> <target-dir> <prefix>");
@@ -96,6 +101,7 @@ fn usage() {
     eprintln!();
     eprintln!("  <dir> may be a directory or s3://bucket[/prefix]; S3 reads");
     eprintln!("  SANA_S3_ENDPOINT, AWS_REGION, and AWS credentials from the env.");
+    eprintln!("  Separate API/indexer roles discover the broker through queue.json.");
 }
 
 /// Open the object-store backing for a CLI location: a filesystem directory,
@@ -108,6 +114,12 @@ fn store(location: &str) -> Result<Arc<dyn ObjectStore>, Box<dyn std::error::Err
     } else {
         Ok(Arc::new(FsObjectStore::new(location)))
     }
+}
+
+fn queue_client(
+    store: Arc<dyn ObjectStore>,
+) -> Result<Arc<dyn QueueClient>, Box<dyn std::error::Error>> {
+    Ok(Arc::new(DiscoveredQueueClient::new(store)?))
 }
 
 /// Parse an id token as u64 if possible, else treat it as a string id.
@@ -312,17 +324,23 @@ async fn maintain(args: &[String]) -> CliResult {
         .first()
         .copied()
         .ok_or_else(|| "missing argument #2".to_string())?;
+    let owner_id = values
+        .get(1)
+        .map(|value| (*value).to_string())
+        .unwrap_or_else(|| sana::maintenance::default_maintenance_owner_id("maintenance"));
     let store = store(dir)?;
     let policy = sana::maintenance::MaintenancePolicy::default();
     let mut state = sana::maintenance::MaintenanceState::default();
     if has_flag(args, "--loop") {
-        println!("running maintenance loop every {MAINTENANCE_INTERVAL_MS} ms; Ctrl-C to stop");
+        println!(
+            "running maintenance loop {owner_id} every {MAINTENANCE_INTERVAL_MS} ms; Ctrl-C to stop"
+        );
         let mut shutdown = shutdown_watcher();
         loop {
             if *shutdown.borrow() {
                 return Ok(());
             }
-            run_maintenance_pass(store.clone(), &policy, &mut state).await?;
+            run_maintenance_pass_leased(store.clone(), &policy, &mut state, &owner_id).await?;
             if sleep_or_shutdown(
                 &mut shutdown,
                 std::time::Duration::from_millis(MAINTENANCE_INTERVAL_MS),
@@ -343,6 +361,28 @@ async fn run_maintenance_pass(
     state: &mut sana::maintenance::MaintenanceState,
 ) -> CliResult {
     let report = sana::maintenance::run_once(store, policy, state).await?;
+    print_maintenance_report(report);
+    Ok(())
+}
+
+async fn run_maintenance_pass_leased(
+    store: Arc<dyn ObjectStore>,
+    policy: &sana::maintenance::MaintenancePolicy,
+    state: &mut sana::maintenance::MaintenanceState,
+    owner_id: &str,
+) -> CliResult {
+    let report =
+        sana::maintenance::run_once_leased(store, policy, state, owner_id, MAINTENANCE_LEASE_MS)
+            .await?;
+    print_maintenance_report(report);
+    Ok(())
+}
+
+fn print_maintenance_report(report: sana::maintenance::MaintenanceReport) {
+    if report.skipped_leader_lease {
+        println!("maintenance skipped: another live leader owns the lease");
+        return;
+    }
     println!(
         "maintenance scanned {} namespace(s): compacted {}, vector-maintained {}, gc-deleted {}, gc-pending {}, errors {}",
         report.scanned_namespaces,
@@ -364,7 +404,6 @@ async fn run_maintenance_pass(
     for error in &report.errors {
         eprintln!("  {error}");
     }
-    Ok(())
 }
 
 async fn work_indexing(args: &[String]) -> CliResult {
@@ -378,16 +417,27 @@ async fn work_indexing(args: &[String]) -> CliResult {
         .map(|value| (*value).to_string())
         .unwrap_or_else(|| format!("cli-indexer-{}", std::process::id()));
     let store = store(dir)?;
+    let queue = queue_client(store.clone())?;
     if has_flag(args, "--loop") {
-        run_indexing_loop(store, worker_id).await
+        run_indexing_loop(store, queue, worker_id).await
     } else {
-        run_indexing_once(store, &worker_id).await
+        run_indexing_once(store, queue, &worker_id).await
     }
 }
 
-async fn run_indexing_once(store: Arc<dyn ObjectStore>, worker_id: &str) -> CliResult {
-    match sana::index_queue::run_worker_once(store, worker_id, INDEX_LEASE_MS, INDEX_RETRY_MS)
-        .await?
+async fn run_indexing_once(
+    store: Arc<dyn ObjectStore>,
+    queue: Arc<dyn QueueClient>,
+    worker_id: &str,
+) -> CliResult {
+    match sana::index_queue::run_worker_once_with_client(
+        store,
+        queue,
+        worker_id,
+        INDEX_LEASE_MS,
+        INDEX_RETRY_MS,
+    )
+    .await?
     {
         Some(run) => println!(
             "completed job {} for {} through WAL seq {} ({})",
@@ -405,7 +455,11 @@ async fn run_indexing_once(store: Arc<dyn ObjectStore>, worker_id: &str) -> CliR
     Ok(())
 }
 
-async fn run_indexing_loop(store: Arc<dyn ObjectStore>, worker_id: String) -> CliResult {
+async fn run_indexing_loop(
+    store: Arc<dyn ObjectStore>,
+    queue: Arc<dyn QueueClient>,
+    worker_id: String,
+) -> CliResult {
     let mut next_reconcile = tokio::time::Instant::now();
     let shutdown = shutdown_watcher();
     println!("running indexing worker {worker_id}; Ctrl-C to stop");
@@ -413,17 +467,25 @@ async fn run_indexing_loop(store: Arc<dyn ObjectStore>, worker_id: String) -> Cl
         if *shutdown.borrow() {
             return Ok(());
         }
-        run_indexing_tick(store.clone(), &worker_id, &mut next_reconcile).await;
+        run_indexing_tick(
+            store.clone(),
+            queue.clone(),
+            &worker_id,
+            &mut next_reconcile,
+        )
+        .await;
     }
 }
 
 async fn run_indexing_tick(
     store: Arc<dyn ObjectStore>,
+    queue: Arc<dyn QueueClient>,
     worker_id: &str,
     next_reconcile: &mut tokio::time::Instant,
 ) {
     if tokio::time::Instant::now() >= *next_reconcile {
-        match sana::index_queue::reconcile_unindexed(store.clone()).await {
+        match sana::index_queue::reconcile_unindexed_with_client(store.clone(), queue.clone()).await
+        {
             Ok(report) => println!(
                 "reconciled {} namespace(s): {} lagging, {} added, {} coalesced",
                 report.scanned_namespaces,
@@ -437,7 +499,14 @@ async fn run_indexing_tick(
             tokio::time::Instant::now() + std::time::Duration::from_millis(INDEX_RECONCILE_MS);
     }
 
-    match sana::index_queue::run_worker_once(store, worker_id, INDEX_LEASE_MS, INDEX_RETRY_MS).await
+    match sana::index_queue::run_worker_once_with_client(
+        store,
+        queue,
+        worker_id,
+        INDEX_LEASE_MS,
+        INDEX_RETRY_MS,
+    )
+    .await
     {
         Ok(Some(run)) => println!(
             "completed job {} for {} through WAL seq {} ({})",
@@ -460,7 +529,9 @@ async fn run_indexing_tick(
 
 async fn reconcile_indexing(args: &[String]) -> CliResult {
     let dir = arg(args, 2)?;
-    let report = sana::index_queue::reconcile_unindexed(store(dir)?).await?;
+    let store = store(dir)?;
+    let queue = queue_client(store.clone())?;
+    let report = sana::index_queue::reconcile_unindexed_with_client(store, queue).await?;
     println!(
         "scanned {} namespace(s): {} lagging, {} notification(s) added, {} coalesced",
         report.scanned_namespaces,
@@ -468,6 +539,39 @@ async fn reconcile_indexing(args: &[String]) -> CliResult {
         report.notifications_added,
         report.notifications_coalesced
     );
+    Ok(())
+}
+
+async fn queue_broker(args: &[String]) -> CliResult {
+    let dir = arg(args, 2)?;
+    let listen_address = args
+        .get(3)
+        .map(String::as_str)
+        .unwrap_or("127.0.0.1:8090")
+        .parse()?;
+    let advertised_address = args
+        .get(4)
+        .cloned()
+        .unwrap_or_else(|| format!("http://{listen_address}"));
+    let owner_id = args
+        .get(5)
+        .cloned()
+        .unwrap_or_else(|| format!("broker-{}", std::process::id()));
+    println!(
+        "serving Sana queue broker {owner_id} on {listen_address}, advertising {advertised_address}"
+    );
+    let metrics = Metrics::shared();
+    let backing = store(dir)?;
+    let metered: Arc<dyn ObjectStore> = Arc::new(MeteredObjectStore::new(backing, metrics.clone()));
+    sana::queue_broker::serve_with_metrics_and_shutdown(
+        metered,
+        listen_address,
+        &advertised_address,
+        &owner_id,
+        metrics,
+        shutdown_signal(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -601,7 +705,15 @@ async fn run_serve_role(args: &[String], dir: &str, role: ServeRole, command: &s
         }
         ServeRole::Api => {
             println!("serving Sana API on http://{address} with {cache_bytes} cache bytes");
-            sana::api::serve_api_with_shutdown(cached, address, metrics, shutdown_signal()).await?;
+            let queue = queue_client(cached.clone())?;
+            sana::api::serve_api_with_queue_and_shutdown(
+                cached,
+                queue,
+                address,
+                metrics,
+                shutdown_signal(),
+            )
+            .await?;
         }
     }
     Ok(())

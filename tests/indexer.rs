@@ -1,8 +1,11 @@
 #![allow(clippy::float_cmp, clippy::indexing_slicing, clippy::unwrap_used)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use sana::error::Error;
 use sana::indexer;
@@ -11,9 +14,12 @@ use sana::manifest::{
     VectorMaintenanceTask, VectorMaintenanceThresholds,
 };
 use sana::namespace::Namespace;
-use sana::object_store::{FsObjectStore, ObjectStore};
+use sana::object_store::{
+    FsObjectStore, GetResult, ObjectMeta, ObjectStore, ObjectVersion, version_of,
+};
 use sana::query::{ApproxVectorQuery, FilterExpr, Query};
 use sana::rabitq::RabitqIndex;
+use sana::reader_lease::{ReaderLeaseController, ReaderLeaseSnapshot};
 use sana::schema::DistanceMetric;
 use sana::value::{Document, Id, Value, VectorValue};
 use sana::vector::{VectorIndex, VectorVersionMap};
@@ -53,6 +59,146 @@ fn indexed_bytes(manifest: &sana::manifest::NamespaceManifest) -> u64 {
                         .sum::<u64>()
             })
             .sum::<u64>()
+}
+
+struct RejectingPublishFence;
+
+#[async_trait]
+impl indexer::ManifestPublishFence for RejectingPublishFence {
+    async fn verify(&self) -> sana::error::Result<()> {
+        Err(Error::InvalidMaintenanceLease(
+            "stale test publish fence".into(),
+        ))
+    }
+}
+
+struct PromoteOrphanBeforeFinalGcScanStore {
+    inner: Arc<dyn ObjectStore>,
+    namespace: String,
+    namespace_gc_lists: AtomicUsize,
+    promotion: tokio::sync::Mutex<Option<sana::manifest::SstMeta>>,
+}
+
+impl PromoteOrphanBeforeFinalGcScanStore {
+    fn new(
+        inner: Arc<dyn ObjectStore>,
+        namespace: &str,
+        promotion: sana::manifest::SstMeta,
+    ) -> Self {
+        Self {
+            inner,
+            namespace: namespace.to_string(),
+            namespace_gc_lists: AtomicUsize::new(0),
+            promotion: tokio::sync::Mutex::new(Some(promotion)),
+        }
+    }
+
+    fn namespace_prefix(&self) -> String {
+        format!("namespaces/{}/", self.namespace)
+    }
+
+    fn pointer_key(&self) -> String {
+        format!("namespaces/{}/manifest/current", self.namespace)
+    }
+
+    async fn promote_if_final_gc_scan(&self, key: &str) -> sana::error::Result<()> {
+        if key != self.pointer_key() || self.namespace_gc_lists.load(Ordering::SeqCst) == 0 {
+            return Ok(());
+        }
+
+        let Some(meta) = self.promotion.lock().await.take() else {
+            return Ok(());
+        };
+        let pointer_key = self.pointer_key();
+        let pointer_get = self.inner.get(&pointer_key).await?;
+        let pointer = ManifestPointer::decode(&pointer_get.bytes)?;
+        let body_key = pointer.body_key.clone().unwrap_or_else(|| {
+            format!(
+                "namespaces/{}/manifest/g/{}.json",
+                self.namespace, pointer.generation
+            )
+        });
+        let body = self.inner.get(&body_key).await?;
+        let mut manifest = sana::manifest::NamespaceManifest::decode(&body.bytes)?;
+        manifest.generation = manifest
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| Error::Corrupt("test manifest generation overflow".into()))?;
+        manifest.updated_at_ms = manifest.updated_at_ms.saturating_add(1);
+        if !manifest.doc_ssts.iter().any(|sst| sst.key == meta.key) {
+            manifest.doc_ssts.push(meta);
+        }
+
+        let encoded = manifest.encode()?;
+        let body_version = version_of(&encoded);
+        let next_body_key = format!(
+            "namespaces/{}/manifest/g/{}-{}.json",
+            self.namespace, manifest.generation, body_version.0
+        );
+        match self
+            .inner
+            .put_if_absent(&next_body_key, Bytes::from(encoded.clone()))
+            .await
+        {
+            Ok(_) => {}
+            Err(Error::AlreadyExists(_)) => {
+                let got = self.inner.get(&next_body_key).await?;
+                assert_eq!(got.bytes.as_ref(), encoded.as_slice());
+            }
+            Err(error) => return Err(error),
+        }
+        self.inner
+            .compare_and_set(
+                &pointer_key,
+                pointer_get.version,
+                Bytes::from(
+                    ManifestPointer::for_body(manifest.generation, next_body_key).encode()?,
+                ),
+            )
+            .await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ObjectStore for PromoteOrphanBeforeFinalGcScanStore {
+    async fn get(&self, key: &str) -> sana::error::Result<GetResult> {
+        self.promote_if_final_gc_scan(key).await?;
+        self.inner.get(key).await
+    }
+
+    async fn get_range(&self, key: &str, range: Range<u64>) -> sana::error::Result<Bytes> {
+        self.inner.get_range(key, range).await
+    }
+
+    async fn put(&self, key: &str, bytes: Bytes) -> sana::error::Result<ObjectVersion> {
+        self.inner.put(key, bytes).await
+    }
+
+    async fn put_if_absent(&self, key: &str, bytes: Bytes) -> sana::error::Result<ObjectVersion> {
+        self.inner.put_if_absent(key, bytes).await
+    }
+
+    async fn compare_and_set(
+        &self,
+        key: &str,
+        expected: ObjectVersion,
+        bytes: Bytes,
+    ) -> sana::error::Result<ObjectVersion> {
+        self.inner.compare_and_set(key, expected, bytes).await
+    }
+
+    async fn list(&self, prefix: &str) -> sana::error::Result<Vec<ObjectMeta>> {
+        let objects = self.inner.list(prefix).await?;
+        if prefix == self.namespace_prefix() {
+            self.namespace_gc_lists.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(objects)
+    }
+
+    async fn delete(&self, key: &str) -> sana::error::Result<()> {
+        self.inner.delete(key).await
+    }
 }
 
 fn doc_with_vector(id: u64, title: &str, score: i64, vector: [f32; 2]) -> Document {
@@ -631,6 +777,32 @@ async fn compaction_collapses_ssts_and_drops_tombstones() {
 }
 
 #[tokio::test]
+async fn compaction_fence_rejects_before_manifest_publish() {
+    let dir = tempfile::tempdir().unwrap();
+    let ns = Namespace::create(store(&dir), "docs").await.unwrap();
+
+    ns.upsert(doc_with(1, "v1", 1)).await.unwrap();
+    indexer::flush(&ns).await.unwrap();
+    ns.upsert(doc_with(1, "v2", 2)).await.unwrap();
+    indexer::flush(&ns).await.unwrap();
+
+    let before = ns.load_manifest().await.unwrap();
+    assert_eq!(before.doc_ssts.len(), 2);
+    let error = indexer::compact_with_fence(&ns, &RejectingPublishFence)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::InvalidMaintenanceLease(_)));
+
+    let after = ns.load_manifest().await.unwrap();
+    assert_eq!(after.generation, before.generation);
+    assert_eq!(after.doc_ssts.len(), 2);
+    assert_eq!(
+        ns.lookup(&Id::U64(1)).await.unwrap(),
+        Some(doc_with(1, "v2", 2))
+    );
+}
+
+#[tokio::test]
 async fn flush_and_compact_update_stats() {
     let dir = tempfile::tempdir().unwrap();
     let ns = Namespace::create(store(&dir), "docs").await.unwrap();
@@ -936,6 +1108,159 @@ async fn gc_reclaims_orphans_and_preserves_live_reads() {
         again.orphan_keys.is_empty(),
         "second GC should find no orphans, found: {:?}",
         again.orphan_keys
+    );
+}
+
+#[tokio::test]
+async fn gc_apply_rechecks_candidates_before_deleting() {
+    let dir = tempfile::tempdir().unwrap();
+    let object_store = store(&dir);
+    let ns = Namespace::create(object_store.clone(), "docs")
+        .await
+        .unwrap();
+
+    ns.upsert(doc_with(1, "old", 1)).await.unwrap();
+    assert!(indexer::flush(&ns).await.unwrap());
+    let old_run = ns.load_manifest().await.unwrap().doc_ssts[0].clone();
+
+    ns.upsert(doc_with(2, "new", 2)).await.unwrap();
+    assert!(indexer::flush(&ns).await.unwrap());
+    assert!(indexer::compact(&ns).await.unwrap());
+
+    let dry_run = indexer::gc(&ns, false).await.unwrap();
+    assert!(
+        dry_run.orphan_keys.contains(&old_run.key),
+        "the first flushed run should be an orphan before the race"
+    );
+
+    let racing_store: Arc<dyn ObjectStore> = Arc::new(PromoteOrphanBeforeFinalGcScanStore::new(
+        object_store.clone(),
+        "docs",
+        old_run.clone(),
+    ));
+    let racing_ns = Namespace::open(racing_store, "docs").await.unwrap();
+
+    let applied = indexer::gc(&racing_ns, true).await.unwrap();
+    assert!(
+        !applied.orphan_keys.contains(&old_run.key),
+        "apply-mode GC must skip a candidate that became live before deletion"
+    );
+    object_store
+        .get(&old_run.key)
+        .await
+        .expect("promoted run must survive final GC recheck");
+
+    let manifest = ns.load_manifest().await.unwrap();
+    assert!(
+        manifest.doc_ssts.iter().any(|sst| sst.key == old_run.key),
+        "the concurrent manifest publish made the old run live"
+    );
+    assert_eq!(
+        ns.lookup(&Id::U64(1)).await.unwrap(),
+        Some(doc_with(1, "old", 1))
+    );
+}
+
+#[tokio::test]
+async fn gc_delete_candidates_fence_rejects_before_delete() {
+    let dir = tempfile::tempdir().unwrap();
+    let object_store = store(&dir);
+    let ns = Namespace::create(object_store.clone(), "docs")
+        .await
+        .unwrap();
+
+    ns.upsert(doc_with(1, "old", 1)).await.unwrap();
+    assert!(indexer::flush(&ns).await.unwrap());
+    ns.upsert(doc_with(2, "new", 2)).await.unwrap();
+    assert!(indexer::flush(&ns).await.unwrap());
+    assert!(indexer::compact(&ns).await.unwrap());
+
+    let dry_run = indexer::gc(&ns, false).await.unwrap();
+    assert!(!dry_run.orphan_keys.is_empty());
+    let candidates: BTreeSet<String> = dry_run.orphan_keys.iter().cloned().collect();
+
+    let error =
+        indexer::delete_gc_candidates_with_fence(&ns, candidates, Some(&RejectingPublishFence))
+            .await
+            .unwrap_err();
+    assert!(matches!(error, Error::InvalidMaintenanceLease(_)));
+
+    for key in &dry_run.orphan_keys {
+        object_store
+            .get(key)
+            .await
+            .expect("rejecting final delete fence must preserve every candidate");
+    }
+}
+
+#[tokio::test]
+async fn gc_preserves_active_reader_snapshot_until_release() {
+    let dir = tempfile::tempdir().unwrap();
+    let object_store = store(&dir);
+    let ns = Namespace::create(object_store.clone(), "docs")
+        .await
+        .unwrap();
+
+    ns.upsert(doc_with(1, "old", 1)).await.unwrap();
+    assert!(indexer::flush(&ns).await.unwrap());
+    let old_manifest = ns.load_manifest().await.unwrap();
+    let old_run = old_manifest.doc_ssts[0].clone();
+    let old_commit = ns.commit_cursor().await.unwrap();
+    let pointer = ManifestPointer::decode(
+        &object_store
+            .get("namespaces/docs/manifest/current")
+            .await
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
+    let old_body_key = pointer.body_key.clone().unwrap();
+
+    let reader = ReaderLeaseController::new(object_store.clone(), "reader-a", 60_000).unwrap();
+    let guard = reader
+        .acquire_snapshot(ReaderLeaseSnapshot {
+            namespace: "docs".into(),
+            generation: old_manifest.generation,
+            body_key: old_body_key.clone(),
+            indexed_cursor: old_manifest.indexed_cursor,
+            commit_cursor: old_commit,
+        })
+        .await
+        .unwrap();
+
+    ns.upsert(doc_with(2, "new", 2)).await.unwrap();
+    assert!(indexer::flush(&ns).await.unwrap());
+    assert!(indexer::compact(&ns).await.unwrap());
+    let dry_run = indexer::gc(&ns, false).await.unwrap();
+    assert!(
+        !dry_run.orphan_keys.contains(&old_run.key),
+        "active reader snapshot must keep its referenced SST live"
+    );
+    assert!(
+        !dry_run.orphan_keys.contains(&old_body_key),
+        "active reader snapshot must keep its manifest body live"
+    );
+
+    let applied = indexer::gc(&ns, true).await.unwrap();
+    assert!(!applied.orphan_keys.contains(&old_run.key));
+    object_store
+        .get(&old_run.key)
+        .await
+        .expect("active reader keeps old SST reachable");
+
+    guard.release().await.unwrap();
+
+    let reclaimed = indexer::gc(&ns, true).await.unwrap();
+    assert!(
+        reclaimed.orphan_keys.contains(&old_run.key),
+        "released reader lets GC reclaim the old SST"
+    );
+    assert!(
+        matches!(
+            object_store.get(&old_run.key).await,
+            Err(Error::NotFound(_))
+        ),
+        "old SST should be deleted after reader release"
     );
 }
 

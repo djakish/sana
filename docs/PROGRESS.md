@@ -12,21 +12,19 @@ the next unchecked task under "Current milestone" / "Next up".
 
 ## Status snapshot
 
-- **Current stage:** Stage 13 (Automatic maintenance) — **done.** Stage 12's
-  `S3ObjectStore` speaks real S3 with server-enforced conditional writes
-  (verified live against MinIO), and `sana serve` now runs policy-driven
-  compaction and vector maintenance on its own. Automatic object deletion is
-  disabled by default until reader/publisher watermarks exist.
-- **Next up:** the engine is feature-complete for its educational goal; docs,
-  a library example, benchmark notes, and the project page ship with it.
-  Future work, should it continue: a turbopuffer wire-compatibility layer,
-  WAL epoch rotation, IAM-role S3 credentials, reader-watermark GC.
+- **Current stage:** post-Stage-13 production hardening. The engine remains
+  feature-complete for its educational goal; work now follows the prioritized
+  multi-pod gaps in `docs/TODO.md`.
+- **Next up:** per-namespace maintenance ownership and safe object reclamation:
+  publisher safety points, durable maintenance jobs, and durable GC candidates
+  before any online GC.
 - **Done:** Stage 0 (Skeleton), Stage 1 (Durable Documents), Stage 2 (SST/LSM),
   Stage 3 (Attributes & Exact Search), Stage 4 (ANN v0), Stage 5 (Native
   Filtering), Stage 6 (SPFresh local rebuild), Stage 7 (Full-text search),
   Stage 8 (RaBitQ & kernels), Stage 9 (Object-store operations), Stage 10
   (Durability hardening and write semantics).
-- **Tests:** `cargo test` green (230 tests); `cargo clippy --all-targets` clean.
+- **Tests:** `cargo test` and `cargo clippy --all-targets` should be green before
+  each push.
 - **Note:** post-Stage-2 and Stage-3–5 code-review fixes applied; remaining
   findings tracked under "Stage 2 — code review follow-ups" and "Stages 3–5 —
   code review follow-ups". Recently fixed limitations: Stage 2 ranged
@@ -44,8 +42,13 @@ the next unchecked task under "Current milestone" / "Next up".
   4-bit stochastic query packing reduces RaBitQ estimation to AND+popcount.
   Stage 9 now has a durable global indexing queue with fenced leases,
   heartbeats, retries, at-least-once workers, brokered group commit, and
-  WAL/manifest reconciliation for missed advisory notifications. Query nodes
-  can wrap any backend in a byte-bounded immutable-object LRU and warm one
+  WAL/manifest reconciliation for missed advisory notifications. Queue
+  mutations now share a `QueueClient` boundary, and all-in-one serve mode routes
+  HTTP writers, reconciliation, and its worker through one in-process broker.
+  Multi-pod roles use a standalone broker whose address and owner generation
+  live in the queue JSON; stale overlapping brokers are fenced by CAS and
+  clients rediscover replacements from object storage. Query nodes can wrap any
+  backend in a byte-bounded immutable-object LRU and warm one
   manifest generation under an explicit byte/concurrency budget. Fully indexed
   generations support zero-copy branches, independent cross-store copies, and
   deterministic catalog-last exports. Namespace pinning now uses durable,
@@ -72,8 +75,20 @@ the next unchecked task under "Current milestone" / "Next up".
   fixed-bucket latency histograms now time backend object-store round trips and
   the write/query paths at their dominant phase seams (write plan/commit/notify,
   query plan/candidates/overlay/rank/materialize), attached per-request via
-  `Namespace::with_metrics`.
-- **Last updated:** 2026-06-13.
+  `Namespace::with_metrics`. Store-global indexing queue metrics now cover live,
+  available, and claimed jobs, oldest-job age, queue CAS
+  attempts/successes/retries, broker group-commit batch sizes, and claim wait;
+  the standalone queue broker exposes its own `/metrics` endpoint. Automatic
+  maintenance loops now acquire a store-global object-store CAS lease before
+  scanning namespaces. Background flush, compaction, and vector-maintenance
+  publishers re-check their queue claim or maintenance lease immediately before
+  manifest publication; per-namespace maintenance jobs and manual publisher
+  fencing remain open. Apply-mode GC and opt-in maintenance GC now re-scan
+  namespace liveness immediately before deleting candidate objects. API
+  query/recall snapshots now publish durable per-process reader leases so GC
+  keeps their manifest bodies, referenced index objects, and WAL overlay ranges
+  live; publisher safety points and durable GC candidate state remain open.
+- **Last updated:** 2026-06-26.
 
 ---
 
@@ -107,7 +122,8 @@ the next unchecked task under "Current milestone" / "Next up".
       and a service-facing HTTP/metadata surface.
 - [x] **Stage 11 — Observability.** In-process metrics registry, object-store
       traffic metering and latency, phase latency histograms, cache stats,
-      per-namespace index-lag gauges, ANN/FTS counters, Prometheus `/metrics`.
+      per-namespace index-lag gauges, store-global queue metrics, ANN/FTS
+      counters, Prometheus `/metrics`.
 - [x] **Stage 12 — S3 backend.** `S3ObjectStore` over presigned SigV4 requests
       with native conditional writes (`If-None-Match: *` / `If-Match: etag`),
       env-gated MinIO conformance tests, and `s3://bucket[/prefix]` locations
@@ -1215,6 +1231,9 @@ Review-driven polish after the engine was feature-complete.
   `IndexQueueBroker` is an in-process group-commit helper with no client/server
   transport yet. `docs/kubernetes-roles.yaml` shows separate API, indexer, and
   maintenance Deployments.
+  - **Superseded by D79:** the standalone `sana queue-broker` role and
+    object-store-discovered HTTP client now exist; the remaining queue work is
+    observability, not process separation.
 - **D77 — Kubernetes lifecycle uses readiness as the traffic gate.** Following
   Kubernetes probe guidance, `/livez` (and legacy `/healthz`) stays
   process-local and does not fail just because S3 is unavailable. `/readyz`
@@ -1226,6 +1245,90 @@ Review-driven polish after the engine was feature-complete.
   work, so shutdown stops the next claim/pass without cancelling the current
   job or maintenance scan. The Kubernetes example sets termination grace periods
   from the five-second readiness delay plus a 30-second worker-drain budget.
+- **D78 — Queue transport is separated from queue state.** `QueueClient` is the
+  object-safe mutation boundary for enqueue, claim, heartbeat, completion,
+  failure, and reconciliation. Direct `IndexQueue` CAS remains the library and
+  recovery default; `IndexQueueBroker` implements the same contract with durable
+  group commit. `sana serve --role all` injects one broker into HTTP namespace
+  handles and its indexing worker, so those operations no longer contend as
+  independent queue writers. Reconciliation accepts the same client and keeps
+  enqueue requests concurrent so a broker can batch them.
+- **D79 — Broker discovery and fencing live in `queue.json`.** Following the
+  checked-in turbopuffer queue article, `sana queue-broker` registers its
+  advertised HTTP address, owner id, and monotonically increasing generation in
+  the same CAS-updated queue object. API writers, reconciliation, and indexer
+  workers discover that registration directly from object storage. Every
+  broker batch verifies the exact registration before mutation; a replacement
+  therefore fences an overlapping old broker, whose client response triggers
+  rediscovery. Successful responses are sent only after durable group commit.
+  Transport timeouts remain ambiguous and are not blindly replayed. A bounded
+  broker group-commit timeout stops the broker loop and fails `/livez`;
+  Kubernetes supplies the replacement process. This is the one implementation
+  detail the article leaves to deployment supervision.
+- **D80 — Queue observability is measured at the queue owner.** The remaining
+  global-queue scaling question is whether the single JSON file is healthy, not
+  whether broad object-store traffic exists. `IndexQueue` now records queue
+  jobs, available jobs, claimed jobs, oldest-job age, queue CAS attempts,
+  successes, retries, and claim wait. `IndexQueueBroker` records group-commit
+  batches, total batched requests, and batch-size histograms. `sana
+  queue-broker` exposes the same Prometheus `/metrics` surface as the API and
+  wraps its backend in `MeteredObjectStore`, so multi-pod deployments can scrape
+  the queue owner directly. All-in-one `sana serve` reports these queue metrics
+  on the API `/metrics`; API-only pods using a remote broker do not claim to own
+  queue health. Queue sharding remains intentionally deferred until these
+  measurements prove the single-object design is insufficient.
+- **D81 — Automatic maintenance uses a store-global CAS lease.** turbopuffer's
+  published BYOC material exposes distinct query, index, and maintenance
+  capacity, but not an internal maintenance protocol. Sana stays object-store
+  native by adding `jobs/maintenance_leader.json`: pretty JSON with a format
+  version, revision, owner id, monotonic fencing token, and lease expiry.
+  `sana serve --role all` and `sana maintain --loop` must claim that lease
+  before scanning namespaces; a live owner blocks duplicates, an expired owner
+  can be replaced, and stale owners cannot heartbeat or release the replacement.
+  This is intentionally coarse. It prevents duplicated automatic maintenance
+  loops, but it does not yet create durable per-namespace compaction/vector jobs
+  or re-check a fencing token immediately before manifest publication.
+- **D82 — Background publishers verify ownership at manifest publication.**
+  The checked-in turbopuffer material says object storage is authoritative and
+  any indexing node can run compaction, but does not expose a private
+  per-namespace maintenance protocol. Sana therefore adds a local
+  `ManifestPublishFence` around manifest-pointer CAS publication: indexing
+  workers heartbeat their exact queue claim, and automatic maintenance
+  publishers heartbeat their store-global maintenance lease immediately before
+  making new immutable index objects reachable. A stale owner can still leave
+  orphaned immutable files, but it cannot publish them. Manual CLI publishers
+  and durable per-namespace maintenance jobs remain future work.
+- **D83 — Filesystem CAS locks are scoped per root.** `FsObjectStore` still
+  provides only single-process CAS, but the in-process write mutex now belongs
+  to the normalized backing root instead of the whole process. Handles opened on
+  the same directory still serialize `put_if_absent`, `compare_and_set`, `put`,
+  and `delete`, preserving D4's local correctness model. Independent stores no
+  longer block each other, which keeps parallel tests and multi-store examples
+  from coupling unrelated tempdirs through one global async mutex.
+- **D84 — GC deletion rechecks namespace liveness immediately before delete.**
+  Direct `sana gc --apply` and the legacy opt-in maintenance GC no longer delete
+  solely from the first orphan scan. They first collect candidate keys, then run
+  a fresh manifest/WAL/branch-reference liveness scan and delete only the
+  intersection that still proves orphaned. This closes the race where a
+  concurrent publisher makes a candidate reachable between scan and delete, but
+  it is not a production online-GC protocol: Sana still needs durable
+  reader/publisher watermarks before automatic deletion can be enabled.
+- **D85 — Query snapshots publish durable reader leases for GC.** The checked-in
+  turbopuffer material says object storage is the source of truth and compaction
+  eventually removes deleted data, but does not expose a private GC watermark
+  protocol. Sana stays object-store-native by writing one CAS-updated
+  `jobs/readers/{owner}.json` object per API process. Each active query/recall
+  snapshot records the namespace, manifest generation, exact manifest body key,
+  indexed WAL cursor, and committed WAL cursor. After publishing that lease, the
+  query re-reads `manifest/current` and retries if the pointer moved, so a
+  generation cannot become orphaned between snapshot capture and lease
+  publication. GC lists those reader objects only in the maintenance/tooling
+  path and treats unexpired snapshots as live by loading their manifest bodies
+  and preserving their referenced index objects plus WAL overlay range. Query
+  hot paths use exact-key CAS writes, never object listing. This closes the
+  old-reader deletion gap for API queries and recall; active publishers, durable
+  GC candidates, and read-dependent write paths still need follow-up before
+  automatic online GC can be enabled.
 
 ---
 

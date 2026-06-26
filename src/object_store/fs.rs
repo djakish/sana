@@ -3,10 +3,11 @@
 //! correct for single-process local development; true cross-process CAS will
 //! come from S3/GCS conditional writes. See `docs/PROGRESS.md` decision log.
 
+use std::collections::BTreeMap;
 use std::io::ErrorKind;
 use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock, Weak};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -17,16 +18,40 @@ use crate::error::{Error, Result};
 
 pub struct FsObjectStore {
     root: PathBuf,
+    write_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl FsObjectStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        let root = Self::normalize_root(root.into());
+        let write_lock = Self::lock_for_root(&root);
+        Self { root, write_lock }
     }
 
-    fn write_lock() -> &'static tokio::sync::Mutex<()> {
-        static WRITE_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-        WRITE_LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    fn normalize_root(root: PathBuf) -> PathBuf {
+        match std::fs::canonicalize(&root) {
+            Ok(root) => root,
+            Err(_) if root.is_absolute() => root,
+            Err(_) => std::env::current_dir()
+                .map(|cwd| cwd.join(&root))
+                .unwrap_or(root),
+        }
+    }
+
+    fn lock_for_root(root: &Path) -> Arc<tokio::sync::Mutex<()>> {
+        static WRITE_LOCKS: OnceLock<
+            std::sync::Mutex<BTreeMap<PathBuf, Weak<tokio::sync::Mutex<()>>>>,
+        > = OnceLock::new();
+        let locks = WRITE_LOCKS.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()));
+        let mut locks = locks
+            .lock()
+            .expect("filesystem object-store lock registry is not poisoned");
+        if let Some(lock) = locks.get(root).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(root.to_path_buf(), Arc::downgrade(&lock));
+        lock
     }
 
     /// Map an object key to a path under root, rejecting absolute paths and
@@ -115,14 +140,14 @@ impl ObjectStore for FsObjectStore {
 
     async fn put(&self, key: &str, bytes: Bytes) -> Result<ObjectVersion> {
         let path = self.resolve(key)?;
-        let _g = Self::write_lock().lock().await;
+        let _g = self.write_lock.lock().await;
         Self::write_atomic(&path, &bytes).await?;
         Ok(version_of(&bytes))
     }
 
     async fn put_if_absent(&self, key: &str, bytes: Bytes) -> Result<ObjectVersion> {
         let path = self.resolve(key)?;
-        let _g = Self::write_lock().lock().await;
+        let _g = self.write_lock.lock().await;
         if tokio::fs::try_exists(&path).await? {
             return Err(Error::AlreadyExists(key.to_string()));
         }
@@ -137,7 +162,7 @@ impl ObjectStore for FsObjectStore {
         bytes: Bytes,
     ) -> Result<ObjectVersion> {
         let path = self.resolve(key)?;
-        let _g = Self::write_lock().lock().await;
+        let _g = self.write_lock.lock().await;
         let actual = match tokio::fs::read(&path).await {
             Ok(data) => Some(version_of(&data)),
             Err(e) if e.kind() == ErrorKind::NotFound => None,
@@ -202,7 +227,7 @@ impl ObjectStore for FsObjectStore {
 
     async fn delete(&self, key: &str) -> Result<()> {
         let path = self.resolve(key)?;
-        let _g = Self::write_lock().lock().await;
+        let _g = self.write_lock.lock().await;
         match tokio::fs::remove_file(&path).await {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),

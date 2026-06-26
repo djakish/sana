@@ -30,17 +30,36 @@ coordination around maintenance and object deletion.
 
 ## P0: Safe object reclamation
 
-**Status:** automatic deletion is disabled by default. The legacy two-pass GC
-path remains unsafe for a multi-process deployment unless explicitly opted into
-for controlled single-process/quiescent use.
+**Status:** automatic deletion is disabled by default. API query and recall
+snapshots now publish durable per-process reader leases under `jobs/readers/`.
+After publishing the lease, the query re-reads `manifest/current` and retries if
+the pointer moved, so the old-reader snapshot is not orphaned between capture
+and lease publication.
+Apply-mode GC and the legacy opt-in two-pass maintenance GC now re-read
+namespace liveness immediately before deleting candidates and include those
+active reader snapshots. The path remains unsafe for automatic multi-process
+reclamation because Sana still has no publisher safety point or durable GC
+candidate set.
 
 Current code:
 
-- [`maintenance.rs`](../src/maintenance.rs#L65-L151) keeps legacy GC behind
+- [`maintenance.rs`](../src/maintenance.rs#L42-L503) keeps legacy GC behind
   `MaintenancePolicy::gc`; when enabled, it remembers orphan candidates only in
-  process memory and deletes an object after two scans.
-- [`indexer.rs`](../src/indexer.rs#L822-L913) computes liveness from only the
-  current manifest and explicitly assumes quiescence.
+  process memory and asks the indexer GC helper to re-check candidates before
+  deletion.
+- [`indexer.rs`](../src/indexer.rs#L854-L926) computes liveness from the
+  current manifest plus unexpired reader leases. Deletion re-runs that liveness
+  calculation immediately before deleting, but still explicitly assumes
+  quiescence from unpublished writers.
+- [`reader_lease.rs`](../src/reader_lease.rs#L81-L247) stores one CAS-updated
+  lease file per API process. Each active query/recall snapshot records the
+  manifest body key and WAL overlay range that GC must keep reachable.
+- [`query.rs`](../src/query.rs#L336-L370) publishes the reader lease before
+  object reads, then verifies that `manifest/current` still names the same
+  pointer before it uses the snapshot.
+- [`reader_lease.rs`](../src/reader_lease.rs#L365-L390) lists reader leases only
+  from the GC path, then loads active manifests and preserves their referenced
+  objects.
 - Publishers write immutable objects before publishing their manifest:
   [`flush`](../src/indexer.rs#L543-L615),
   [`compact`](../src/indexer.rs#L773-L809), and
@@ -70,13 +89,16 @@ still holds the old generation.
 ### Required work
 
 - [x] Disable automatic online GC by default. Keep dry-run reporting available.
-- [ ] Add a durable reader-generation lease or watermark per query pod.
+- [x] Add a durable reader-generation lease or watermark per query pod.
 - [ ] Include active publishers in the reclamation safety calculation.
 - [ ] Delete only below a computed safe generation, never only because two
       timer-based scans agreed.
 - [ ] Make GC candidates durable or safely reconstructable across leader failover.
-- [ ] Add tests that pause readers and publishers across multiple GC passes.
-- [ ] Add a final reference and safety-point check immediately before deletion.
+- [ ] Add tests that pause publishers across multiple GC passes.
+- [x] Add tests that keep an old reader snapshot active across GC and release it.
+- [x] Add a final current-manifest/WAL reference check immediately before
+      deletion.
+- [ ] Add a durable publisher safety-point check immediately before deletion.
 
 A conservative age threshold can be an interim safeguard, but
 [`ObjectMeta`](../src/object_store.rs#L56-L61) currently has no creation or
@@ -90,9 +112,9 @@ Related designs:
 
 ## P0: Separate process roles
 
-**Status:** API-only, indexing-worker, and maintenance roles now exist. The
-standalone networked `queue-broker` role is still tracked under the global queue
-broker P0.
+**Status:** API-only, queue-broker, indexing-worker, and maintenance roles now
+exist. The remaining role work is per-role tuning and ownership policy, not
+binary separation.
 
 [`api::serve_with_shutdown`](../src/api.rs#L278-L297) always joins the HTTP
 server, index worker, and maintenance loop. Scaling the API Deployment from one
@@ -117,7 +139,7 @@ maintenance loops.
   sana maintain --loop
   ```
 
-- [ ] Add the standalone `sana queue-broker` role tracked in the queue-broker
+- [x] Add the standalone `sana queue-broker` role tracked in the queue-broker
       section below.
 - [x] Keep `sana serve --role all` only as a convenient single-node/dev mode.
 - [ ] Give each role separate concurrency, cache, metrics, and shutdown config.
@@ -129,20 +151,29 @@ binaries: [turbopuffer architecture](https://turbopuffer.com/docs/architecture).
 
 ## P0: Coordinate all maintenance publishers
 
-**Status:** indexing jobs are leased, but compaction and vector maintenance are
-not distributed jobs.
+**Status:** automatic maintenance loops now acquire a store-global object-store
+CAS lease before scanning namespaces. Background flush, compaction, and vector
+maintenance publishers now re-check their queue claim or maintenance lease
+immediately before publishing `manifest/current`. Compaction and vector
+maintenance still do not have per-namespace durable jobs, and manual publisher
+entry points remain outside the lease.
 
-[`maintenance::run_once`](../src/maintenance.rs#L65-L151) independently scans
-the whole store in every process. Manifest CAS prevents two stale manifests
-from both becoming current, but it does not prevent duplicate expensive work,
-conflicting maintenance decisions, or unsafe interaction with GC.
+The unleased maintenance pass ([`maintenance::run_once`](../src/maintenance.rs))
+still scans the whole store when called directly; automatic loops now enter
+through [`run_once_leased`](../src/maintenance.rs). Manifest CAS prevents two
+stale manifests from both becoming current. The new publish fence additionally
+prevents stale background owners from making already-written immutable work
+reachable, but it does not prevent duplicate expensive work, conflicting
+maintenance decisions, or unsafe interaction with GC unless callers use the
+leader lease.
 
-The queue lease also does not cover manual `flush`, `compact`,
-`maintain-vectors`, or the automatic maintenance loop.
+The queue lease also does not cover manual `flush`, `compact`, or
+`maintain-vectors`. The maintenance leader lease only gates the automatic
+all-namespace maintenance loop.
 
 ### Required work
 
-- [ ] Initially run one maintenance leader using a Kubernetes
+- [x] Initially run one maintenance leader using a Kubernetes
       `coordination.k8s.io/Lease`, or an object-store CAS lease if Sana should
       remain independent of Kubernetes.
 - [ ] Add per-namespace ownership for compaction and vector maintenance.
@@ -150,8 +181,8 @@ The queue lease also does not cover manual `flush`, `compact`,
       generation, attempts, lease, and fencing token.
 - [ ] Make every publishing entry point use the same ownership mechanism,
       including CLI operations.
-- [ ] Re-check the source generation and ownership immediately before manifest
-      publication.
+- [x] Re-check the source generation and ownership immediately before manifest
+      publication for automatic queue and maintenance publishers.
 - [ ] Test leader death, lease expiry, duplicate execution, and stale workers.
 
 Kubernetes uses Lease objects for leader election in its own HA components:
@@ -159,26 +190,24 @@ Kubernetes uses Lease objects for leader election in its own HA components:
 
 ## P0: Finish the global queue broker
 
-**Status:** the queue data model is useful; the deployed broker topology is
-missing.
+**Status:** the published turbopuffer queue shape is implemented and measured:
+one JSON queue object, brokered group commit, durable acknowledgement, broker
+address discovery through that object, generation fencing for overlapping
+brokers, worker heartbeats, and queue-owner metrics for contention and queue
+age. Kubernetes supplies replacement broker processes when liveness fails.
 
 Sana already has:
 
 - One global CAS-updated queue object:
-  [`IndexQueue`](../src/index_queue.rs#L367-L531).
+  [`IndexQueue`](../src/index_queue.rs).
 - Leased claims, attempts, heartbeats, retries, and at-least-once work:
-  [`run_worker_once`](../src/index_queue.rs#L827-L884).
+  [`run_worker_once_with_client`](../src/index_queue.rs).
 - An in-process group-commit broker:
-  [`IndexQueueBroker`](../src/index_queue.rs#L583-L595).
-
-But normal operations bypass that broker:
-
-- Writes enqueue directly through `IndexQueue`:
-  [`namespace.rs`](../src/namespace.rs#L953-L959).
-- Workers claim and heartbeat directly through `IndexQueue`:
-  [`index_queue.rs`](../src/index_queue.rs#L827-L846).
-- Reconciliation creates a temporary broker local to one process:
-  [`index_queue.rs`](../src/index_queue.rs#L751-L759).
+  [`IndexQueueBroker`](../src/index_queue.rs).
+- A transport-neutral mutation boundary implemented by both:
+  [`QueueClient`](../src/index_queue.rs).
+- A standalone HTTP broker and object-store-discovered client:
+  [`queue_broker.rs`](../src/queue_broker.rs).
 
 ### Why direct CAS stops scaling
 
@@ -191,16 +220,19 @@ But normal operations bypass that broker:
 
 ### Required work
 
-- [ ] Introduce a `QueueClient` boundary used by all enqueue, claim, heartbeat,
+- [x] Introduce a `QueueClient` boundary used by all enqueue, claim, heartbeat,
       complete, fail, and reconcile operations.
-- [ ] Implement a standalone broker service that owns the group-commit loop.
-- [ ] Route all normal queue mutations through the broker.
-- [ ] Acknowledge a request only after its batched CAS is durable.
-- [ ] Add broker discovery and an epoch/lease for failover.
-- [ ] Permit brief overlapping brokers; CAS remains the final correctness guard.
-- [ ] Keep direct object-store CAS as a dev/recovery backend, not the normal
+- [x] Implement a standalone broker service that owns the group-commit loop.
+- [x] Route all normal multi-pod queue mutations through the broker.
+- [x] Acknowledge a broker request only after its batched CAS is durable.
+- [x] Store broker discovery and a monotonically increasing owner generation in
+      `queue.json`.
+- [x] Permit brief overlapping brokers; CAS remains the final correctness guard.
+- [x] Keep direct object-store CAS as a dev/recovery backend, not the normal
       multi-pod path.
-- [ ] Measure queue size, CAS rate, batch size, retries, claim latency, and
+- [x] Fail broker liveness after a bounded group-commit timeout so the process
+      supervisor starts a replacement.
+- [x] Measure queue size, CAS rate, batch size, retries, claim latency, and
       oldest-job age before considering sharding.
 
 Do **not** shard the queue preemptively. Turbopuffer reports that a single JSON
@@ -415,7 +447,8 @@ Source: [Cormack, Clarke, and Buettcher, Reciprocal Rank Fusion](https://plg.uwa
 3. Split API, indexer, maintenance, and broker roles.
 4. Route every queue mutation through the standalone broker.
 5. Add maintenance leader election and per-namespace ownership.
-6. Implement reader/publisher watermarks, then re-enable GC.
+6. Implement publisher safety points and durable GC candidates, then re-enable
+   automatic GC.
 7. Add Kubernetes lifecycle, probes, renewable AWS credentials, and the HTTP
    trust boundary.
 8. Add cache-aware routing after the basic multi-pod deployment is correct.

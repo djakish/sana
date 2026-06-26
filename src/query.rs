@@ -22,6 +22,7 @@ use crate::metrics::{add, incr};
 use crate::namespace::{Namespace, op_id};
 use crate::object_store::ObjectStore;
 use crate::rabitq::RabitqIndex;
+use crate::reader_lease::ReaderLeaseGuard;
 use crate::schema::{ColumnType, DistanceMetric};
 use crate::text::{self, Bm25Params};
 use crate::value::{Document, Id, Value, compare_scalars, scalar_eq};
@@ -33,6 +34,7 @@ const DEFAULT_RECALL_TOP_K: usize = 10;
 pub const MAX_MULTI_QUERIES: usize = 16;
 pub const MAX_QUERY_RESULTS: usize = 10_000;
 pub const MAX_FULL_TEXT_QUERY_BYTES: usize = 1_024;
+const MAX_STRONG_SNAPSHOT_ATTEMPTS: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueryOptions {
@@ -230,6 +232,12 @@ struct VectorPlan {
     dim: usize,
 }
 
+struct StrongSnapshot {
+    manifest: NamespaceManifest,
+    commit: WalCursor,
+    reader: Option<ReaderLeaseGuard>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct QueryRow {
     pub id: Id,
@@ -272,8 +280,16 @@ pub async fn execute_with_options(
     options: QueryOptions,
 ) -> Result<QueryResult> {
     let start = Instant::now();
-    let (manifest, commit) = load_strong_snapshot(ns, options).await?;
-    let result = execute_with_snapshot(ns, &manifest, commit, query).await?;
+    let StrongSnapshot {
+        manifest,
+        commit,
+        reader,
+    } = load_strong_snapshot(ns, options).await?;
+    let result = release_reader_after(
+        reader,
+        execute_with_snapshot(ns, &manifest, commit, query).await,
+    )
+    .await?;
     ns.metrics().latency.query_total.observe(start.elapsed());
     Ok(result)
 }
@@ -298,33 +314,76 @@ pub async fn execute_multi_with_options(
         )));
     }
     let start = Instant::now();
-    let (manifest, commit) = load_strong_snapshot(ns, options).await?;
-    let mut results = Vec::with_capacity(request.queries.len());
-    for query in request.queries {
-        results.push(execute_with_snapshot(ns, &manifest, commit, query).await?);
+    let StrongSnapshot {
+        manifest,
+        commit,
+        reader,
+    } = load_strong_snapshot(ns, options).await?;
+    let result = async {
+        let mut results = Vec::with_capacity(request.queries.len());
+        for query in request.queries {
+            results.push(execute_with_snapshot(ns, &manifest, commit, query).await?);
+        }
+        Ok(MultiQueryResult { results })
     }
+    .await;
+    let result = release_reader_after(reader, result).await?;
     // Phases record per subquery; the total is one observation per request.
     ns.metrics().latency.query_total.observe(start.elapsed());
-    Ok(MultiQueryResult { results })
+    Ok(result)
 }
 
-async fn load_strong_snapshot(
-    ns: &Namespace,
-    options: QueryOptions,
-) -> Result<(NamespaceManifest, WalCursor)> {
+async fn load_strong_snapshot(ns: &Namespace, options: QueryOptions) -> Result<StrongSnapshot> {
     ns.metrics()
         .latency
         .query_plan
         .time(async {
-            let manifest = ns.load_manifest().await?;
-            let (commit, committed_wal_bytes) = ns.wal_commit_stats().await?;
-            enforce_limit(
-                unindexed_wal_bytes(&manifest, committed_wal_bytes)?,
-                options.max_unindexed_wal_bytes,
-            )?;
-            Ok((manifest, commit))
+            for _ in 0..MAX_STRONG_SNAPSHOT_ATTEMPTS {
+                let snapshot = ns.load_manifest_snapshot().await?;
+                let (commit, committed_wal_bytes) = ns.wal_commit_stats().await?;
+                enforce_limit(
+                    unindexed_wal_bytes(&snapshot.manifest, committed_wal_bytes)?,
+                    options.max_unindexed_wal_bytes,
+                )?;
+                let reader = ns.acquire_reader_lease(&snapshot, commit).await?;
+                if reader.is_some() {
+                    let current = ns.load_manifest_snapshot().await?;
+                    if current.pointer != snapshot.pointer {
+                        if let Some(reader) = reader {
+                            let _ = reader.release().await;
+                        }
+                        continue;
+                    }
+                }
+                return Ok(StrongSnapshot {
+                    manifest: snapshot.manifest,
+                    commit,
+                    reader,
+                });
+            }
+            Err(Error::CasMismatch {
+                key: format!("namespaces/{}/manifest/current", ns.name()),
+                expected: crate::object_store::ObjectVersion("stable-query-snapshot".into()),
+                actual: None,
+            })
         })
         .await
+}
+
+async fn release_reader_after<T>(reader: Option<ReaderLeaseGuard>, result: Result<T>) -> Result<T> {
+    let Some(reader) = reader else {
+        return result;
+    };
+    match result {
+        Ok(value) => {
+            let _ = reader.release().await;
+            Ok(value)
+        }
+        Err(error) => {
+            let _ = reader.release().await;
+            Err(error)
+        }
+    }
 }
 
 async fn execute_with_snapshot(
@@ -545,120 +604,129 @@ pub async fn recall_with_options(
             "recall top_k cannot exceed {MAX_QUERY_RESULTS}"
         )));
     }
-    let (manifest, commit) = load_strong_snapshot(ns, options).await?;
-    let column = match request.column.clone() {
-        Some(column) => column,
-        None => manifest
-            .vector_indexes
-            .keys()
-            .next()
-            .cloned()
-            .ok_or_else(|| {
-                Error::InvalidQuery(
-                    "recall requires a published vector index; run flush or compact first".into(),
-                )
-            })?,
-    };
-    let Some(index_meta) = manifest.vector_indexes.get(&column) else {
-        return Err(Error::InvalidQuery(format!(
-            "recall requires a published vector index for '{column}'; run flush or compact first"
-        )));
-    };
+    let StrongSnapshot {
+        manifest,
+        commit,
+        reader,
+    } = load_strong_snapshot(ns, options).await?;
+    let result = async {
+        let column = match request.column.clone() {
+            Some(column) => column,
+            None => manifest
+                .vector_indexes
+                .keys()
+                .next()
+                .cloned()
+                .ok_or_else(|| {
+                    Error::InvalidQuery(
+                        "recall requires a published vector index; run flush or compact first"
+                            .into(),
+                    )
+                })?,
+        };
+        let Some(index_meta) = manifest.vector_indexes.get(&column) else {
+            return Err(Error::InvalidQuery(format!(
+                "recall requires a published vector index for '{column}'; run flush or compact first"
+            )));
+        };
 
-    let (dim, default_metric) = vector_column_schema(&manifest, &column)?;
-    let metric = request.metric.unwrap_or(default_metric);
-    if let Some(filter) = &request.filter {
-        let index = VectorIndex::decode(&ns.store().get(&index_meta.key).await?.bytes)?;
-        if native_filter_mask(&index, filter)?.is_none() {
-            return Err(Error::InvalidQuery(
-                "filtered recall requires a natively supported scalar filter".into(),
-            ));
+        let (dim, default_metric) = vector_column_schema(&manifest, &column)?;
+        let metric = request.metric.unwrap_or(default_metric);
+        if let Some(filter) = &request.filter {
+            let index = VectorIndex::decode(&ns.store().get(&index_meta.key).await?.bytes)?;
+            if native_filter_mask(&index, filter)?.is_none() {
+                return Err(Error::InvalidQuery(
+                    "filtered recall requires a natively supported scalar filter".into(),
+                ));
+            }
         }
+
+        let mut candidates =
+            recall_candidates(ns, &manifest, commit, &column, dim, request.filter.as_ref()).await?;
+        if candidates.is_empty() {
+            return Err(Error::InvalidQuery(format!(
+                "recall column '{column}' has no stored vectors"
+            )));
+        }
+
+        candidates.sort_by_key(|candidate| stable_sample_key(&candidate.id, &column));
+        candidates.truncate(request.num.min(candidates.len()));
+
+        let mut samples = Vec::with_capacity(candidates.len());
+        let mut recall_sum = 0.0;
+        let mut exhaustive_count_sum = 0usize;
+        let mut ann_count_sum = 0usize;
+
+        for candidate in candidates {
+            // The exact and ANN queries for a sample are independent read-only
+            // executions; run them concurrently rather than back to back.
+            let exact_query = Query {
+                filter: request.filter.clone(),
+                order_by: None,
+                limit: None,
+                aggregates: Vec::new(),
+                exact_vector: Some(ExactVectorQuery {
+                    column: column.clone(),
+                    vector: candidate.vector.clone(),
+                    k: request.top_k,
+                    metric: Some(metric),
+                }),
+                approx_vector: None,
+                text: None,
+            };
+            let ann_query = Query {
+                filter: request.filter.clone(),
+                order_by: None,
+                limit: None,
+                aggregates: Vec::new(),
+                exact_vector: None,
+                approx_vector: Some(ApproxVectorQuery {
+                    column: column.clone(),
+                    vector: candidate.vector,
+                    k: request.top_k,
+                    probes: request.probes,
+                    metric: Some(metric),
+                }),
+                text: None,
+            };
+            let (exact, ann) = tokio::join!(
+                execute_with_snapshot(ns, &manifest, commit, exact_query),
+                execute_with_snapshot(ns, &manifest, commit, ann_query)
+            );
+            let (exact, ann) = (exact?, ann?);
+
+            let exhaustive_ids = exact.rows.into_iter().map(|row| row.id).collect::<Vec<_>>();
+            let ann_ids = ann.rows.into_iter().map(|row| row.id).collect::<Vec<_>>();
+            let sample_recall = vector::recall_at(&exhaustive_ids, &ann_ids, request.top_k);
+
+            recall_sum += sample_recall;
+            exhaustive_count_sum += exhaustive_ids.len();
+            ann_count_sum += ann_ids.len();
+            samples.push(RecallSample {
+                query_id: candidate.id,
+                recall: sample_recall,
+                exhaustive_count: exhaustive_ids.len(),
+                ann_count: ann_ids.len(),
+                exhaustive_ids,
+                ann_ids,
+            });
+        }
+
+        let sampled = samples.len();
+        Ok(RecallResult {
+            column,
+            requested: request.num,
+            sampled,
+            top_k: request.top_k,
+            probes: request.probes,
+            avg_recall: recall_sum / sampled as f64,
+            avg_exhaustive_count: exhaustive_count_sum as f64 / sampled as f64,
+            avg_ann_count: ann_count_sum as f64 / sampled as f64,
+            samples,
+        })
     }
-
-    let mut candidates =
-        recall_candidates(ns, &manifest, commit, &column, dim, request.filter.as_ref()).await?;
-    if candidates.is_empty() {
-        return Err(Error::InvalidQuery(format!(
-            "recall column '{column}' has no stored vectors"
-        )));
-    }
-
-    candidates.sort_by_key(|candidate| stable_sample_key(&candidate.id, &column));
-    candidates.truncate(request.num.min(candidates.len()));
-
-    let mut samples = Vec::with_capacity(candidates.len());
-    let mut recall_sum = 0.0;
-    let mut exhaustive_count_sum = 0usize;
-    let mut ann_count_sum = 0usize;
-
-    for candidate in candidates {
-        // The exact and ANN queries for a sample are independent read-only
-        // executions; run them concurrently rather than back to back.
-        let exact_query = Query {
-            filter: request.filter.clone(),
-            order_by: None,
-            limit: None,
-            aggregates: Vec::new(),
-            exact_vector: Some(ExactVectorQuery {
-                column: column.clone(),
-                vector: candidate.vector.clone(),
-                k: request.top_k,
-                metric: Some(metric),
-            }),
-            approx_vector: None,
-            text: None,
-        };
-        let ann_query = Query {
-            filter: request.filter.clone(),
-            order_by: None,
-            limit: None,
-            aggregates: Vec::new(),
-            exact_vector: None,
-            approx_vector: Some(ApproxVectorQuery {
-                column: column.clone(),
-                vector: candidate.vector,
-                k: request.top_k,
-                probes: request.probes,
-                metric: Some(metric),
-            }),
-            text: None,
-        };
-        let (exact, ann) = tokio::join!(
-            execute_with_snapshot(ns, &manifest, commit, exact_query),
-            execute_with_snapshot(ns, &manifest, commit, ann_query)
-        );
-        let (exact, ann) = (exact?, ann?);
-
-        let exhaustive_ids = exact.rows.into_iter().map(|row| row.id).collect::<Vec<_>>();
-        let ann_ids = ann.rows.into_iter().map(|row| row.id).collect::<Vec<_>>();
-        let sample_recall = vector::recall_at(&exhaustive_ids, &ann_ids, request.top_k);
-
-        recall_sum += sample_recall;
-        exhaustive_count_sum += exhaustive_ids.len();
-        ann_count_sum += ann_ids.len();
-        samples.push(RecallSample {
-            query_id: candidate.id,
-            recall: sample_recall,
-            exhaustive_count: exhaustive_ids.len(),
-            ann_count: ann_ids.len(),
-            exhaustive_ids,
-            ann_ids,
-        });
-    }
-
-    let sampled = samples.len();
-    Ok(RecallResult {
-        column,
-        requested: request.num,
-        sampled,
-        top_k: request.top_k,
-        probes: request.probes,
-        avg_recall: recall_sum / sampled as f64,
-        avg_exhaustive_count: exhaustive_count_sum as f64 / sampled as f64,
-        avg_ann_count: ann_count_sum as f64 / sampled as f64,
-        samples,
-    })
+    .await;
+    release_reader_after(reader, result).await
 }
 
 async fn execute_ann_vector(

@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use crate::backpressure::{enforce_limit, unindexed_wal_bytes};
 use crate::doc::{DocRecord, decode_id, encode_id};
 use crate::error::{Error, Result};
-use crate::index_queue::{EnqueueOutcome, IndexQueue};
+use crate::index_queue::{EnqueueOutcome, IndexQueue, QueueClient};
 use crate::manifest::{ManifestPointer, NamespaceManifest};
 use crate::metrics::Metrics;
 use crate::object_store::{
@@ -37,6 +37,7 @@ use crate::object_store::{
 use crate::query::{
     MultiQuery, MultiQueryResult, Query, QueryOptions, QueryResult, RecallRequest, RecallResult,
 };
+use crate::reader_lease::{ReaderLeaseController, ReaderLeaseGuard};
 use crate::sst::SstReader;
 use crate::value::{Document, Id, Value};
 use crate::wal::{WalBatch, WalCursor, WalOp};
@@ -397,6 +398,8 @@ fn can_disable_backpressure(operations: &[WalOp]) -> bool {
 
 pub struct Namespace {
     store: Arc<dyn ObjectStore>,
+    queue: Arc<dyn QueueClient>,
+    reader_leases: Option<Arc<ReaderLeaseController>>,
     name: String,
     append_lock: tokio::sync::Mutex<()>,
     metrics: Arc<Metrics>,
@@ -488,8 +491,11 @@ impl Namespace {
     }
 
     fn handle(store: Arc<dyn ObjectStore>, name: &str) -> Self {
+        let queue: Arc<dyn QueueClient> = Arc::new(IndexQueue::new(store.clone()));
         Self {
             store,
+            queue,
+            reader_leases: None,
             name: name.to_string(),
             append_lock: tokio::sync::Mutex::new(()),
             metrics: Metrics::shared(),
@@ -504,6 +510,18 @@ impl Namespace {
         self
     }
 
+    /// Route advisory indexing notifications through a configured queue client.
+    /// Standalone library use defaults to direct object-store CAS.
+    pub fn with_queue_client(mut self, queue: Arc<dyn QueueClient>) -> Self {
+        self.queue = queue;
+        self
+    }
+
+    pub fn with_reader_lease(mut self, reader_leases: Arc<ReaderLeaseController>) -> Self {
+        self.reader_leases = Some(reader_leases);
+        self
+    }
+
     pub(crate) fn metrics(&self) -> &Metrics {
         &self.metrics
     }
@@ -514,6 +532,23 @@ impl Namespace {
 
     pub(crate) fn store(&self) -> &Arc<dyn ObjectStore> {
         &self.store
+    }
+
+    pub(crate) async fn acquire_reader_lease(
+        &self,
+        snapshot: &ManifestSnapshot,
+        commit_cursor: WalCursor,
+    ) -> Result<Option<ReaderLeaseGuard>> {
+        let Some(reader_leases) = &self.reader_leases else {
+            return Ok(None);
+        };
+        let lease = crate::reader_lease::snapshot_from_manifest(
+            &self.name,
+            &snapshot.pointer,
+            &snapshot.manifest,
+            commit_cursor,
+        );
+        reader_leases.acquire_snapshot(lease).await.map(Some)
     }
 
     pub(crate) async fn load_sst(&self, key: &str) -> Result<SstReader> {
@@ -961,7 +996,7 @@ impl Namespace {
         // this cursor again later.
         let _ = latency
             .write_notify
-            .time(IndexQueue::new(self.store.clone()).enqueue(&self.name, committed))
+            .time(self.queue.enqueue(&self.name, committed))
             .await;
 
         latency.write_total.observe(start.elapsed());
@@ -1015,7 +1050,7 @@ impl Namespace {
 
         let _ = latency
             .write_notify
-            .time(IndexQueue::new(self.store.clone()).enqueue(&self.name, result.cursor))
+            .time(self.queue.enqueue(&self.name, result.cursor))
             .await;
         latency.write_total.observe(start.elapsed());
         Ok(result)
@@ -1116,7 +1151,7 @@ impl Namespace {
         drop(append_guard);
         let _ = latency
             .write_notify
-            .time(IndexQueue::new(self.store.clone()).enqueue(&self.name, result.cursor))
+            .time(self.queue.enqueue(&self.name, result.cursor))
             .await;
         latency.write_total.observe(start.elapsed());
         Ok(result)
@@ -1202,7 +1237,7 @@ impl Namespace {
         drop(append_guard);
         let _ = latency
             .write_notify
-            .time(IndexQueue::new(self.store.clone()).enqueue(&self.name, result.cursor))
+            .time(self.queue.enqueue(&self.name, result.cursor))
             .await;
         latency.write_total.observe(start.elapsed());
         Ok(result)
@@ -1698,9 +1733,7 @@ impl Namespace {
     /// queue. This is safe to call repeatedly because pending jobs coalesce.
     pub async fn enqueue_indexing(&self) -> Result<EnqueueOutcome> {
         let target = self.commit_cursor().await?;
-        IndexQueue::new(self.store.clone())
-            .enqueue(&self.name, target)
-            .await
+        self.queue.enqueue(&self.name, target).await
     }
 
     async fn evolve_schema_for_ops(&self, operations: &[WalOp]) -> Result<()> {

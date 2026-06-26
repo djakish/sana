@@ -41,8 +41,17 @@ pub enum Error {
     #[error("invalid indexing queue claim: {0}")]
     InvalidQueueClaim(String),
 
+    #[error("invalid indexing queue broker: {0}")]
+    InvalidQueueBroker(String),
+
     #[error("invalid pinning replica claim: {0}")]
     InvalidPinningClaim(String),
+
+    #[error("invalid maintenance lease: {0}")]
+    InvalidMaintenanceLease(String),
+
+    #[error("invalid reader lease: {0}")]
+    InvalidReaderLease(String),
 
     #[error("corrupt data: {0}")]
     Corrupt(String),

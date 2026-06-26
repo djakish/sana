@@ -26,12 +26,19 @@ const BUCKET_BOUNDS_US: [u64; 17] = [
 /// Bucket count including the final overflow (`+Inf`) bucket.
 const BUCKETS: usize = BUCKET_BOUNDS_US.len() + 1;
 
+/// Queue broker batch-size buckets, in number of mutation requests.
+const BATCH_SIZE_BOUNDS: [u64; 11] = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1_024];
+
+/// Bucket count including the final overflow (`+Inf`) bucket.
+const VALUE_BUCKETS: usize = BATCH_SIZE_BOUNDS.len() + 1;
+
 #[derive(Debug, Default)]
 pub struct Metrics {
     pub object_store: ObjectStoreMetrics,
     pub cache: CacheMetrics,
     pub latency: LatencyMetrics,
     pub search: SearchMetrics,
+    pub queue: QueueMetrics,
     pub index_lag: IndexLagMetrics,
 }
 
@@ -46,6 +53,7 @@ impl Metrics {
             cache: self.cache.snapshot(),
             latency: self.latency.snapshot(),
             search: self.search.snapshot(),
+            queue: self.queue.snapshot(),
             index_lag: self.index_lag.snapshot(),
         }
     }
@@ -167,6 +175,68 @@ impl SearchMetrics {
             text_queries: load(&self.text_queries),
             text_blocks_read: load(&self.text_blocks_read),
             text_blocks_skipped: load(&self.text_blocks_skipped),
+        }
+    }
+}
+
+/// Store-global indexing queue metrics. These are measured at the queue owner
+/// rather than inferred from broad object-store counters, so a broker scrape can
+/// answer whether the single JSON queue is still healthy before sharding it.
+#[derive(Debug, Default)]
+pub struct QueueMetrics {
+    pub cas_attempts: AtomicU64,
+    pub cas_successes: AtomicU64,
+    pub cas_retries: AtomicU64,
+    pub broker_batches: AtomicU64,
+    pub broker_batch_requests: AtomicU64,
+    pub jobs: AtomicU64,
+    pub available_jobs: AtomicU64,
+    pub claimed_jobs: AtomicU64,
+    pub oldest_job_age_seconds: AtomicU64,
+    pub broker_batch_size: ValueHistogram,
+    pub claim_wait: Histogram,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct QueueStateSample {
+    pub jobs: u64,
+    pub available_jobs: u64,
+    pub claimed_jobs: u64,
+    pub oldest_job_age_seconds: u64,
+}
+
+impl QueueMetrics {
+    pub fn record_state(&self, sample: QueueStateSample) {
+        set(&self.jobs, sample.jobs);
+        set(&self.available_jobs, sample.available_jobs);
+        set(&self.claimed_jobs, sample.claimed_jobs);
+        set(&self.oldest_job_age_seconds, sample.oldest_job_age_seconds);
+    }
+
+    pub fn record_broker_batch(&self, request_count: u64) {
+        incr(&self.broker_batches);
+        add(&self.broker_batch_requests, request_count);
+        self.broker_batch_size.observe(request_count);
+    }
+
+    pub fn record_claim_wait(&self, wait: Duration) {
+        self.claim_wait.observe(wait);
+    }
+
+    fn snapshot(&self) -> QueueSnapshot {
+        let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        QueueSnapshot {
+            cas_attempts: load(&self.cas_attempts),
+            cas_successes: load(&self.cas_successes),
+            cas_retries: load(&self.cas_retries),
+            broker_batches: load(&self.broker_batches),
+            broker_batch_requests: load(&self.broker_batch_requests),
+            jobs: load(&self.jobs),
+            available_jobs: load(&self.available_jobs),
+            claimed_jobs: load(&self.claimed_jobs),
+            oldest_job_age_seconds: load(&self.oldest_job_age_seconds),
+            broker_batch_size: self.broker_batch_size.snapshot(),
+            claim_wait: self.claim_wait.snapshot(),
         }
     }
 }
@@ -293,6 +363,7 @@ pub struct MetricsSnapshot {
     pub cache: CacheSnapshot,
     pub latency: LatencySnapshot,
     pub search: SearchSnapshot,
+    pub queue: QueueSnapshot,
     pub index_lag: BTreeMap<String, IndexLagSample>,
 }
 
@@ -316,6 +387,10 @@ impl MetricsSnapshot {
         for series in self.search.series() {
             series.render(&mut out);
         }
+        for series in self.queue.series() {
+            series.render(&mut out);
+        }
+        self.queue.render_histograms(&mut out);
         self.render_index_lag(&mut out);
         out
     }
@@ -423,6 +498,49 @@ pub struct HistogramSnapshot {
 }
 
 impl HistogramSnapshot {
+    pub fn count(&self) -> u64 {
+        self.buckets.iter().sum()
+    }
+}
+
+/// Fixed-bucket integer histogram for non-latency observations.
+#[derive(Debug, Default)]
+pub struct ValueHistogram {
+    buckets: [AtomicU64; VALUE_BUCKETS],
+    sum: AtomicU64,
+}
+
+impl ValueHistogram {
+    pub fn observe(&self, value: u64) {
+        let slot = BATCH_SIZE_BOUNDS
+            .iter()
+            .position(|bound| value <= *bound)
+            .unwrap_or(BATCH_SIZE_BOUNDS.len());
+        if let Some(bucket) = self.buckets.get(slot) {
+            bucket.fetch_add(1, Ordering::Relaxed);
+        }
+        self.sum.fetch_add(value, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> ValueHistogramSnapshot {
+        let mut buckets = [0u64; VALUE_BUCKETS];
+        for (bucket, source) in buckets.iter_mut().zip(&self.buckets) {
+            *bucket = source.load(Ordering::Relaxed);
+        }
+        ValueHistogramSnapshot {
+            buckets,
+            sum: self.sum.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct ValueHistogramSnapshot {
+    pub buckets: [u64; VALUE_BUCKETS],
+    pub sum: u64,
+}
+
+impl ValueHistogramSnapshot {
     pub fn count(&self) -> u64 {
         self.buckets.iter().sum()
     }
@@ -580,6 +698,88 @@ impl SearchSnapshot {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct QueueSnapshot {
+    pub cas_attempts: u64,
+    pub cas_successes: u64,
+    pub cas_retries: u64,
+    pub broker_batches: u64,
+    pub broker_batch_requests: u64,
+    pub jobs: u64,
+    pub available_jobs: u64,
+    pub claimed_jobs: u64,
+    pub oldest_job_age_seconds: u64,
+    pub broker_batch_size: ValueHistogramSnapshot,
+    pub claim_wait: HistogramSnapshot,
+}
+
+impl QueueSnapshot {
+    fn series(&self) -> [Series; 9] {
+        [
+            Series::new(
+                "sana_index_queue_cas_attempts_total",
+                "Compare-and-set attempts against the indexing queue object.",
+                self.cas_attempts,
+            ),
+            Series::new(
+                "sana_index_queue_cas_successes_total",
+                "Successful compare-and-set writes against the indexing queue object.",
+                self.cas_successes,
+            ),
+            Series::new(
+                "sana_index_queue_cas_retries_total",
+                "Indexing queue compare-and-set attempts rejected by a version mismatch.",
+                self.cas_retries,
+            ),
+            Series::new(
+                "sana_index_queue_broker_batches_total",
+                "Group-commit batches attempted by the indexing queue broker.",
+                self.broker_batches,
+            ),
+            Series::new(
+                "sana_index_queue_broker_batch_requests_total",
+                "Queue mutation requests included in broker group-commit batches.",
+                self.broker_batch_requests,
+            ),
+            Series::gauge(
+                "sana_index_queue_jobs",
+                "Live jobs in the indexing queue.",
+                self.jobs,
+            ),
+            Series::gauge(
+                "sana_index_queue_available_jobs",
+                "Live indexing queue jobs immediately eligible for claim.",
+                self.available_jobs,
+            ),
+            Series::gauge(
+                "sana_index_queue_claimed_jobs",
+                "Live indexing queue jobs with an unexpired claim lease.",
+                self.claimed_jobs,
+            ),
+            Series::gauge(
+                "sana_index_queue_oldest_job_age_seconds",
+                "Age of the oldest live indexing queue job.",
+                self.oldest_job_age_seconds,
+            ),
+        ]
+    }
+
+    fn render_histograms(&self, out: &mut String) {
+        render_value_histogram(
+            out,
+            "sana_index_queue_broker_batch_size",
+            "Queue mutation requests per broker group-commit batch.",
+            &self.broker_batch_size,
+        );
+        render_histogram(
+            out,
+            "sana_index_queue_claim_wait_seconds",
+            "Time from indexing job creation to successful claim.",
+            &[(None, &self.claim_wait)],
+        );
+    }
+}
+
 impl ObjectStoreSnapshot {
     fn series(&self) -> [Series; 11] {
         [
@@ -679,6 +879,26 @@ fn render_histogram(
     }
 }
 
+fn render_value_histogram(
+    out: &mut String,
+    name: &str,
+    help: &str,
+    histogram: &ValueHistogramSnapshot,
+) {
+    use std::fmt::Write;
+    let _ = writeln!(out, "# HELP {name} {help}");
+    let _ = writeln!(out, "# TYPE {name} histogram");
+    let mut cumulative = 0u64;
+    for (count, bound) in histogram.buckets.iter().zip(BATCH_SIZE_BOUNDS.iter()) {
+        cumulative += *count;
+        let _ = writeln!(out, "{name}_bucket{{le=\"{bound}\"}} {cumulative}");
+    }
+    cumulative += histogram.buckets.last().copied().unwrap_or(0);
+    let _ = writeln!(out, "{name}_bucket{{le=\"+Inf\"}} {cumulative}");
+    let _ = writeln!(out, "{name}_sum {}", histogram.sum);
+    let _ = writeln!(out, "{name}_count {cumulative}");
+}
+
 fn seconds(micros: u64) -> f64 {
     micros as f64 / 1e6
 }
@@ -709,10 +929,12 @@ mod tests {
         assert!(text.contains("# HELP sana_object_store_cas_mismatches_total"));
         assert!(text.contains("# TYPE sana_object_store_cas_mismatches_total counter"));
         assert!(text.contains("\nsana_object_store_cas_mismatches_total 7\n"));
+        assert!(text.contains("# HELP sana_index_queue_jobs"));
+        assert!(text.contains("# TYPE sana_index_queue_broker_batch_size histogram"));
         // Every family is emitted, even at zero.
-        assert_eq!(text.matches(" counter\n").count(), 24);
-        assert_eq!(text.matches(" gauge\n").count(), 5);
-        assert_eq!(text.matches(" histogram\n").count(), 5);
+        assert_eq!(text.matches(" counter\n").count(), 29);
+        assert_eq!(text.matches(" gauge\n").count(), 9);
+        assert_eq!(text.matches(" histogram\n").count(), 7);
     }
 
     #[test]
@@ -765,6 +987,38 @@ mod tests {
             .await;
         assert!(failed.is_err());
         assert_eq!(metrics.latency.query_total.snapshot().count(), 1);
+    }
+
+    #[test]
+    fn queue_metrics_render_state_counters_and_histograms() {
+        let metrics = Metrics::default();
+        metrics.queue.record_state(QueueStateSample {
+            jobs: 3,
+            available_jobs: 2,
+            claimed_jobs: 1,
+            oldest_job_age_seconds: 9,
+        });
+        incr(&metrics.queue.cas_attempts);
+        incr(&metrics.queue.cas_successes);
+        incr(&metrics.queue.cas_retries);
+        metrics.queue.record_broker_batch(17);
+        metrics
+            .queue
+            .record_claim_wait(Duration::from_millis(1_500));
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.queue.jobs, 3);
+        assert_eq!(snapshot.queue.broker_batch_size.count(), 1);
+        assert_eq!(snapshot.queue.claim_wait.count(), 1);
+
+        let text = snapshot.to_prometheus();
+        assert!(text.contains("sana_index_queue_jobs 3\n"));
+        assert!(text.contains("sana_index_queue_available_jobs 2\n"));
+        assert!(text.contains("sana_index_queue_claimed_jobs 1\n"));
+        assert!(text.contains("sana_index_queue_oldest_job_age_seconds 9\n"));
+        assert!(text.contains("sana_index_queue_cas_retries_total 1\n"));
+        assert!(text.contains("sana_index_queue_broker_batch_size_bucket{le=\"32\"} 1\n"));
+        assert!(text.contains("sana_index_queue_claim_wait_seconds_count 1\n"));
     }
 
     #[test]

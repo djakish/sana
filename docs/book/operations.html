@@ -172,20 +172,20 @@ S3 or local filesystem</pre>
       deliberately left fail-closed rather than done halfway. The biggest is safe
       automatic deletion across many machines: reclaiming a file is only safe once
       you can <em>prove</em> no reader and no in-flight publisher still needs it,
-      and that proof needs durable reader and publisher watermarks Sana does not yet
-      have. So automatic garbage collection is off by default; deletion stays an
-      operator action.
+      and Sana now records active query/recall reader snapshots but still lacks
+      publisher safety points and durable GC candidate state. So automatic garbage
+      collection is off by default; deletion stays an operator action.
     </p>
     <pre class="diagram">safe deletion needs proof:
   no reader still holds the old generation
   no publisher can still attach the object
   the candidate survived a durable safety check
-  a final reference check passes immediately before delete</pre>
+  the final reference check still passes immediately before delete</pre>
     <p>
       Also not present: authentication and TLS on the HTTP service (bind to
       localhost or front it with a reverse proxy), WAL epoch rotation, IAM-role S3
-      credentials, a standalone queue broker, and a turbopuffer-compatible wire
-      protocol. None of these are hidden; they are tracked in the repository.
+      credentials, publisher-safe automatic GC, and a turbopuffer-compatible
+      wire protocol. None of these are hidden; they are tracked in the repository.
     </p>
 
     <div class="callout">

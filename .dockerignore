@@ -1,0 +1,7 @@
+# Keep the Rust build artifacts and git history out of the Docker build context
+# (the showcase builds the sana image from the repo root).
+/target
+/.git
+**/__pycache__
+**/.DS_Store
+/examples/showcase

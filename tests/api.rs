@@ -17,6 +17,7 @@ use sana::metrics::Metrics;
 use sana::namespace::Namespace;
 use sana::object_store::{FsObjectStore, MeteredObjectStore, ObjectStore};
 use sana::query::{FilterExpr, MultiQuery, Query, QueryOptions, RecallRequest};
+use sana::reader_lease::READER_LEASE_PREFIX;
 use sana::value::{Document, Id, Value, VectorValue};
 use sana::wal::WalOp;
 use sana::write::{ConditionalWriteOp, DeleteByFilterRequest, PatchByFilterRequest, WriteOptions};
@@ -119,6 +120,11 @@ async fn http_write_query_metadata_recall_and_warm_cache_round_trip() {
         QueryResponse::Multi(result) => assert_eq!(result.results.len(), 2),
         QueryResponse::Single(_) => panic!("expected multi-query response"),
     }
+    assert_eq!(
+        object_store.list(READER_LEASE_PREFIX).await.unwrap().len(),
+        1,
+        "HTTP query path should publish a durable per-process reader lease object"
+    );
 
     let blocked_query = QueryRequest::Single {
         query: Box::new(Query::all()),

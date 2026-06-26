@@ -2,7 +2,7 @@
 
 This document describes the engine **as it currently stands**. It is the place
 to look for "how does Sana work today"; [`PROGRESS.md`](PROGRESS.md) is the
-dated build log (every decision `D1`–`D73`, in the order it happened) and is
+dated build log (every decision `D1`–`D85`, in the order it happened) and is
 deliberately *not* rewritten when a decision is later superseded.
 
 Sana is an object-storage-native search database. Every durable byte lives in an
@@ -59,7 +59,7 @@ repeats.
 
 | Layer | Role |
 |---|---|
-| `FsObjectStore` | local filesystem; CAS via an in-process lock + atomic temp-file rename. Crash-safe, but **single-process only** (D4). |
+| `FsObjectStore` | local filesystem; CAS via a per-root in-process lock + atomic temp-file rename. Crash-safe, but **single-process only** (D4). |
 | `S3ObjectStore` | presigned SigV4 over `reqwest`; CAS is S3-native (`If-None-Match: *`, `If-Match: <etag>`), so it holds **across processes and nodes**. |
 | `MeteredObjectStore` | decorator that counts requests, bytes, and CAS rejections — placed *below* the cache so hits don't inflate backend counts. |
 | `CachingObjectStore` | byte-bounded LRU that admits **only immutable** objects (manifest bodies, `index/g/...`); mutable pointers/cursors/queue always bypass. |
@@ -99,7 +99,9 @@ namespaces/{ns}/
 
   routing/pinning.json                  # leased replica routing control        (MUTABLE, CAS)
 
-jobs/indexing_queue.json                # store-global indexing notification queue (MUTABLE, CAS)
+jobs/indexing_queue.json                # global jobs + active broker registration (MUTABLE, CAS)
+jobs/maintenance_leader.json            # store-global maintenance leader lease (MUTABLE, CAS)
+jobs/readers/{owner-hex}.json           # per-process active query snapshots (MUTABLE, CAS)
 ```
 
 Reading a namespace is always: `get manifest/current` → `get` the named body →
@@ -183,7 +185,13 @@ turns them into conditional ops rechecked under the reservation.
 ## 6. Read & query path
 
 `query::execute_with_options` captures one snapshot — manifest pointer → body,
-plus the commit cursor — then builds the **overlay** by reading the WAL range
+plus the commit cursor — then, when a reader-lease controller is attached,
+CAS-publishes that exact active snapshot under `jobs/readers/{owner}.json`.
+The lease records the namespace, generation, manifest body key, indexed WAL
+cursor, and committed WAL cursor. After publishing the lease, the query re-reads
+`manifest/current` and retries if the pointer moved, closing the capture-to-lease
+race where GC could otherwise see the old generation as unreferenced. After
+that, the query builds the **overlay** by reading the WAL range
 `(indexed_cursor, commit]` (its size is bounded by the same byte budget as
 writes). All ranking runs against that consistent base+overlay, giving
 **read-after-write** consistency. Then the planner picks a path:
@@ -229,9 +237,11 @@ These hold everywhere and are the reason the moving parts compose:
   therefore never sees a catalog pointing at a missing object.
 - **GC fail-closed.** Automatic deletion is disabled by default. `sana gc`
   reports orphaned immutable objects as a dry-run, and `sana gc --apply` remains
-  an operator action for controlled quiescent deployments. The legacy two-pass
-  maintenance GC can be explicitly enabled in-process, but production
-  multi-pod reclamation needs durable reader/publisher watermarks before delete.
+  an operator action for controlled quiescent deployments. Apply-mode GC and the
+  legacy opt-in maintenance GC re-scan namespace liveness immediately before
+  deleting candidates and include active reader snapshots from
+  `jobs/readers/`. Production multi-pod reclamation still needs publisher
+  safety points and durable GC candidates before automatic deletion is enabled.
 - **Epoch fail-closed.** WAL epoch rotation is unimplemented; overlay/flush/GC
   compare full cursors and reject cross-epoch ranges rather than risk a silent
   stale read.
@@ -246,7 +256,7 @@ These hold everywhere and are the reason the moving parts compose:
 | tiering | `indexer` | when a level reaches the run threshold, fold it into one run at the next level |
 | `compact` | `indexer` | merge all runs into one, drop tombstones, rebuild clean attribute/text snapshots, rebuild the IVF base & clear the append chain |
 | `maintain_vectors` | `indexer`, `vector/maintenance` | publish SPFresh split/merge/reassign delta segments from manifest-planned tasks |
-| `gc` | `indexer` | `list` the namespace prefix, delete anything the live manifest no longer references (plus already-folded WAL) |
+| `gc` | `indexer` | `list` the namespace prefix, then delete only candidates that a final liveness scan still proves unreferenced |
 
 **Coordination.** `jobs/indexing_queue.json` is a *notification* layer (WAL +
 manifest stay authoritative): each commit best-effort enqueues its cursor;
@@ -254,14 +264,52 @@ manifest stay authoritative): each commit best-effort enqueues its cursor;
 namespace). `reconcile_unindexed` repairs missed notifications by comparing
 authoritative cursors and doubles as the per-namespace lag metric.
 
-`sana serve --role all` runs this itself: an embedded indexing worker (poll,
-lease, heartbeat, retry; reconcile every 30 s) plus a maintenance loop (every
-60 s: threshold-driven compaction *or* vector maintenance; automatic GC is off
-by default). Multi-pod deployments use `sana serve-api` for HTTP-only query/write
-pods, `sana work-indexing --loop` for leased indexing workers, and
-`sana maintain --loop` for all-namespace maintenance. API-only pods do not claim
-jobs or scan namespaces, so query scaling no longer multiplies background object
-store traffic.
+All queue mutations use the `QueueClient` boundary. `IndexQueue` implements the
+direct object-store CAS path for library/dev/recovery use.
+`IndexQueueBroker` implements one group-commit loop that acknowledges requests
+only after the queue CAS is durable.
+
+For multi-process deployments, `sana queue-broker` CAS-registers
+`{address, owner_id, generation}` in the queue JSON before serving.
+`DiscoveredQueueClient` reads that registration from object storage and sends
+the versioned mutation request to the advertised broker. A replacement writes a
+higher generation. Every broker batch verifies its exact registration before
+applying operations, so an overlapping old broker is fenced after its CAS loses;
+the client then re-reads the registration and retries through the replacement.
+Transport timeouts are treated as ambiguous and are not blindly replayed.
+Broker group-commit timeout stops the broker loop and fails liveness so the
+process supervisor can start a replacement.
+The queue owner records queue size, available and claimed jobs, oldest-job age,
+queue CAS attempts/successes/retries, broker batch size, and job claim wait.
+All-in-one mode exposes these through the API `/metrics`; multi-pod deployments
+scrape the standalone broker's `/metrics`.
+Flush workers also verify their exact queue claim immediately before the
+manifest-pointer CAS that makes new index objects reachable. A stale worker may
+leave orphaned immutable files, but it cannot publish them after its claim has
+expired or been replaced.
+
+`sana serve --role all` shares one `IndexQueueBroker` between HTTP write
+notifications, reconciliation, and its embedded indexing worker (poll, lease,
+heartbeat, retry; reconcile every 30 s). It also runs a maintenance loop every
+60 s, but the loop first acquires `jobs/maintenance_leader.json`, a
+store-global object-store CAS lease with `{owner_id, fencing_token,
+lease_expires_at_ms}`. Only the current leader runs threshold-driven compaction
+or vector maintenance; automatic GC is off by default. Before publishing a
+compaction/vector manifest or deleting opt-in GC objects, the maintenance path
+heartbeats the same lease. GC deletion also re-runs namespace liveness
+immediately before deleting the candidate batch and treats unexpired
+`jobs/readers/` snapshots as live. This is still a coarse process-level gate:
+per-namespace maintenance jobs, publisher safety points, durable GC candidates,
+and manual publisher entry points remain future work.
+
+Multi-pod deployments use `sana serve-api` for HTTP-only query/write pods,
+`sana queue-broker` for the store-global group-commit owner, `sana
+work-indexing --loop` for leased indexing workers, and `sana maintain --loop`
+for all-namespace maintenance under the same store-global leader lease.
+API-only pods do not claim jobs or scan
+namespaces, so query scaling no longer multiplies background maintenance work.
+API writers, reconciliation, and workers discover the broker through
+`queue.json`; direct queue CAS is not their normal path.
 
 ---
 
@@ -298,8 +346,10 @@ shutdown so load balancers can stop routing while in-flight requests drain.
 Metrics (`src/metrics.rs`) are a dependency-free in-process registry rendered as
 Prometheus text. Because the meter sits *below* the cache, object-store counters
 measure true backend egress; latency histograms record dominant phase seams of
-the write and query paths; gauges cover cache temperature and per-namespace index
-lag.
+the write and query paths; gauges cover cache temperature, per-namespace index
+lag, and store-global queue state. The queue owner also exposes CAS contention,
+broker group-commit batch sizes, and job claim wait so queue sharding decisions
+come from measurements.
 
 > **Not yet present:** authentication and TLS on the HTTP service (bind to
 > localhost or front it with a reverse proxy), WAL epoch rotation, IAM-role S3
