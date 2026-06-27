@@ -445,6 +445,8 @@ Source: [Cormack, Clarke, and Buettcher, Reciprocal Rank Fusion](https://plg.uwa
 **Status:** namespaces can be created, branched, copied, exported, written, and
 queried, but there is no `sana drop` or library equivalent.
 
+**Design:** [RFC 0001](rfcs/0001-namespace-drop-lifecycle.md) (draft).
+
 Current code:
 
 - [`Namespace::create`](../src/namespace.rs) and [`Namespace::open`](../src/namespace.rs)
@@ -525,6 +527,9 @@ Current code:
 there is no seeded adversarial object-store test that searches for unknown
 interleavings.
 
+**Design:** [RFC 0002](rfcs/0002-randomized-object-store-adversary-tests.md)
+(draft).
+
 Current code:
 
 - Tests use small custom `ObjectStore` decorators for specific scenarios, such
@@ -551,6 +556,8 @@ Current code:
 operator `compact` path still rewrites a whole namespace and is the only path
 that drops tombstones, rebuilds stale-free attribute/text snapshots, and resets
 the vector append chain.
+
+**Design:** [RFC 0003](rfcs/0003-incremental-compaction-planning.md) (draft).
 
 Current code:
 
