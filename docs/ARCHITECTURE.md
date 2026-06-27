@@ -349,7 +349,11 @@ measure true backend egress; latency histograms record dominant phase seams of
 the write and query paths; gauges cover cache temperature, per-namespace index
 lag, and store-global queue state. The queue owner also exposes CAS contention,
 broker group-commit batch sizes, and job claim wait so queue sharding decisions
-come from measurements.
+come from measurements. Background work is exported rather than left on stderr:
+the maintenance loop counts passes, leader-lease skips, compactions, vector
+maintenance, GC candidates/deletions, and errors; the serve indexing worker
+counts job claims, index-publishing flushes, retried failures, and stale-claim
+publication rejections.
 
 > **Not yet present:** authentication and TLS on the HTTP service (bind to
 > localhost or front it with a reverse proxy), WAL epoch rotation, IAM-role S3

@@ -571,28 +571,33 @@ Current code:
 
 ## P2: Surface background work in metrics and logs
 
-**Status:** object-store, cache, query/search, queue, and index-lag metrics
-exist. Background maintenance and worker failures still mostly go to `eprintln!`,
-and maintenance outcomes are not first-class metrics.
+**Status:** mostly done. Maintenance-pass and indexing-worker outcomes are now
+first-class `Metrics` counters exported on `/metrics`; failures still also print
+to stderr. The only deferred item is structured `tracing`.
 
 Current code:
 
-- [`api::run_maintenance_loop`](../src/api.rs) and the indexing worker print
-  failures to stderr.
-- [`MaintenanceReport`](../src/maintenance.rs) records compactions, vector
-  maintenance, GC deletions, pending GC objects, and errors for the caller, but
-  those fields are not exported by [`Metrics`](../src/metrics.rs).
+- [`MaintenanceMetrics`](../src/metrics.rs) and [`WorkerMetrics`](../src/metrics.rs)
+  hold the new counters; both render through `to_prometheus`.
+- [`api::run_maintenance_loop`](../src/api.rs) folds each `MaintenanceReport`
+  into `MaintenancePassSample` and records skipped/failed passes; the serve
+  indexing worker classifies each `run_worker_once_with_client` outcome into
+  claims, flushes, failures, and stale-claim rejections.
+- [`MaintenanceReport`](../src/maintenance.rs) still carries the per-namespace
+  detail; the loop also keeps `eprintln!` for human-readable failure context.
 
 ### Required work
 
-- [ ] Add counters for maintenance passes, skipped leased passes, compactions,
+- [x] Add counters for maintenance passes, skipped leased passes, compactions,
       vector-maintenance publications, GC candidates, GC deletions, and
       maintenance errors.
-- [ ] Add worker counters for claims, successful flushes, retries/failures, and
+- [x] Add worker counters for claims, successful flushes, retries/failures, and
       stale-claim publication rejections.
 - [ ] Decide whether to add feature-gated `tracing` for structured logs while
-      preserving the low-dependency default.
-- [ ] Document which metrics operators should alert on.
+      preserving the low-dependency default. (Deferred: kept the dependency-free
+      counter registry; failures still go to stderr. Revisit if operators need
+      structured per-event logs.)
+- [x] Document which metrics operators should alert on.
 
 ## P2: Improve public library ergonomics
 

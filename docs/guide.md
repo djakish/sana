@@ -364,6 +364,31 @@ multi-pod mode, scrape the `sana queue-broker` process for these queue-owner
 series; API pods expose their own API/cache/query metrics. See `src/metrics.rs`
 for the full series list.
 
+Background work is also exported, so maintenance and indexing no longer hide in
+stderr. The maintenance loop counts passes run versus `skipped_leased_passes`
+(another process held the leader lease), `compactions`, `vector_maintenance`
+publications, GC `gc_candidates`/`gc_deletions`, and `errors`. The serve
+indexing worker counts `claims` (jobs engaged this tick), `flushes` (the subset
+that published a new index), `failures` (jobs returned to the queue for retry),
+and `stale_claim_rejections` (claims fenced at publish/heartbeat after going
+stale).
+
+What to alert on:
+
+- `rate(sana_index_worker_failures_total)` sustained above zero — indexing is
+  stuck retrying; check namespace health.
+- `rate(sana_index_worker_stale_claim_rejections_total)` above the heartbeat
+  cadence — leases are expiring mid-job (slow flushes, lease too short, or
+  duplicate workers).
+- `rate(sana_maintenance_errors_total) > 0` — a namespace cannot compact or
+  maintain its vectors; the rest of the fleet keeps running, but it will fall
+  behind.
+- `sana_maintenance_passes_total` flat while writes continue — no process holds
+  the maintenance leader lease, so compaction and vector maintenance have
+  stalled (expected `skipped_leased_passes` on non-leader pods is fine).
+- `flushes`/`claims` collapsing toward zero while `sana_namespace_unindexed_*`
+  gauges climb — the worker is engaging jobs but not publishing indexes.
+
 ## Benchmark
 
 ```sh
@@ -379,6 +404,6 @@ filtered queries, plus the true object-store traffic the run generated. See
 
 - `docs/ARCHITECTURE.md` — how the engine works today: the object-store
   boundary, on-disk layout, write/read paths, and the core invariants.
-- `docs/PROGRESS.md` — staged build log and every design decision (D1–D85).
+- `docs/PROGRESS.md` — staged build log and every design decision (D1–D86).
 - `sana --help` (no args) — the complete CLI verb list: branch, copy, export,
   pin, gc, recall, and friends.

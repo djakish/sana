@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::cache_warm::CacheWarmOptions;
 use crate::error::Error;
 use crate::index_queue::{IndexQueue, IndexQueueBroker, QueueClient};
-use crate::metrics::Metrics;
+use crate::metrics::{MaintenancePassSample, Metrics, incr};
 use crate::namespace::Namespace;
 use crate::object_store::ObjectStore;
 use crate::query::{
@@ -442,8 +442,8 @@ pub async fn serve_with_shutdown(
     let worker = async {
         let worker_health = health.clone();
         tokio::join!(
-            run_index_worker(store.clone(), queue, metrics, worker_health.clone()),
-            run_maintenance_loop(store, worker_health),
+            run_index_worker(store.clone(), queue, metrics.clone(), worker_health.clone()),
+            run_maintenance_loop(store, metrics, worker_health),
         );
     };
     Box::pin(run_server_and_worker(server, worker, WORKER_DRAIN_TIMEOUT)).await
@@ -457,7 +457,11 @@ async fn drain_on_shutdown(health: Arc<HealthState>, shutdown: impl Future<Outpu
 
 /// Background maintenance: one policy pass per interval. The default policy
 /// compacts and maintains vector topology but does not delete orphaned objects.
-async fn run_maintenance_loop(store: Arc<dyn ObjectStore>, health: Arc<HealthState>) {
+async fn run_maintenance_loop(
+    store: Arc<dyn ObjectStore>,
+    metrics: Arc<Metrics>,
+    health: Arc<HealthState>,
+) {
     const MAINTENANCE_INTERVAL_MS: u64 = 60_000;
     const MAINTENANCE_LEASE_MS: u64 = 180_000;
 
@@ -479,13 +483,24 @@ async fn run_maintenance_loop(store: Arc<dyn ObjectStore>, health: Arc<HealthSta
         {
             Ok(report) => {
                 if report.skipped_leader_lease {
+                    metrics.maintenance.record_skipped_pass();
                     continue;
                 }
+                metrics.maintenance.record_pass(MaintenancePassSample {
+                    compactions: report.compacted.len() as u64,
+                    vector_maintenance: report.vector_maintained.len() as u64,
+                    gc_candidates: report.gc_pending_objects as u64,
+                    gc_deletions: report.gc_deleted_objects as u64,
+                    errors: report.errors.len() as u64,
+                });
                 for error in &report.errors {
                     eprintln!("maintenance: {error}");
                 }
             }
-            Err(error) => eprintln!("maintenance pass failed: {error}"),
+            Err(error) => {
+                metrics.maintenance.record_failed_pass();
+                eprintln!("maintenance pass failed: {error}");
+            }
         }
     }
 }
@@ -545,13 +560,26 @@ async fn run_index_worker(
         )
         .await
         {
-            Ok(Some(_)) => {}
+            Ok(Some(run)) => {
+                incr(&metrics.worker.claims);
+                if run.did_flush {
+                    incr(&metrics.worker.flushes);
+                }
+            }
             Ok(None) => {
                 if sleep_or_drain(&health, Duration::from_millis(IDLE_POLL_MS)).await {
                     return;
                 }
             }
             Err(error) => {
+                // A terminal error implies the worker engaged a job (or a rare
+                // claim-poll error); count it as a claim and classify it.
+                incr(&metrics.worker.claims);
+                if matches!(error, Error::InvalidQueueClaim(_)) {
+                    incr(&metrics.worker.stale_claim_rejections);
+                } else {
+                    incr(&metrics.worker.failures);
+                }
                 eprintln!("index worker failed: {error}");
                 if sleep_or_drain(&health, Duration::from_millis(ERROR_RETRY_MS)).await {
                     return;

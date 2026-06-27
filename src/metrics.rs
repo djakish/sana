@@ -40,6 +40,8 @@ pub struct Metrics {
     pub search: SearchMetrics,
     pub queue: QueueMetrics,
     pub index_lag: IndexLagMetrics,
+    pub maintenance: MaintenanceMetrics,
+    pub worker: WorkerMetrics,
 }
 
 impl Metrics {
@@ -55,6 +57,8 @@ impl Metrics {
             search: self.search.snapshot(),
             queue: self.queue.snapshot(),
             index_lag: self.index_lag.snapshot(),
+            maintenance: self.maintenance.snapshot(),
+            worker: self.worker.snapshot(),
         }
     }
 }
@@ -270,6 +274,97 @@ impl IndexLagMetrics {
     }
 }
 
+/// Background maintenance-loop outcomes, recorded once per policy pass so a
+/// `/metrics` scrape can answer whether compaction, vector maintenance, and GC
+/// are making progress without parsing stderr. The leader-lease loser path and
+/// whole-pass failures are counted separately from per-namespace errors.
+#[derive(Debug, Default)]
+pub struct MaintenanceMetrics {
+    /// Passes that ran (this process held the leader lease).
+    pub passes: AtomicU64,
+    /// Passes skipped because another process held the maintenance lease.
+    pub skipped_leased_passes: AtomicU64,
+    pub compactions: AtomicU64,
+    pub vector_maintenance: AtomicU64,
+    /// Fresh orphan candidates observed this pass (deletable next pass).
+    pub gc_candidates: AtomicU64,
+    pub gc_deletions: AtomicU64,
+    /// Per-namespace failures plus whole-pass failures.
+    pub errors: AtomicU64,
+}
+
+/// One maintenance pass folded into counter deltas. Built from a
+/// `MaintenanceReport` by the caller so this module stays independent of the
+/// maintenance layer, mirroring [`QueueStateSample`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct MaintenancePassSample {
+    pub compactions: u64,
+    pub vector_maintenance: u64,
+    pub gc_candidates: u64,
+    pub gc_deletions: u64,
+    pub errors: u64,
+}
+
+impl MaintenanceMetrics {
+    /// Record a completed (leader-held) pass.
+    pub fn record_pass(&self, sample: MaintenancePassSample) {
+        incr(&self.passes);
+        add(&self.compactions, sample.compactions);
+        add(&self.vector_maintenance, sample.vector_maintenance);
+        add(&self.gc_candidates, sample.gc_candidates);
+        add(&self.gc_deletions, sample.gc_deletions);
+        add(&self.errors, sample.errors);
+    }
+
+    /// Record a pass skipped because another process owns the leader lease.
+    pub fn record_skipped_pass(&self) {
+        incr(&self.skipped_leased_passes);
+    }
+
+    /// Record a pass that failed before producing a report.
+    pub fn record_failed_pass(&self) {
+        incr(&self.errors);
+    }
+
+    fn snapshot(&self) -> MaintenanceSnapshot {
+        let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        MaintenanceSnapshot {
+            passes: load(&self.passes),
+            skipped_leased_passes: load(&self.skipped_leased_passes),
+            compactions: load(&self.compactions),
+            vector_maintenance: load(&self.vector_maintenance),
+            gc_candidates: load(&self.gc_candidates),
+            gc_deletions: load(&self.gc_deletions),
+            errors: load(&self.errors),
+        }
+    }
+}
+
+/// Indexing-worker job outcomes, recorded by the serve worker loop. `claims`
+/// counts every job the worker engaged this tick; `flushes` is the subset that
+/// published a new index (the rest were already indexed). `failures` are jobs
+/// returned to the queue for retry; `stale_claim_rejections` are claims fenced
+/// at publish or heartbeat because they went stale.
+#[derive(Debug, Default)]
+pub struct WorkerMetrics {
+    pub claims: AtomicU64,
+    pub flushes: AtomicU64,
+    pub failures: AtomicU64,
+    pub stale_claim_rejections: AtomicU64,
+}
+
+impl WorkerMetrics {
+    fn snapshot(&self) -> WorkerSnapshot {
+        let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        WorkerSnapshot {
+            claims: load(&self.claims),
+            flushes: load(&self.flushes),
+            failures: load(&self.failures),
+            stale_claim_rejections: load(&self.stale_claim_rejections),
+        }
+    }
+}
+
 /// Wall-clock latency at the dominant write/query seams. Phases are the
 /// expensive spans, not a partition: a request's phases need not sum to its
 /// `*_total` observation, and a phase that does not occur for a request
@@ -365,6 +460,8 @@ pub struct MetricsSnapshot {
     pub search: SearchSnapshot,
     pub queue: QueueSnapshot,
     pub index_lag: BTreeMap<String, IndexLagSample>,
+    pub maintenance: MaintenanceSnapshot,
+    pub worker: WorkerSnapshot,
 }
 
 impl MetricsSnapshot {
@@ -391,6 +488,12 @@ impl MetricsSnapshot {
             series.render(&mut out);
         }
         self.queue.render_histograms(&mut out);
+        for series in self.maintenance.series() {
+            series.render(&mut out);
+        }
+        for series in self.worker.series() {
+            series.render(&mut out);
+        }
         self.render_index_lag(&mut out);
         out
     }
@@ -780,6 +883,94 @@ impl QueueSnapshot {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct MaintenanceSnapshot {
+    pub passes: u64,
+    pub skipped_leased_passes: u64,
+    pub compactions: u64,
+    pub vector_maintenance: u64,
+    pub gc_candidates: u64,
+    pub gc_deletions: u64,
+    pub errors: u64,
+}
+
+impl MaintenanceSnapshot {
+    fn series(&self) -> [Series; 7] {
+        [
+            Series::new(
+                "sana_maintenance_passes_total",
+                "Maintenance passes run by the lease-holding leader.",
+                self.passes,
+            ),
+            Series::new(
+                "sana_maintenance_skipped_leased_passes_total",
+                "Maintenance passes skipped because another process held the leader lease.",
+                self.skipped_leased_passes,
+            ),
+            Series::new(
+                "sana_maintenance_compactions_total",
+                "Namespace compactions published by maintenance passes.",
+                self.compactions,
+            ),
+            Series::new(
+                "sana_maintenance_vector_maintenance_total",
+                "Vector split/merge/reassign publications by maintenance passes.",
+                self.vector_maintenance,
+            ),
+            Series::new(
+                "sana_maintenance_gc_candidates_total",
+                "Fresh orphan objects observed by maintenance GC, deletable next pass.",
+                self.gc_candidates,
+            ),
+            Series::new(
+                "sana_maintenance_gc_deletions_total",
+                "Orphan objects deleted by maintenance GC.",
+                self.gc_deletions,
+            ),
+            Series::new(
+                "sana_maintenance_errors_total",
+                "Per-namespace and whole-pass maintenance failures.",
+                self.errors,
+            ),
+        ]
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct WorkerSnapshot {
+    pub claims: u64,
+    pub flushes: u64,
+    pub failures: u64,
+    pub stale_claim_rejections: u64,
+}
+
+impl WorkerSnapshot {
+    fn series(&self) -> [Series; 4] {
+        [
+            Series::new(
+                "sana_index_worker_claims_total",
+                "Indexing jobs engaged by the worker (claimed and run to a terminal outcome).",
+                self.claims,
+            ),
+            Series::new(
+                "sana_index_worker_flushes_total",
+                "Claimed indexing jobs that published a new index.",
+                self.flushes,
+            ),
+            Series::new(
+                "sana_index_worker_failures_total",
+                "Indexing jobs returned to the queue for retry after a worker failure.",
+                self.failures,
+            ),
+            Series::new(
+                "sana_index_worker_stale_claim_rejections_total",
+                "Worker claims fenced at publish or heartbeat because they went stale.",
+                self.stale_claim_rejections,
+            ),
+        ]
+    }
+}
+
 impl ObjectStoreSnapshot {
     fn series(&self) -> [Series; 11] {
         [
@@ -932,9 +1123,60 @@ mod tests {
         assert!(text.contains("# HELP sana_index_queue_jobs"));
         assert!(text.contains("# TYPE sana_index_queue_broker_batch_size histogram"));
         // Every family is emitted, even at zero.
-        assert_eq!(text.matches(" counter\n").count(), 29);
+        assert_eq!(text.matches(" counter\n").count(), 40);
         assert_eq!(text.matches(" gauge\n").count(), 9);
         assert_eq!(text.matches(" histogram\n").count(), 7);
+    }
+
+    #[test]
+    fn maintenance_metrics_fold_pass_reports() {
+        let metrics = Metrics::default();
+        metrics.maintenance.record_pass(MaintenancePassSample {
+            compactions: 2,
+            vector_maintenance: 1,
+            gc_candidates: 5,
+            gc_deletions: 3,
+            errors: 1,
+        });
+        metrics.maintenance.record_skipped_pass();
+        metrics.maintenance.record_failed_pass();
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.maintenance.passes, 1);
+        assert_eq!(snapshot.maintenance.skipped_leased_passes, 1);
+        assert_eq!(snapshot.maintenance.compactions, 2);
+        assert_eq!(snapshot.maintenance.vector_maintenance, 1);
+        assert_eq!(snapshot.maintenance.gc_candidates, 5);
+        assert_eq!(snapshot.maintenance.gc_deletions, 3);
+        // One per-namespace error from the pass plus one failed pass.
+        assert_eq!(snapshot.maintenance.errors, 2);
+
+        let text = snapshot.to_prometheus();
+        assert!(text.contains("# TYPE sana_maintenance_passes_total counter"));
+        assert!(text.contains("\nsana_maintenance_compactions_total 2\n"));
+        assert!(text.contains("\nsana_maintenance_gc_deletions_total 3\n"));
+        assert!(text.contains("\nsana_maintenance_errors_total 2\n"));
+    }
+
+    #[test]
+    fn worker_metrics_count_outcomes() {
+        let metrics = Metrics::default();
+        incr(&metrics.worker.claims);
+        incr(&metrics.worker.claims);
+        incr(&metrics.worker.flushes);
+        incr(&metrics.worker.failures);
+        incr(&metrics.worker.stale_claim_rejections);
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.worker.claims, 2);
+        assert_eq!(snapshot.worker.flushes, 1);
+        assert_eq!(snapshot.worker.failures, 1);
+        assert_eq!(snapshot.worker.stale_claim_rejections, 1);
+
+        let text = snapshot.to_prometheus();
+        assert!(text.contains("\nsana_index_worker_claims_total 2\n"));
+        assert!(text.contains("\nsana_index_worker_flushes_total 1\n"));
+        assert!(text.contains("\nsana_index_worker_stale_claim_rejections_total 1\n"));
     }
 
     #[test]

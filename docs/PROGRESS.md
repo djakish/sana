@@ -1350,6 +1350,21 @@ Review-driven polish after the engine was feature-complete.
   old-reader deletion gap for API queries and recall; active publishers, durable
   GC candidates, and read-dependent write paths still need follow-up before
   automatic online GC can be enabled.
+- **D86 — Background work is exported as metrics, recorded by the callers.**
+  Maintenance and indexing-worker outcomes used to exist only as
+  `MaintenanceReport`/`WorkerRun` values consumed by `eprintln!`. `Metrics` now
+  carries `MaintenanceMetrics` (passes, leader-lease skips, compactions, vector
+  maintenance, GC candidates/deletions, errors) and `WorkerMetrics` (claims,
+  flushes, failures, stale-claim rejections), rendered as Prometheus counters.
+  To keep `metrics.rs` a leaf module, the caller folds a `MaintenanceReport`
+  into a `MaintenancePassSample` (the same pattern as `QueueStateSample`), and
+  the serve worker loop classifies each `run_worker_once_with_client` result —
+  `Err(InvalidQueueClaim)` is a stale-claim rejection, any other `Err` is a
+  retried failure — instead of threading metrics through the durability-sensitive
+  worker core in `index_queue.rs`. `claims` counts every engaged tick, so
+  `claims − failures − stale_claim_rejections` is the completed-job count and
+  `flushes ≤ completed`. Structured `tracing` was deferred to preserve the
+  dependency-free default; failures still also print to stderr for context.
 
 ---
 
