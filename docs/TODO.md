@@ -596,11 +596,12 @@ Current code:
 
 ## P2: Improve public library ergonomics
 
-**Status:** mostly done. `From` conversions, chainable `Document` builders,
-`FilterExpr`/`RangeBound` constructors, and crate-root re-exports now let an
-embedder write documents and filters without naming low-level enum variants;
-`examples/usage.rs` is rewritten to use them. The only remaining item is the
-optional `Namespace::flush()`/`scan()` aliases.
+**Status:** done. `From` conversions, chainable `Document` builders,
+`FilterExpr`/`RangeBound` constructors, crate-root re-exports, and the
+`Namespace::flush()`/`scan()` aliases now let an embedder write documents and
+filters and run the common lifecycle calls without naming low-level enum
+variants or reaching into the `indexer` module; `examples/usage.rs` is rewritten
+to use them.
 
 Current code:
 
@@ -612,8 +613,9 @@ Current code:
 - The crate root re-exports `Namespace`, `Document`, `Id`, `Value`,
   `VectorValue`, `Query`, `FilterExpr`, `RangeBound`, `ObjectStore`,
   `FsObjectStore`.
-- `Namespace::replay` is still the public "scan everything" method name, and
-  flush is still reached via `indexer::flush`.
+- [`Namespace::scan`](../src/namespace.rs) aliases `replay`, and
+  [`Namespace::flush`](../src/namespace.rs) delegates to `indexer::flush`;
+  both original entry points stay public for compatibility.
 
 ### Required work
 
@@ -621,7 +623,7 @@ Current code:
       inputs without changing persisted binary formats.
 - [x] Add chainable document builders for attributes and vectors.
 - [x] Add filter/query helper constructors for the common cookbook shapes.
-- [ ] Consider `Namespace::flush()` and `Namespace::scan()` aliases while
+- [x] Consider `Namespace::flush()` and `Namespace::scan()` aliases while
       keeping existing APIs for compatibility.
 - [x] Re-export the public types needed by most examples from the crate root.
 

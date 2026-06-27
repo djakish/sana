@@ -644,3 +644,29 @@ async fn zero_match_patch_by_filter_still_validates_patch_schema() {
     assert!(matches!(error, Error::InvalidSchema(_)));
     assert_eq!(namespace.commit_cursor().await.unwrap(), before);
 }
+
+#[tokio::test]
+async fn namespace_scan_and_flush_aliases_match_underlying_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let namespace = Namespace::create(store(&dir), "docs").await.unwrap();
+    namespace.upsert(document(1, 1, "old")).await.unwrap();
+    namespace.upsert(document(2, 1, "old")).await.unwrap();
+
+    // `scan` is a thin alias for `replay`: same materialized snapshot.
+    let scanned = namespace.scan().await.unwrap();
+    assert_eq!(scanned, namespace.replay().await.unwrap());
+    assert_eq!(scanned.len(), 2);
+
+    // `flush` delegates to `indexer::flush`: the first call does work, and the
+    // second is a no-op because the WAL is already indexed.
+    assert!(namespace.flush().await.unwrap());
+    assert!(!namespace.flush().await.unwrap());
+    assert!(!indexer::flush(&namespace).await.unwrap());
+
+    // The snapshot is unchanged across the fold, and the aliases still agree.
+    assert_eq!(
+        namespace.scan().await.unwrap(),
+        namespace.replay().await.unwrap()
+    );
+    assert_eq!(namespace.scan().await.unwrap().len(), 2);
+}

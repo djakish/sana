@@ -13,7 +13,6 @@
 
 use std::sync::Arc;
 
-use sana::indexer;
 use sana::query::{Aggregate, ApproxVectorQuery, ExactVectorQuery, MultiQuery, TextQuery};
 use sana::{Document, FilterExpr, FsObjectStore, Id, Namespace, ObjectStore, Query};
 
@@ -48,8 +47,9 @@ async fn main() -> sana::Result<()> {
 
     // Fold the WAL into immutable SSTs and build the attribute, full-text,
     // and vector (IVF + RaBitQ) indexes. `sana serve` does this in the
-    // background; a library embedder calls it directly.
-    indexer::flush(&ns).await?;
+    // background; a library embedder calls it directly. `Namespace::flush`
+    // is a thin alias for `indexer::flush`.
+    ns.flush().await?;
 
     // 1. Filtered query with an aggregate: scifi books, count them.
     let result = ns

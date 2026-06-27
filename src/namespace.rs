@@ -1792,6 +1792,20 @@ impl Namespace {
         self.replay_at(&manifest, commit).await
     }
 
+    /// Alias for [`replay`](Self::replay): materialize the full document
+    /// snapshot. `replay` stays the canonical name; this reads better at call
+    /// sites that think in terms of scanning a namespace.
+    pub async fn scan(&self) -> Result<BTreeMap<Id, Document>> {
+        self.replay().await
+    }
+
+    /// Fold the committed WAL delta into a new document SST, returning `true`
+    /// if work was done. Thin alias for [`crate::indexer::flush`] so embedders
+    /// can flush a namespace without reaching into the `indexer` module.
+    pub async fn flush(&self) -> Result<bool> {
+        crate::indexer::flush(self).await
+    }
+
     pub(crate) async fn replay_at(
         &self,
         manifest: &NamespaceManifest,
